@@ -1,0 +1,14 @@
+streamlit
+pytest
+pymupdf
+python-docx
+paddleocr
+paddlex[ocr]==3.7.2
+
+# PaddlePaddle 深度学习框架，OCR 推理用。二选一：
+#  - 有 NVIDIA GPU（推荐，推理快一到两个数量级）：装 GPU 版，需按本机 CUDA 版本
+#    选择对应下载源，例如 CUDA 12.6：
+#      pip install paddlepaddle-gpu==3.3.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+#  - 纯 CPU：pip install paddlepaddle==3.3.1
+#    （CPU 下 core/parser.py 会自动禁用 MKL-DNN 以规避已知崩溃，速度较慢）
+paddlepaddle-gpu==3.3.1
