@@ -5,6 +5,11 @@ python-docx
 paddleocr
 paddlex[ocr]==3.7.2
 
+# 阶段4 LLM调用：DashScope兼容模式是标准OpenAI兼容REST接口(POST {base_url}/chat/completions)，
+# 用 requests 直接发请求即可；未引入 openai/dashscope SDK，因为阶段4要求完全自定义的重试/
+# 退避/Retry-After逻辑，SDK自带的重试机制用不上，且能省掉 openai 附带的 httpx/pydantic 依赖树。
+requests
+
 # PaddlePaddle 深度学习框架，OCR 推理用。二选一：
 #  - 有 NVIDIA GPU（推荐，推理快一到两个数量级）：装 GPU 版，需按本机 CUDA 版本
 #    选择对应下载源，例如 CUDA 12.6：
@@ -12,3 +17,7 @@ paddlex[ocr]==3.7.2
 #  - 纯 CPU：pip install paddlepaddle==3.3.1
 #    （CPU 下 core/parser.py 会自动禁用 MKL-DNN 以规避已知崩溃，速度较慢）
 paddlepaddle-gpu==3.3.1
+
+# 阶段8 Excel导出：需要按行/单元格精细设色（高优先级标红、引文类标浅黄），
+# openpyxl 直接支持，比引入 pandas 更省心。
+openpyxl
