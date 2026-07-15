@@ -22,6 +22,7 @@ def create_record(
     accepted_count: int = 0,
     rejected_count: int = 0,
     result_path: str | None = None,
+    mode: str | None = None,
     db_path=None,
 ) -> int:
     """插入一条流程记录，返回 record_id。"""
@@ -32,8 +33,8 @@ def create_record(
             INSERT INTO records (
                 created_at, doc_name, doc_version, task_type, total_issues,
                 count_confirmed, count_doubtful, count_quotation, count_optional,
-                high_priority_count, accepted_count, rejected_count, result_path
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                high_priority_count, accepted_count, rejected_count, result_path, mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 datetime.now().isoformat(),
@@ -49,6 +50,7 @@ def create_record(
                 accepted_count,
                 rejected_count,
                 result_path,
+                mode,
             ),
         )
         conn.commit()
@@ -103,7 +105,7 @@ def add_issue(
     layer: str,
     suggestion: str,
     status: str = "待处理",
-    reject_reason: str | None = None,
+    note: str | None = None,
     context_snippet: str | None = None,
     followup_history: str | None = None,
     db_path=None,
@@ -115,7 +117,7 @@ def add_issue(
             """
             INSERT INTO issues (
                 record_id, page_location, original_text, issue_type, priority,
-                layer, suggestion, status, reject_reason, context_snippet,
+                layer, suggestion, status, note, context_snippet,
                 followup_history
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -128,7 +130,7 @@ def add_issue(
                 layer,
                 suggestion,
                 status,
-                reject_reason,
+                note,
                 context_snippet,
                 followup_history,
             ),
@@ -139,15 +141,51 @@ def add_issue(
         conn.close()
 
 
-def update_issue_status(
-    issue_id: int, status: str, reject_reason: str | None = None, db_path=None
-) -> None:
-    """更新问题的处理状态（及拒绝理由）。"""
+def update_issue_status(issue_id: int, status: str, db_path=None) -> None:
+    """更新问题的处理状态。批注（note）与状态无关，用 update_issue_note 单独更新。"""
     conn = get_connection(db_path)
     try:
         conn.execute(
-            "UPDATE issues SET status = ?, reject_reason = ? WHERE issue_id = ?",
-            (status, reject_reason, issue_id),
+            "UPDATE issues SET status = ? WHERE issue_id = ?",
+            (status, issue_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_issue_note(issue_id: int, note: str, db_path=None) -> None:
+    """更新某条问题的批注（与采纳/拒绝状态无关，用户可写可不写）。"""
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "UPDATE issues SET note = ? WHERE issue_id = ?",
+            (note, issue_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_issue(issue_id: int, db_path=None) -> dict | None:
+    """按 issue_id 查询单条问题，不存在返回 None。"""
+    conn = get_connection(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM issues WHERE issue_id = ?", (issue_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def update_issue_followup(issue_id: int, followup_history: str, db_path=None) -> None:
+    """更新某条问题的追问历史（JSON字符串，编解码由 core/followup.py 负责）。"""
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "UPDATE issues SET followup_history = ? WHERE issue_id = ?",
+            (followup_history, issue_id),
         )
         conn.commit()
     finally:

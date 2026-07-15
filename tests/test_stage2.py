@@ -48,6 +48,155 @@ def double_column_doc():
 
 
 # ---------------------------------------------------------------------------
+# 回归测试：block内多行拼接必须保留换行，不能拼成空格/无分隔的连续文本
+# （真实文档踩过的坑：换行丢失导致本来独立的两行被读成一句病句，或OCR场景下
+# 完全无分隔地粘连成乱码，误导LLM把"解析伪影"当成"错别字/语法问题"来报）
+# ---------------------------------------------------------------------------
+
+class _FakeNativePage:
+    """伪造一个具备 get_text("dict") 接口的对象，隔离测试 _extract_native_page_raw
+    的拼接逻辑，不依赖真实PDF文件里恰好存在多行block。"""
+
+    def get_text(self, mode):
+        assert mode == "dict"
+        return {
+            "width": 600.0,
+            "height": 800.0,
+            "blocks": [
+                {
+                    "type": 0,
+                    "bbox": (50.0, 100.0, 550.0, 140.0),
+                    "lines": [
+                        {"spans": [{"text": "第一行文字：", "size": 12.0}]},
+                        {"spans": [{"text": "第二行文字。", "size": 12.0}]},
+                    ],
+                }
+            ],
+        }
+
+
+def test_native_pdf_multiline_block_join_uses_newline():
+    from core.parser.native_pdf import _extract_native_page_raw
+
+    raw_blocks, width = _extract_native_page_raw(_FakeNativePage())
+
+    assert width == 600.0
+    assert len(raw_blocks) == 1
+    assert raw_blocks[0]["text"] == "第一行文字：\n第二行文字。"
+
+
+class _FakeLayoutPipeline:
+    def predict(self, path):
+        return [{"boxes": [{"label": "text", "coordinate": (0, 0, 100, 100)}]}]
+
+
+class _FakeOCRPipeline:
+    def predict(self, path):
+        return [
+            {
+                "rec_texts": ["第一行", "第二行"],
+                "rec_scores": [0.99, 0.98],
+                "rec_boxes": [(10, 10, 60, 20), (10, 30, 60, 40)],
+            }
+        ]
+
+
+def test_ocr_region_multiline_join_uses_newline(monkeypatch):
+    from PIL import Image
+
+    from core.parser import ocr_pdf as parser
+
+    monkeypatch.setattr(parser, "_get_layout_pipeline", lambda: _FakeLayoutPipeline())
+    monkeypatch.setattr(parser, "_get_ocr_pipeline", lambda: _FakeOCRPipeline())
+
+    img = Image.new("RGB", (100, 100), color="white")
+    blocks, _ = parser._run_structure(img)
+
+    assert len(blocks) == 1
+    assert blocks[0]["text"] == "第一行\n第二行"
+
+
+# ---------------------------------------------------------------------------
+# 补丁回归测试：table类区域不再尝试结构识别重建，按坐标拉平的文本原样保留
+# （曾用 TableRecognitionPipelineV2 重建行列结构，真实验证命中率接近零：
+# 真实文档诊断发现table类区域绝大多数是说明性UI截图/菜单结构图，不是待校对
+# 正文，且贡献了大量假错误，core/chunker.py 已改为整体跳过这类block不送审，
+# 结构重建本身不再有必要，见 core/parser/CLAUDE.md）
+# ---------------------------------------------------------------------------
+
+class _FakeLayoutPipelineTable:
+    def predict(self, path):
+        return [{"boxes": [{"label": "table", "coordinate": (0, 0, 200, 200)}]}]
+
+
+class _FakeOCRPipelineTable:
+    def predict(self, path):
+        return [
+            {
+                "rec_texts": ["姓名", "年龄", "张三", "20"],
+                "rec_scores": [0.99, 0.99, 0.99, 0.99],
+                "rec_boxes": [(10, 10, 50, 20), (100, 10, 140, 20), (10, 30, 50, 40), (100, 30, 140, 40)],
+            }
+        ]
+
+
+def test_table_region_keeps_flat_joined_text(monkeypatch):
+    from PIL import Image
+
+    from core.parser import ocr_pdf as parser
+
+    monkeypatch.setattr(parser, "_get_layout_pipeline", lambda: _FakeLayoutPipelineTable())
+    monkeypatch.setattr(parser, "_get_ocr_pipeline", lambda: _FakeOCRPipelineTable())
+
+    img = Image.new("RGB", (200, 200), color="white")
+    blocks, _ = parser._run_structure(img)
+
+    assert len(blocks) == 1
+    assert blocks[0]["block_type"] == "table"
+    assert blocks[0]["text"] == "姓名\n年龄\n张三\n20"
+
+
+# ---------------------------------------------------------------------------
+# 补丁回归测试：OCR文字识别模型换档（降低低画质截图的字符误识别率）
+# _get_ocr_pipeline 应把 config.PADDLEOCR_DET_MODEL/REC_MODEL 透传给 PaddleOCR
+# ---------------------------------------------------------------------------
+
+class _FakePaddleOCR:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+def _call_get_ocr_pipeline_capturing_kwargs(monkeypatch, det_model, rec_model):
+    import paddleocr
+
+    import config
+    from core.parser import ocr_pdf as parser
+
+    monkeypatch.setattr(parser, "_OCR_PIPELINE", None)
+    monkeypatch.setattr(parser, "_resolve_device", lambda: "cpu")
+    monkeypatch.setattr(paddleocr, "PaddleOCR", _FakePaddleOCR)
+    monkeypatch.setattr(config, "PADDLEOCR_DET_MODEL", det_model)
+    monkeypatch.setattr(config, "PADDLEOCR_REC_MODEL", rec_model)
+
+    pipeline = parser._get_ocr_pipeline()
+    return pipeline.kwargs
+
+
+def test_get_ocr_pipeline_passes_configured_model_names(monkeypatch):
+    kwargs = _call_get_ocr_pipeline_capturing_kwargs(
+        monkeypatch, "PP-OCRv5_server_det", "PP-OCRv5_server_rec"
+    )
+    assert kwargs["text_detection_model_name"] == "PP-OCRv5_server_det"
+    assert kwargs["text_recognition_model_name"] == "PP-OCRv5_server_rec"
+
+
+def test_get_ocr_pipeline_omits_model_names_when_none(monkeypatch):
+    kwargs = _call_get_ocr_pipeline_capturing_kwargs(monkeypatch, None, None)
+    assert "text_detection_model_name" not in kwargs
+    assert "text_recognition_model_name" not in kwargs
+
+
+# ---------------------------------------------------------------------------
 # 基础断言
 # ---------------------------------------------------------------------------
 
