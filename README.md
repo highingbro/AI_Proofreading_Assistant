@@ -1,12 +1,12 @@
 # 出版校对AI助手
 
-单人使用、本地运行的出版校对 AI 助手（Python + Streamlit + SQLite）。
-当前处于**阶段1：项目骨架**，仅包含目录结构、数据库表结构与最简页面骨架。
+本地运行的出版校对 AI 助手（Python + Streamlit + SQLite）。
+
 
 ## 启动方式
 
 ```bash
-# 激活虚拟环境（已存在 .venv）
+# 激活虚拟环境
 # Windows PowerShell:
 .venv\Scripts\Activate.ps1
 
