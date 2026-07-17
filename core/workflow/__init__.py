@@ -10,8 +10,15 @@
 
 from __future__ import annotations
 
-from core.workflow.persist import persist_result
-from core.workflow.run import run_standard_proofread
+from core.workflow.persist import persist_comparison_result, persist_result
+from core.workflow.run import run_document_comparison, run_standard_proofread
 from core.workflow.status import set_issue_note, set_issue_status
 
-__all__ = ["run_standard_proofread", "persist_result", "set_issue_status", "set_issue_note"]
+__all__ = [
+    "run_standard_proofread",
+    "persist_result",
+    "run_document_comparison",
+    "persist_comparison_result",
+    "set_issue_status",
+    "set_issue_note",
+]

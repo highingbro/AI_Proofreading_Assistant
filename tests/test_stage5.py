@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
 from core.classifier import ClassifiedResult, classify_issue, classify_issues
 from core.chunker import Chunk, ChunkedDocument
+from core.feedback import LearnedFeedback
 from core.parser import ParsedBlock, ParsedDocument
 from core.proofreader import ProofreadResult, RawIssue, proofread_chunk
 
@@ -122,7 +123,7 @@ def test_rule_b_factual_high_confidence_keeps_confirmed_with_note():
     issue = classify_issue(raw, {})
     assert issue.layer == config.LAYER_CONFIRMED
     assert issue.suggestion == raw.suggestion  # 未被改写
-    assert "事实类high置信,建议人工复核仍然适用" in issue.layer_notes
+    assert "事实类高置信,建议人工复核仍然适用" in issue.layer_notes
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +172,216 @@ def test_rule_d_unlocated_quotation_stays_quotation():
 
 
 # ---------------------------------------------------------------------------
+# 规则I：PDF换行符被LLM转写成空格的解析伪影豁免（补丁，真实使用中发现后追加）
+# ---------------------------------------------------------------------------
+
+def test_rule_i_downgrades_linewrap_space_artifact():
+    """真实案例：block里"教务管理\\n教师"的换行符被LLM转写成空格"教务管理教 师"上报，
+    空格插入位置和真实\\n位置相差一个字符，仍应命中（整体去除后子串匹配，不要求精确对位）。
+    """
+    block = _block(block_index=0, text="教务管理\n教师无组织权限。")
+    raw = _raw_issue(
+        original_text="教务管理教 师", issue_type="错别字与拼写", confidence="high",
+        suggestion="应删除空格，改为“教务管理教师”", block_index=0,
+    )
+    issue = classify_issue(raw, {0: block})
+    assert issue.layer == config.LAYER_DOUBTFUL
+    assert issue.priority == config.PRIORITY_LOW
+    assert any("换行" in n for n in issue.layer_notes)
+
+
+def test_rule_i_does_not_trigger_without_matching_block():
+    raw = _raw_issue(
+        original_text="教务管理教 师", issue_type="错别字与拼写", confidence="high", block_index=0,
+    )
+    issue = classify_issue(raw, {})  # block_by_index里找不到block_index=0，block为None
+    assert issue.layer == config.LAYER_CONFIRMED
+
+
+def test_rule_i_does_not_trigger_when_space_is_real():
+    """空格在block.text里原样存在（不是靠换行符拼出来的），说明是原文真实携带的，不豁免。"""
+    block = _block(block_index=0, text="选择时间段内 学习课程数量")
+    raw = _raw_issue(
+        original_text="时间段内 学习课程", issue_type="错别字与拼写", confidence="high", block_index=0,
+    )
+    issue = classify_issue(raw, {0: block})
+    assert issue.layer == config.LAYER_CONFIRMED
+
+
+def test_rule_i_does_not_trigger_when_no_match_after_stripping():
+    """去除空格/换行符后也在block里找不到对应内容，说明不是这类伪影，保留原判定。"""
+    block = _block(block_index=0, text="这是完全不相关的一段文字，没有任何关联。")
+    raw = _raw_issue(
+        original_text="教务管理教 师", issue_type="错别字与拼写", confidence="high", block_index=0,
+    )
+    issue = classify_issue(raw, {0: block})
+    assert issue.layer == config.LAYER_CONFIRMED
+
+
+def test_rule_i_does_not_trigger_when_layer_not_confirmed():
+    """已经不是"确定性错误"的层级（比如被规则A判成引文类）不需要再降，规则I不生效。"""
+    block = _block(block_index=0, text="教务管理\n教师无组织权限。")
+    raw = _raw_issue(
+        original_text="教务管理教 师", issue_type="错别字与拼写", category="quotation",
+        confidence="high", block_index=0,
+    )
+    issue = classify_issue(raw, {0: block})
+    assert issue.layer == config.LAYER_QUOTATION
+
+
+# ---------------------------------------------------------------------------
+# 规则J：人工反馈学习自动降级（补丁，阶段12新增）
+# ---------------------------------------------------------------------------
+
+_PATH_SEP_SUGGESTION = "将'一'改为'-'或'>'等规范的路径分隔符"
+
+
+def test_rule_j_no_downgrade_below_threshold():
+    """命中次数(2)低于阈值(config.FEEDBACK_REJECTION_THRESHOLD=3)，不降级。"""
+    raw = _raw_issue(
+        original_text="管理控台一组织权限一用户管理", issue_type="错别字与拼写",
+        confidence="high", suggestion=_PATH_SEP_SUGGESTION,
+    )
+    learned = [
+        LearnedFeedback(issue_type="错别字与拼写", original_text="管理控台一组织权限一用户管理", suggestion=_PATH_SEP_SUGGESTION),
+        LearnedFeedback(issue_type="错别字与拼写", original_text="管理控台一组织权限一用户管理", suggestion=_PATH_SEP_SUGGESTION),
+    ]
+    issue = classify_issue(raw, {}, learned_feedback=learned)
+    assert issue.layer == config.LAYER_CONFIRMED
+
+
+def test_rule_j_downgrades_on_original_text_exact_match():
+    """达到阈值(3)，走original_text精确匹配这一档命中，降级为风格可选。"""
+    raw = _raw_issue(
+        original_text="管理控台一组织权限一用户管理", issue_type="错别字与拼写",
+        confidence="high", suggestion=_PATH_SEP_SUGGESTION,
+    )
+    learned = [
+        LearnedFeedback(issue_type="错别字与拼写", original_text="管理控台一组织权限一用户管理", suggestion=_PATH_SEP_SUGGESTION)
+        for _ in range(3)
+    ]
+    issue = classify_issue(raw, {}, learned_feedback=learned)
+    assert issue.layer == config.LAYER_OPTIONAL
+    assert issue.priority == config.PRIORITY_OPTIONAL
+    assert any("人工拒绝" in n for n in issue.layer_notes)
+
+
+def test_rule_j_downgrades_on_suggestion_similarity_across_different_documents():
+    """达到阈值(3)，走suggestion相似度这一档命中（original_text完全不同，模拟同一种
+    没有意义的改动出现在完全不同的文档里这个真实场景），同样降级。"""
+    raw = _raw_issue(
+        original_text="系统管理一部门配置", issue_type="错别字与拼写",
+        confidence="high", suggestion=_PATH_SEP_SUGGESTION,
+    )
+    learned = [
+        LearnedFeedback(issue_type="错别字与拼写", original_text="菜单设置一权限分配", suggestion=_PATH_SEP_SUGGESTION),
+        LearnedFeedback(issue_type="错别字与拼写", original_text="订单管理一退款审核", suggestion=_PATH_SEP_SUGGESTION),
+        LearnedFeedback(issue_type="错别字与拼写", original_text="报表中心一导出记录", suggestion=_PATH_SEP_SUGGESTION),
+    ]
+    issue = classify_issue(raw, {}, learned_feedback=learned)
+    assert issue.layer == config.LAYER_OPTIONAL
+    assert issue.priority == config.PRIORITY_OPTIONAL
+
+
+def test_rule_j_downgrades_on_normalized_suggestion_similarity():
+    """真实场景：编号1~7都因为"全角句号应改半角"被拒绝过，字面相似度不到阈值，但归一化
+    （去掉具体编号/引号内容）后应识别为同一类问题，编号10再出现时直接降级。"""
+    raw = _raw_issue(
+        original_text="10．发布成绩", issue_type="错别字与拼写", confidence="high",
+        suggestion='应改为"10.发布成绩"或"10. 发布成绩"',
+    )
+    learned = [
+        LearnedFeedback(
+            issue_type="错别字与拼写", original_text=f"{n}．某条目",
+            suggestion=f'应改为"{n}.某条目"或"{n}. 某条目"',
+        )
+        for n in range(1, 4)
+    ]
+    issue = classify_issue(raw, {}, learned_feedback=learned)
+    assert issue.layer == config.LAYER_OPTIONAL
+
+
+def test_rule_j_different_issue_type_not_counted():
+    raw = _raw_issue(
+        original_text="管理控台一组织权限一用户管理", issue_type="错别字与拼写",
+        confidence="high", suggestion=_PATH_SEP_SUGGESTION,
+    )
+    learned = [
+        LearnedFeedback(issue_type="标点符号问题", original_text="管理控台一组织权限一用户管理", suggestion=_PATH_SEP_SUGGESTION)
+        for _ in range(3)
+    ]
+    issue = classify_issue(raw, {}, learned_feedback=learned)
+    assert issue.layer == config.LAYER_CONFIRMED
+
+
+def test_rule_j_similarity_below_threshold_not_counted():
+    raw = _raw_issue(
+        original_text="系统管理一部门配置", issue_type="错别字与拼写",
+        confidence="high", suggestion=_PATH_SEP_SUGGESTION,
+    )
+    learned = [
+        LearnedFeedback(issue_type="错别字与拼写", original_text="完全不相关的原文内容", suggestion="建议调整语序，使句子更通顺")
+        for _ in range(3)
+    ]
+    issue = classify_issue(raw, {}, learned_feedback=learned)
+    assert issue.layer == config.LAYER_CONFIRMED
+
+
+def test_rule_j_factual_issue_never_downgraded():
+    """事实类问题即使命中次数远超阈值也不降级——三种事实类判定信号逐一验证。"""
+    factual_variants = [
+        dict(category="factual", issue_type="标点符号问题", original_text="示例原文"),
+        dict(category="normal", issue_type="常识与事实性错误", original_text="示例原文"),
+        dict(category="normal", issue_type="标点符号问题", original_text="钱学森1955年归国"),  # 命中_has_factual_feature年份特征
+    ]
+    for overrides in factual_variants:
+        raw = _raw_issue(confidence="high", suggestion=_PATH_SEP_SUGGESTION, **overrides)
+        learned = [
+            LearnedFeedback(issue_type=raw.issue_type, original_text=raw.original_text, suggestion=raw.suggestion)
+            for _ in range(5)
+        ]
+        issue = classify_issue(raw, {}, learned_feedback=learned)
+        assert issue.layer != config.LAYER_OPTIONAL
+
+
+def test_rule_j_quotation_layer_unaffected():
+    raw = _raw_issue(category="quotation", original_text="普通文本", suggestion=_PATH_SEP_SUGGESTION)
+    learned = [
+        LearnedFeedback(issue_type=raw.issue_type, original_text="普通文本", suggestion=_PATH_SEP_SUGGESTION)
+        for _ in range(5)
+    ]
+    issue = classify_issue(raw, {}, learned_feedback=learned)
+    assert issue.layer == config.LAYER_QUOTATION
+
+
+def test_rule_j_already_optional_not_reprocessed():
+    raw = _raw_issue(category="style", original_text="风格问题原文", suggestion=_PATH_SEP_SUGGESTION)
+    learned = [
+        LearnedFeedback(issue_type=raw.issue_type, original_text="风格问题原文", suggestion=_PATH_SEP_SUGGESTION)
+        for _ in range(5)
+    ]
+    issue = classify_issue(raw, {}, learned_feedback=learned)
+    assert issue.layer == config.LAYER_OPTIONAL
+    assert not any("人工拒绝" in n for n in issue.layer_notes)
+
+
+def test_classify_issues_forwards_learned_feedback_to_classify_issue():
+    raw = _raw_issue(
+        original_text="管理控台一组织权限一用户管理", issue_type="错别字与拼写",
+        confidence="high", suggestion=_PATH_SEP_SUGGESTION, block_index=0,
+    )
+    parsed = _parsed([_block(0)])
+    learned = [
+        LearnedFeedback(issue_type="错别字与拼写", original_text="管理控台一组织权限一用户管理", suggestion=_PATH_SEP_SUGGESTION)
+        for _ in range(3)
+    ]
+    result = classify_issues(
+        ProofreadResult(issues=[raw], chunk_warnings=[]), parsed, learned_feedback=learned
+    )
+    assert result.issues[0].layer == config.LAYER_OPTIONAL
+
+
+# ---------------------------------------------------------------------------
 # 规则E：风格可选
 # ---------------------------------------------------------------------------
 
@@ -185,6 +396,106 @@ def test_rule_e_style_keyword_fallback():
     raw = _raw_issue(category="normal", suggestion="建议润色，读起来更通顺")
     issue = classify_issue(raw, {})
     assert issue.layer == config.LAYER_OPTIONAL
+
+
+# ---------------------------------------------------------------------------
+# 精简模式语法结构降级（补丁：精简/深度模式功能新增后追加，非阶段5原始设计）
+# ---------------------------------------------------------------------------
+
+def test_deep_mode_grammar_issue_unaffected_high_confidence():
+    """深度模式（默认，不传mode）下语法结构问题不受影响，回归保护：高置信度仍是确定性错误。"""
+    raw = _raw_issue(issue_type="语法结构问题", category="normal", confidence="high")
+    issue = classify_issue(raw, {})
+    assert issue.layer == config.LAYER_CONFIRMED
+
+
+def test_deep_mode_grammar_issue_unaffected_low_confidence():
+    raw = _raw_issue(issue_type="语法结构问题", category="normal", confidence="low")
+    issue = classify_issue(raw, {})
+    assert issue.layer == config.LAYER_DOUBTFUL
+
+
+def test_simplified_mode_grammar_issue_downgraded_to_style_regardless_of_confidence():
+    for confidence in ("high", "medium", "low"):
+        raw = _raw_issue(issue_type="语法结构问题", category="normal", confidence=confidence)
+        issue = classify_issue(raw, {}, mode=config.PROOFREAD_MODE_SIMPLIFIED)
+        assert issue.layer == config.LAYER_OPTIONAL
+        assert issue.priority == config.PRIORITY_OPTIONAL
+
+
+def test_simplified_mode_quotation_protection_still_wins_over_grammar_downgrade():
+    """即使issue_type是语法结构问题，精简模式下quotation特征命中仍优先生效，保护不被弱化。"""
+    raw = _raw_issue(issue_type="语法结构问题", category="quotation", confidence="high")
+    issue = classify_issue(raw, {}, mode=config.PROOFREAD_MODE_SIMPLIFIED)
+    assert issue.layer == config.LAYER_QUOTATION
+
+
+def test_simplified_mode_factual_protection_still_wins_over_grammar_downgrade():
+    """即使issue_type是语法结构问题，精简模式下factual特征命中仍优先生效，保护不被弱化。"""
+    raw = _raw_issue(issue_type="语法结构问题", category="factual", confidence="high")
+    issue = classify_issue(raw, {}, mode=config.PROOFREAD_MODE_SIMPLIFIED)
+    assert issue.layer == config.LAYER_CONFIRMED
+
+
+def test_classify_issues_forwards_mode_to_classify_issue():
+    raw = _raw_issue(issue_type="语法结构问题", category="normal", confidence="high", block_index=0)
+    parsed = _parsed([_block(0)])
+    result = classify_issues(
+        ProofreadResult(issues=[raw], chunk_warnings=[]), parsed, mode=config.PROOFREAD_MODE_SIMPLIFIED
+    )
+    assert result.issues[0].layer == config.LAYER_OPTIONAL
+
+
+# ---------------------------------------------------------------------------
+# 精简模式"汉字冒充标点"降级（补丁：与语法结构降级同批真实反馈，成因不同）
+# ---------------------------------------------------------------------------
+
+def test_deep_mode_typo_as_punctuation_unaffected():
+    """深度模式下不受影响，回归保护：即使建议提到"破折号"，仍按原confidence判定。"""
+    raw = _raw_issue(
+        issue_type="错别字与拼写", category="normal", confidence="high",
+        original_text="管理控台一角色权限", suggestion="将汉字“一”改为破折号“——”或短横线“-”。",
+    )
+    issue = classify_issue(raw, {})
+    assert issue.layer == config.LAYER_CONFIRMED
+
+
+def test_simplified_mode_typo_as_punctuation_downgraded_to_style():
+    raw = _raw_issue(
+        issue_type="错别字与拼写", category="normal", confidence="high",
+        original_text="管理控台一角色权限", suggestion="将汉字“一”改为破折号“——”或短横线“-”。",
+    )
+    issue = classify_issue(raw, {}, mode=config.PROOFREAD_MODE_SIMPLIFIED)
+    assert issue.layer == config.LAYER_OPTIONAL
+    assert issue.priority == config.PRIORITY_OPTIONAL
+
+
+def test_simplified_mode_genuine_typo_not_downgraded():
+    """建议里没有命中连接类标点关键词的真正错别字（如"的/地/得"），精简模式下不受这条规则影响。"""
+    raw = _raw_issue(
+        issue_type="错别字与拼写", category="normal", confidence="high",
+        original_text="他吃的很开心", suggestion="将“的”改为“得”",
+    )
+    issue = classify_issue(raw, {}, mode=config.PROOFREAD_MODE_SIMPLIFIED)
+    assert issue.layer == config.LAYER_CONFIRMED
+
+
+def test_simplified_mode_quotation_protection_still_wins_over_typo_punctuation_downgrade():
+    raw = _raw_issue(
+        issue_type="错别字与拼写", category="quotation", confidence="high",
+        suggestion="将汉字“一”改为破折号“——”",
+    )
+    issue = classify_issue(raw, {}, mode=config.PROOFREAD_MODE_SIMPLIFIED)
+    assert issue.layer == config.LAYER_QUOTATION
+
+
+def test_simplified_mode_factual_protection_still_wins_over_typo_punctuation_downgrade():
+    raw = _raw_issue(
+        issue_type="错别字与拼写", category="factual", confidence="high",
+        suggestion="将汉字“一”改为破折号“——”",
+    )
+    issue = classify_issue(raw, {}, mode=config.PROOFREAD_MODE_SIMPLIFIED)
+    assert issue.layer == config.LAYER_CONFIRMED
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +714,7 @@ def test_rule_c_stacks_on_top_of_base_rule_f():
     issue = classify_issue(raw, block_by_index)
     assert issue.layer == config.LAYER_DOUBTFUL
     notes = _notes_text(issue)
-    assert "默认归层:high置信度→确定性错误" in notes  # F的判定痕迹被保留
+    assert "默认归层:高置信度→确定性错误" in notes  # F的判定痕迹被保留
     assert "低OCR置信度降级" in notes  # C的修饰痕迹叠加在上面
 
 

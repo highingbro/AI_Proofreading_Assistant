@@ -1,6 +1,7 @@
 """SQLite 连接与建表（阶段1实现）。
 
-定义两张表：records（流程记录表）与 issues（问题明细表）。
+定义三张表：records（流程记录表）、issues（问题明细表）与 feedback（阶段12新增，
+人工反馈学习记录表）。
 """
 
 import sqlite3
@@ -42,6 +43,19 @@ CREATE TABLE IF NOT EXISTS issues (
     context_snippet TEXT,
     followup_history TEXT,
     FOREIGN KEY (record_id) REFERENCES records (record_id)
+)
+"""
+
+_CREATE_FEEDBACK_SQL = """
+CREATE TABLE IF NOT EXISTS feedback (
+    feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    issue_type TEXT,
+    original_text TEXT,
+    suggestion TEXT,
+    reason TEXT,
+    source_issue_id INTEGER,
+    source_record_id INTEGER
 )
 """
 
@@ -94,6 +108,7 @@ def init_db(db_path=None) -> None:
     try:
         conn.execute(_CREATE_RECORDS_SQL)
         conn.execute(_CREATE_ISSUES_SQL)
+        conn.execute(_CREATE_FEEDBACK_SQL)
         conn.commit()
         _migrate_reject_reason_to_note(conn)
         _migrate_add_mode_column(conn)

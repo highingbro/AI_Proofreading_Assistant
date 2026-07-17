@@ -66,7 +66,22 @@ def chunk_document(
         group, i = _fill_body(fill_units, i, effective_target)
 
         block_indices = list(dict.fromkeys(u.block_index for u in group))
-        body_text = "".join(u.text for u in group)
+        # 不同 block 之间插入换行，避免LLM看到的正文在block接缝处完全无缝——
+        # 各 ParsedBlock.text 在解析阶段已 strip 首尾空白（core/parser/），
+        # 空字符串拼接会让相邻block的文字直接连在一起，导致LLM摘录的
+        # original_text 有概率横跨两个block，而 core/proofreader/locator.py
+        # 逐block定位时用的是未拼接的原始 block.text，找不到跨block的片段，
+        # 产出"命中正文但未能归属到具体block"的告警。同一超长block切分出的
+        # 多个片段共享同一 block_index，之间仍不加分隔符，保持能拼回原始
+        # block.text 原样。
+        body_parts: list[str] = []
+        prev_block_index: int | None = None
+        for u in group:
+            if body_parts and u.block_index != prev_block_index:
+                body_parts.append("\n")
+            body_parts.append(u.text)
+            prev_block_index = u.block_index
+        body_text = "".join(body_parts)
         text = overlap_wrap + body_text
 
         # 页码范围覆盖重叠区和正文两部分，取两者最小页与最大页

@@ -1,4 +1,4 @@
-"""Streamlit 入口（阶段6标准校对流+阶段8Excel导出+阶段7追问+阶段10历史记录详情页；原稿比对仍是占位）。
+"""Streamlit 入口（标准校对流+Excel导出+追问+历史记录详情页+反馈学习管理+原稿比对）。
 
 ## 标准校对分支（阶段6）要点
 
@@ -19,6 +19,17 @@ st.file_uploader 在页面切走再切回来后，浏览器出于安全限制无
 的文件，uploaded_file 会变回 None——这不代表用户想清空已校对结果，所以只
 有在 uploaded_file 真的拿到新文件时才判断是否换文件/清缓存；uploaded_file
 为 None 时直接往下走，看有没有已缓存的结果可以展示。
+
+补丁（真实使用中发现）：换文件判断是按文件内容md5哈希（_file_id）比较的，
+"开始校对"按钮只在 classified_result 为 None 时渲染——这两条叠加导致校对完
+一个文件后，想直接对同一个文件重新校对一遍（哈希不变），没有任何按钮能触发，
+必须先换成别的文件（哈希变化触发 _reset_session_state）再换回来才行。修复：
+把"开始校对"按钮原本内联的解析→校对→落库逻辑抽成 _execute_proofread(uploaded_
+file, mode)，结果展示区顶部加一个"🔄 重新校对本文件"按钮，点击时 uploaded_file
+如果还在（没离开过页面，函数局部变量原样可用）就直接调用 _execute_proofread
+原地重新执行一遍，不需要用户再点一次"开始校对"、更不需要重新上传；只有
+uploaded_file 已经因为切页丢失（浏览器安全限制，没有文件字节可用）时才退回
+_reset_session_state()+提示重新上传这条兜底路径。
 
 ## 追问区域（阶段7）要点
 
@@ -95,6 +106,53 @@ _render_stats(result.stats, result.warnings, st.session_state.get("mode"))，
 （history_export_{record_id}/history_download_{record_id}）避免和标准校对
 页的同名按钮/未来可能的多记录场景冲突。
 
+## 反馈学习管理（阶段12）要点
+
+同一类被人工判定"判错了"的问题（点击"拒绝"）此前会在后续校对里反复出现，没有任何
+"记忆"。`_render_issue_card` 的拒绝分支新增一行 `feedback.record_rejection(issue,
+issue_id, record_id, db_path=None)`，把这条issue记进 `feedback` 表；因为
+`_render_issue_card` 是实时校对流程和历史记录页共用的同一份逻辑（阶段10既有设计），
+这一行改动自动覆盖两个入口。核心判定/自动降级逻辑在 `core/classifier` 的规则J里
+（详见 `core/classifier/CLAUDE.md`），本文件只负责在拒绝时记录、以及提供查看/撤销
+的管理页。
+
+事实性错误类问题（含引文类）不参与自动降级——这是设计铁律"事实性内容必须始终保留
+人工复核机会"的延伸，已与用户确认。这类问题的拒绝仍会被记录（管理页可见），只是
+不会触发自动降级。
+
+新增的"反馈学习"页面（`_render_feedback_management`）用 `feedback.cluster_feedback()`
+把 `get_feedback()` 的结果按"是否是同一类问题"聚类展示（两阶段：原文精确相等分组打底
++ suggestion/reason模糊相似度做complete-linkage合并，判定信号与规则J的
+`count_similar_rejections` 完全一致，见 `core/feedback.py::_is_similar`；两阶段设计
+的原因——单阶段容易在原文精确相同的场景里被中途混入的模糊匹配成员反而拆散，详见
+`core/feedback.py::cluster_feedback` docstring），每簇标注"是否已达到自动降级阈值"。
+**早期版本按 `issue_type` 分组，被用户指出有误导性**——同
+issue_type 不代表同一类问题，一条跟其余内容毫无关系的新拒绝会被归进同一个已经"达到
+阈值"的大分组里，让人误以为这次拒绝也会被计入自动降级判定，但真正驱动降级的判断并
+不会这样匹配；改成按真实相似度聚类后，管理页看到的分组和判定口径完全一致，不再是
+"近似指标"。每条反馈支持"撤销"（删除该条反馈记录，相当于让所在簇的计数下降）。
+
+## 原稿比对（阶段9）要点
+
+`_render_document_comparison` 结构上跟标准校对流平行（两个 st.file_uploader +
+"开始比对"按钮 + workflow.run_document_comparison + workflow.persist_comparison_result），
+但**结果展示阶段完全复用历史记录页那一套**，不是照抄标准校对流：比对结果落库后，
+直接用 get_issues(record_id) 现读 + _row_to_issue_view + _render_issue_card 渲染
+（跟 _render_history_detail 一模一样的流程），而不是像标准校对流那样把内存中的
+ClassifiedResult 存进 session_state 再渲染。原因：core.comparer.compare_documents
+返回的是 list[dict]，落库之后这些差异条目在 issues 表里跟标准校对的 issue 长得
+完全一样（page_location/original_text/issue_type/priority/layer/suggestion 等
+字段），没必要为它单独维护一份内存态或另写一套卡片UI——采纳/拒绝/批注/追问/导出
+Excel 全部原样可用。
+
+`issue_status`（渲染用的状态缓存）是全局共享的 session_state 字典，键是数据库
+自增的 issue_id（标准校对/历史记录/原稿比对三个页面之间不会撞号），所以渲染前
+都要用 get_issues 的DB当前值无条件刷新一遍，跟 _render_history_detail 处理"两处
+状态同步的坑"是同一个原因、同一套写法。
+
+原稿限定只收 Word（type=["docx"]），排版稿收 PDF/Word（type=["pdf","docx"]），
+对应框架文档"输入：原稿Word + 排版稿PDF/Word"这条。
+
 ## 未覆盖范围
 
 框架文档把"异常处理（解析失败、API超时重试）"归在阶段10，但这部分早已随
@@ -110,19 +168,19 @@ from datetime import datetime
 import streamlit as st
 
 import config
-from core import exporter, followup, workflow
+from core import exporter, feedback, followup, workflow
 from core.llm_client import LLMCallError
 from core.parser import NoTextLayerError, UnsupportedFormatError
 from core.proofreader import LLMResponseError
 from db.database import init_db
-from db.models import get_issues, get_records
+from db.models import get_feedback, get_issues, get_records
 
 init_db()
 
 st.set_page_config(page_title="出版校对AI助手", layout="wide")
 st.title("出版校对AI助手")
 
-page = st.sidebar.radio("功能入口", ("标准校对", "原稿比对", "历史记录"))
+page = st.sidebar.radio("功能入口", ("标准校对", "原稿比对", "历史记录", "反馈学习"))
 
 
 def _file_id(uploaded_file) -> str:
@@ -178,13 +236,14 @@ def _render_issue_card(issue, issue_id, record_id):
 
         if col_reject.button("拒绝", key=f"reject_{issue_id}"):
             workflow.set_issue_status(issue_id, "已拒绝", record_id=record_id, db_path=None)
+            feedback.record_rejection(issue, issue_id, record_id, db_path=None)
             status_info["status"] = "已拒绝"
             st.rerun()
 
         def _save_note():
             workflow.set_issue_note(issue_id, st.session_state.get(f"note_{issue_id}", ""), db_path=None)
 
-        st.text_input("批注（可选，采纳/拒绝/待处理都可以写）", key=f"note_{issue_id}", on_change=_save_note)
+        st.text_input("批注", key=f"note_{issue_id}", on_change=_save_note)
 
         with st.expander("追问"):
             for turn in followup.get_followup_history(issue_id, db_path=None):
@@ -205,6 +264,55 @@ def _render_issue_card(issue, issue_id, record_id):
                         st.error(f"追问失败：{exc}")
                     else:
                         st.rerun()
+
+
+def _execute_proofread(uploaded_file, mode: str) -> bool:
+    """实际跑一遍 解析→校对→分层→落库，把结果写进 session_state。
+
+    从"开始校对"按钮和"重新校对本文件"按钮两处调用（后者需要 uploaded_file 还没
+    因切页丢失才能直接调用，见 _render_standard_proofread）。返回是否成功——失败
+    时已经用 st.error 展示了原因，调用方只需要据此决定要不要 st.rerun()。
+    """
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    save_path = config.UPLOADS_DIR / f"{timestamp}_{uploaded_file.name}"
+    save_path.write_bytes(uploaded_file.getvalue())
+
+    progress_bar = st.progress(0.0)
+    status_text = st.empty()
+
+    def _on_progress(current, total):
+        progress_bar.progress(current / total if total else 1.0)
+        status_text.text(f"已完成 {current}/{total} 块（所有块并发校对中）…")
+
+    try:
+        with st.spinner("正在校对，请稍候…"):
+            result, parsed = workflow.run_standard_proofread(
+                str(save_path), progress_callback=_on_progress, mode=mode, db_path=None
+            )
+    except (UnsupportedFormatError, NoTextLayerError) as exc:
+        st.error(f"文档解析失败：{exc}")
+        return False
+    except LLMCallError as exc:
+        st.error(f"LLM调用失败（请检查 DASHSCOPE_API_KEY 等配置）：{exc}")
+        return False
+    except LLMResponseError as exc:
+        st.error(f"LLM输出解析失败：{exc}")
+        return False
+    except Exception as exc:  # noqa: BLE001 兜底，避免未预期异常打崩页面
+        st.error(f"校对过程中发生未预期错误：{exc}")
+        return False
+
+    record_id, issue_ids = workflow.persist_result(
+        result, doc_name=uploaded_file.name, parsed=parsed, mode=mode, db_path=None
+    )
+    st.session_state["classified_result"] = result
+    st.session_state["record_id"] = record_id
+    st.session_state["issue_ids"] = issue_ids
+    st.session_state["issue_status"] = {
+        issue_id: {"status": "待处理"} for issue_id in issue_ids
+    }
+    st.session_state["mode"] = mode
+    return True
 
 
 def _render_standard_proofread():
@@ -234,51 +342,26 @@ def _render_standard_proofread():
         if uploaded_file is None:
             return
         if st.button("开始校对"):
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            save_path = config.UPLOADS_DIR / f"{timestamp}_{uploaded_file.name}"
-            save_path.write_bytes(uploaded_file.getvalue())
-
-            progress_bar = st.progress(0.0)
-            status_text = st.empty()
-
-            def _on_progress(current, total):
-                progress_bar.progress(current / total if total else 1.0)
-                status_text.text(f"已完成 {current}/{total} 块（所有块并发校对中）…")
-
-            try:
-                with st.spinner("正在校对，请稍候…"):
-                    result, parsed = workflow.run_standard_proofread(
-                        str(save_path), progress_callback=_on_progress, mode=mode
-                    )
-            except (UnsupportedFormatError, NoTextLayerError) as exc:
-                st.error(f"文档解析失败：{exc}")
-                return
-            except LLMCallError as exc:
-                st.error(f"LLM调用失败（请检查 DASHSCOPE_API_KEY 等配置）：{exc}")
-                return
-            except LLMResponseError as exc:
-                st.error(f"LLM输出解析失败：{exc}")
-                return
-            except Exception as exc:  # noqa: BLE001 兜底，避免未预期异常打崩页面
-                st.error(f"校对过程中发生未预期错误：{exc}")
-                return
-
-            record_id, issue_ids = workflow.persist_result(
-                result, doc_name=uploaded_file.name, parsed=parsed, mode=mode, db_path=None
-            )
-            st.session_state["classified_result"] = result
-            st.session_state["record_id"] = record_id
-            st.session_state["issue_ids"] = issue_ids
-            st.session_state["issue_status"] = {
-                issue_id: {"status": "待处理"} for issue_id in issue_ids
-            }
-            st.session_state["mode"] = mode
-            st.rerun()
+            if _execute_proofread(uploaded_file, mode):
+                st.rerun()
         return
 
     result = st.session_state["classified_result"]
     record_id = st.session_state["record_id"]
     issue_ids = st.session_state["issue_ids"]
+
+    if st.button("🔄 重新校对本文件", key="rerun_proofread"):
+        if uploaded_file is not None:
+            # 文件对象还在（没离开过页面），直接原地重新执行一遍，不需要用户再点一次
+            # "开始校对"、更不需要重新上传。
+            if _execute_proofread(uploaded_file, mode):
+                st.rerun()
+        else:
+            # uploaded_file 因切页丢失（浏览器安全限制，见上方说明），没有文件字节可用，
+            # 没法直接重跑，只能清空缓存结果、退回等待重新上传的状态。
+            st.warning("页面切换后文件已从浏览器丢失，请重新上传该文件后点击「开始校对」。")
+            _reset_session_state()
+            st.rerun()
 
     _render_stats(result.stats, result.warnings, st.session_state.get("mode"))
 
@@ -313,12 +396,13 @@ def _render_standard_proofread():
 
 def _row_to_issue_view(row: dict):
     """把 db.models.get_issues() 返回的原始字典行，包装成 _render_issue_card 期望的
-    属性接口（.priority/.page_location/...），使问题卡渲染逻辑在实时校对流程和历史
-    记录页之间原样复用，不需要为历史记录页另写一套卡片UI。
+    属性接口（.priority/.page_location/...），使问题卡渲染逻辑在实时校对流程、历史
+    记录页、原稿比对结果三处之间原样复用，不需要各自另写一套卡片UI。
 
-    layer_notes 是 ClassifiedIssue 独有字段（归层依据），只在校对当次运行时存在于
-    内存里，从未持久化进 issues 表（阶段5/8设计如此，见 CLAUDE.md）——历史记录页
-    没有这份数据可展示，用一句说明文字占位，不是缺陷、也不假装有数据。
+    layer_notes 是 ClassifiedIssue 独有字段（归层依据），只在标准校对当次运行时存在
+    于内存里，从未持久化进 issues 表（阶段5/8设计如此，见 CLAUDE.md）——从数据库现
+    读出来渲染的场景（历史记录页、原稿比对结果，两者都是先落库再用 get_issues 读回
+    来展示）都没有这份数据可展示，用一句说明文字占位，不是缺陷、也不假装有数据。
     """
     return types.SimpleNamespace(
         priority=row["priority"],
@@ -326,7 +410,7 @@ def _row_to_issue_view(row: dict):
         issue_type=row["issue_type"],
         original_text=row["original_text"],
         suggestion=row["suggestion"],
-        layer_notes=["（历史记录未保存归层依据的详细说明，该字段仅在校对当次运行时于内存中可用）"],
+        layer_notes=["（该字段仅在标准校对当次运行时于内存中可用，未持久化，此处无法展示）"],
     )
 
 
@@ -371,6 +455,100 @@ def _render_history_detail(record_id: int):
             )
 
 
+def _reset_compare_session_state():
+    st.session_state["compare_record_id"] = None
+
+
+def _render_document_comparison():
+    st.header("原稿比对")
+
+    if "compare_record_id" not in st.session_state:
+        _reset_compare_session_state()
+        st.session_state["compare_file_id"] = None
+
+    col_orig, col_fmt = st.columns(2)
+    original_file = col_orig.file_uploader("上传原稿（Word）", type=["docx"], key="compare_original_uploader")
+    formatted_file = col_fmt.file_uploader(
+        "上传排版稿（PDF / Word）", type=["pdf", "docx"], key="compare_formatted_uploader"
+    )
+
+    # 跟标准校对流同一个理由：st.file_uploader 页面切走再切回来会变回 None，不代表
+    # 用户想清空已比对结果，只有真的拿到两份新文件时才判断是否换文件/清缓存。
+    if original_file is not None and formatted_file is not None:
+        file_id = hashlib.md5(original_file.getvalue() + formatted_file.getvalue()).hexdigest()
+        if file_id != st.session_state.get("compare_file_id"):
+            _reset_compare_session_state()
+            st.session_state["compare_file_id"] = file_id
+
+    if st.session_state["compare_record_id"] is None:
+        if original_file is None or formatted_file is None:
+            st.info("请分别上传原稿和排版稿。")
+            return
+        if st.button("开始比对"):
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            original_path = config.UPLOADS_DIR / f"{timestamp}_原稿_{original_file.name}"
+            formatted_path = config.UPLOADS_DIR / f"{timestamp}_排版稿_{formatted_file.name}"
+            original_path.write_bytes(original_file.getvalue())
+            formatted_path.write_bytes(formatted_file.getvalue())
+
+            try:
+                with st.spinner("正在比对，请稍候…"):
+                    diffs, formatted_parsed = workflow.run_document_comparison(
+                        str(original_path), str(formatted_path)
+                    )
+            except (UnsupportedFormatError, NoTextLayerError) as exc:
+                st.error(f"文档解析失败：{exc}")
+                return
+            except Exception as exc:  # noqa: BLE001 兜底，避免未预期异常打崩页面
+                st.error(f"比对过程中发生未预期错误：{exc}")
+                return
+
+            record_id, _ = workflow.persist_comparison_result(
+                diffs,
+                doc_name=f"{original_file.name} / {formatted_file.name}",
+                formatted=formatted_parsed,
+                db_path=None,
+            )
+            st.session_state["compare_record_id"] = record_id
+            st.rerun()
+        return
+
+    record_id = st.session_state["compare_record_id"]
+    rows = get_issues(record_id, db_path=None)
+
+    st.caption(f"共发现 {len(rows)} 处实质性内容改动（排版调整不计入，已自动过滤）。")
+
+    # 复用历史记录页同一套"issue_status刷新+批注预填"逻辑：issue_status是全局共享的
+    # session_state字典，渲染前必须用DB当前值刷新，否则会显示成陈旧/错误的状态。
+    st.session_state.setdefault("issue_status", {})
+    for row in rows:
+        st.session_state["issue_status"][row["issue_id"]] = {"status": row["status"]}
+        note_key = f"note_{row['issue_id']}"
+        if note_key not in st.session_state:
+            st.session_state[note_key] = row["note"] or ""
+
+    if not rows:
+        st.success("未发现排版稿与原稿之间的实质性内容改动。")
+    for row in rows:
+        _render_issue_card(_row_to_issue_view(row), row["issue_id"], record_id)
+
+    st.divider()
+    if st.button("导出Excel", key=f"compare_export_{record_id}"):
+        try:
+            export_path = exporter.export_issues_to_excel(record_id, db_path=None)
+        except Exception as exc:  # noqa: BLE001 兜底，避免导出异常打崩页面
+            st.error(f"导出失败：{exc}")
+        else:
+            st.success(f"已导出：{export_path}")
+            st.download_button(
+                "下载Excel文件",
+                data=export_path.read_bytes(),
+                file_name=export_path.name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"compare_download_{record_id}",
+            )
+
+
 def _render_history():
     st.header("历史记录")
     records = get_records()
@@ -392,10 +570,39 @@ def _render_history():
     _render_history_detail(selected_record_id)
 
 
+def _render_feedback_management():
+    st.header("反馈学习")
+    rows = get_feedback(db_path=None)
+    if not rows:
+        st.info("暂无反馈学习记录。")
+        return
+
+    # 按"是不是同一类问题"聚类展示，不按issue_type分组——issue_type相同不代表同一类
+    # 问题，聚类信号与规则J的count_similar_rejections完全一致（见core/feedback.py），
+    # 管理页看到的分组跟真正驱动自动降级的判定口径始终一致。
+    clusters = feedback.cluster_feedback(rows)
+
+    for cluster in clusters:
+        representative = cluster[0]
+        reached = len(cluster) >= config.FEEDBACK_REJECTION_THRESHOLD
+        badge = "✅ 已达到自动降级阈值" if reached else f"未达阈值({len(cluster)}/{config.FEEDBACK_REJECTION_THRESHOLD})"
+        label = f"{representative['issue_type']}·{representative['suggestion'][:24]}（{len(cluster)}条同类反馈）— {badge}"
+        with st.expander(label):
+            for entry in cluster:
+                st.write(f"原文：{entry['original_text']}")
+                st.write(f"建议：{entry['suggestion']}")
+                st.caption(f"AI说明：{entry['reason'] or '（无）'} · 记录时间：{entry['created_at']}")
+                if st.button("撤销此条反馈", key=f"forget_feedback_{entry['feedback_id']}"):
+                    feedback.forget_feedback(entry["feedback_id"], db_path=None)
+                    st.rerun()
+                st.divider()
+
+
 if page == "标准校对":
     _render_standard_proofread()
 elif page == "原稿比对":
-    st.header("原稿比对")
-    st.info("该功能将在后续阶段实现。")
-else:
+    _render_document_comparison()
+elif page == "历史记录":
     _render_history()
+else:
+    _render_feedback_management()

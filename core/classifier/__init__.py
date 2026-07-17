@@ -11,6 +11,7 @@ RawIssue 做强制归层校验（引文保护、事实置信度降级、OCR低�
 
 from __future__ import annotations
 
+import config
 from core.chunker import ChunkedDocument
 from core.classifier._types import ClassifiedIssue, ClassifiedResult, _ClassificationState
 from core.classifier.base_rules import _BASE_RULES
@@ -30,12 +31,22 @@ def classify_issue(
     raw: RawIssue,
     block_by_index: dict[int, ParsedBlock],
     tail_blocks: set[int] = frozenset(),
+    mode: str = config.PROOFREAD_MODE_DEEP,
+    learned_feedback: list = (),
 ) -> ClassifiedIssue:
-    """对单条 RawIssue 做归层校验，返回带分层标注的 ClassifiedIssue。"""
+    """对单条 RawIssue 做归层校验，返回带分层标注的 ClassifiedIssue。
+
+    mode 控制精简模式下语法结构问题(规则2)统一按风格可选处理这一条基础规则是否生效，
+    不传时按深度模式（现状）处理，见 base_rules.py::_rule_simplified_grammar_as_style。
+
+    learned_feedback（阶段12新增）是 core.feedback.load_learned_feedback() 的产出，
+    驱动 modifier_rules.py 里的规则J（人工反馈学习自动降级）；不传时按空元组处理，
+    等同于该规则从不生效，不影响既有行为。
+    """
     layer = priority = suggestion = None
     notes: list[str] = []
     for rule in _BASE_RULES:
-        result = rule(raw)
+        result = rule(raw, mode)
         if result is not None:
             layer, priority, suggestion, notes = result
             break
@@ -43,7 +54,7 @@ def classify_issue(
     block = block_by_index.get(raw.block_index) if raw.block_index is not None else None
     state = _ClassificationState(layer=layer, priority=priority, suggestion=suggestion, notes=notes)
     for _name, rule in _MODIFIER_RULES:
-        state = rule(raw, block, tail_blocks, state)
+        state = rule(raw, block, tail_blocks, state, learned_feedback)
 
     return ClassifiedIssue(
         original_text=raw.original_text,
@@ -71,16 +82,22 @@ def classify_issues(
     result: ProofreadResult,
     parsed: ParsedDocument,
     chunked: ChunkedDocument | None = None,
+    mode: str = config.PROOFREAD_MODE_DEEP,
+    learned_feedback: list = (),
 ) -> ClassifiedResult:
     """对整份 ProofreadResult 做归层校验、跨块去重、排序并汇总统计。
 
     chunked 非空时启用规则H（分块边界截断误判豁免）；不传时（如离线用RawIssue JSON
-    调规则的调试场景）该规则不生效，其余规则不受影响。
+    调规则的调试场景）该规则不生效，其余规则不受影响。mode 透传给每条 classify_issue，
+    不传时按深度模式（现状）处理。learned_feedback（阶段12新增）同样透传给每条
+    classify_issue，驱动规则J（人工反馈学习自动降级），不传时该规则不生效。
     """
     block_by_index = {b.block_index: b for b in parsed.blocks}
     tail_blocks = _compute_chunk_tail_blocks(chunked)
 
-    classified = [classify_issue(raw, block_by_index, tail_blocks) for raw in result.issues]
+    classified = [
+        classify_issue(raw, block_by_index, tail_blocks, mode, learned_feedback) for raw in result.issues
+    ]
     deduped, dropped = _dedup(classified)
     ordered = _sort(deduped)
     stats = _compute_stats(ordered)
