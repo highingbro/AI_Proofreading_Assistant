@@ -94,7 +94,9 @@ def test_run_standard_proofread_calls_pipeline_in_order():
 
     with patch("core.workflow.run.parse_document", return_value=fake_parsed) as mock_parse, \
          patch("core.workflow.run.chunk_document", return_value=fake_chunked) as mock_chunk, \
+         patch("core.workflow.run.build_glossary", return_value=[]), \
          patch("core.workflow.run.proofread_document", return_value=fake_proofread_result) as mock_proofread, \
+         patch("core.workflow.run.load_learned_feedback", return_value=[]), \
          patch("core.workflow.run.classify_issues", return_value=fake_classified) as mock_classify:
         result, parsed_returned = run_standard_proofread(
             "dummy.pdf", progress_callback=lambda c, t: progress_calls.append((c, t))
@@ -105,7 +107,9 @@ def test_run_standard_proofread_calls_pipeline_in_order():
     mock_proofread.assert_called_once()
     assert mock_proofread.call_args.args[0] is fake_chunked
     assert mock_proofread.call_args.kwargs["progress_callback"] is not None
-    mock_classify.assert_called_once_with(fake_proofread_result, fake_parsed, fake_chunked)
+    mock_classify.assert_called_once_with(
+        fake_proofread_result, fake_parsed, fake_chunked, mode=config.PROOFREAD_MODE_DEEP, learned_feedback=[]
+    )
     # 阶段7起返回 (ClassifiedResult, ParsedDocument) 元组：parsed 要传给 persist_result
     # 计算 context_snippet，ParsedDocument 只在本次调用链上存在，必须一并交出去。
     assert result is fake_classified
@@ -120,11 +124,14 @@ def test_run_standard_proofread_forwards_mode_to_proofread_document():
 
     with patch("core.workflow.run.parse_document", return_value=fake_parsed), \
          patch("core.workflow.run.chunk_document", return_value=fake_chunked), \
+         patch("core.workflow.run.build_glossary", return_value=[]), \
          patch("core.workflow.run.proofread_document", return_value=fake_proofread_result) as mock_proofread, \
-         patch("core.workflow.run.classify_issues", return_value=fake_classified):
+         patch("core.workflow.run.load_learned_feedback", return_value=[]), \
+         patch("core.workflow.run.classify_issues", return_value=fake_classified) as mock_classify:
         run_standard_proofread("dummy.pdf", mode=config.PROOFREAD_MODE_SIMPLIFIED)
 
     assert mock_proofread.call_args.kwargs["mode"] == config.PROOFREAD_MODE_SIMPLIFIED
+    assert mock_classify.call_args.kwargs["mode"] == config.PROOFREAD_MODE_SIMPLIFIED
 
 
 def test_persist_result_writes_record_and_issues_to_temp_db(db_path):
@@ -268,6 +275,74 @@ def test_app_upload_and_classify_flow_with_mocked_workflow(tmp_path, monkeypatch
         assert not at.exception
         mock_set_status.assert_called_once_with(101, "已采纳", record_id=1, db_path=None)
         assert at.session_state["issue_status"][101]["status"] == "已采纳"
+
+
+def test_app_rerun_button_reclassifies_same_file_immediately(tmp_path, monkeypatch):
+    """回归测试：校对完成后，"开始校对"按钮消失（classified_result非None时不再渲染），
+    换文件判断又是按内容md5哈希比对，导致同一份文件校对完想再来一遍时没有任何按钮能
+    触发——必须先换成别的文件再换回来才行。修复后结果展示区顶部的"重新校对本文件"
+    按钮应该在 uploaded_file 还在（没离开过页面）时一次点击就直接重新触发
+    run_standard_proofread，不需要用户再点一次"开始校对"、也不需要重新上传。"""
+    from streamlit.testing.v1 import AppTest
+
+    fake_result = _classified_result_all_layers()
+    fake_parsed = MagicMock(spec=ParsedDocument)
+    monkeypatch.setattr(config, "UPLOADS_DIR", tmp_path)
+
+    with patch("core.workflow.run_standard_proofread", return_value=(fake_result, fake_parsed)) as mock_run, \
+         patch("core.workflow.persist_result", return_value=(1, [101, 102, 103, 104])) as mock_persist, \
+         patch("core.followup.get_followup_history", return_value=[]):
+        at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+        at.run()
+
+        at.file_uploader[0].upload("test.pdf", b"dummy pdf bytes", "application/pdf").run()
+        start_button = next(b for b in at.button if b.label == "开始校对")
+        start_button.click().run()
+        assert not at.exception
+        assert mock_run.call_count == 1
+
+        # 校对完成后不再有"开始校对"按钮，但应该有"重新校对本文件"按钮
+        assert not any(b.label == "开始校对" for b in at.button)
+        rerun_button = next(b for b in at.button if b.key == "rerun_proofread")
+        rerun_button.click().run()
+
+        # uploaded_file 没变（同一次会话没离开过页面），一次点击应该直接重新执行完毕，
+        # 不需要中间再出现/再点一次"开始校对"
+        assert not at.exception
+        assert mock_run.call_count == 2
+        assert mock_persist.call_count == 2
+        assert at.session_state["classified_result"] is fake_result
+
+
+def test_app_rerun_button_falls_back_to_reupload_prompt_when_file_lost(tmp_path, monkeypatch):
+    """uploaded_file 因切页丢失（浏览器安全限制）时，"重新校对本文件"没有文件字节
+    可用，没法直接重跑，应该退回清空缓存+提示重新上传，而不是报错/静默什么都不做。"""
+    from streamlit.testing.v1 import AppTest
+
+    fake_result = _classified_result_all_layers()
+    fake_parsed = MagicMock(spec=ParsedDocument)
+    monkeypatch.setattr(config, "UPLOADS_DIR", tmp_path)
+
+    with patch("core.workflow.run_standard_proofread", return_value=(fake_result, fake_parsed)) as mock_run, \
+         patch("core.workflow.persist_result", return_value=(1, [101, 102, 103, 104])), \
+         patch("core.followup.get_followup_history", return_value=[]):
+        at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+        at.run()
+
+        at.file_uploader[0].upload("test.pdf", b"dummy pdf bytes", "application/pdf").run()
+        start_button = next(b for b in at.button if b.label == "开始校对")
+        start_button.click().run()
+        assert mock_run.call_count == 1
+
+        at.file_uploader[0].clear().run()  # 模拟切页导致 uploaded_file 变回 None
+
+        rerun_button = next(b for b in at.button if b.key == "rerun_proofread")
+        rerun_button.click().run()
+
+        assert not at.exception
+        assert mock_run.call_count == 1  # 没有文件字节，不应该尝试重跑
+        assert len(at.warning) >= 1
+        assert at.session_state["classified_result"] is None
 
 
 def test_app_mode_radio_selection_forwarded_to_workflow(tmp_path, monkeypatch):

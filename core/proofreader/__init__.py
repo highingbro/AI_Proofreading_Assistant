@@ -36,7 +36,10 @@ _RETRY_HINT = "你上次输出不是合法JSON，只输出JSON数组。"
 # ---------------------------------------------------------------------------
 
 def proofread_chunk(
-    chunk: Chunk, parsed: ParsedDocument, mode: str = config.PROOFREAD_MODE_DEEP
+    chunk: Chunk,
+    parsed: ParsedDocument,
+    mode: str = config.PROOFREAD_MODE_DEEP,
+    glossary_text: str = "",
 ) -> list[RawIssue]:
     """对单个文本块执行校对，返回结构化问题列表。
 
@@ -47,8 +50,12 @@ def proofread_chunk(
 
     mode 控制注入LLM的校对规则子集（config.PROOFREAD_MODE_DEEP/PROOFREAD_MODE_SIMPLIFIED），
     默认深度模式，与该参数新增前的行为一致。
+
+    glossary_text：core/glossary.py::build_glossary()+format_glossary_for_prompt() 产出
+    的全局术语表文本（默认空字符串=没有这份参照），透传给 _build_system_prompt 注入
+    提示词，解决chunk间互不可见导致的跨块一致性误判（详见 core/glossary.py 模块docstring）。
     """
-    system_prompt = _build_system_prompt(mode)
+    system_prompt = _build_system_prompt(mode, glossary_text)
     body_text, overlap_text = _split_body_overlap(chunk.text)
 
     user_content = chunk.text
@@ -109,7 +116,10 @@ def proofread_chunk(
 
 
 def proofread_document(
-    chunked: ChunkedDocument, progress_callback=None, mode: str = config.PROOFREAD_MODE_DEEP
+    chunked: ChunkedDocument,
+    progress_callback=None,
+    mode: str = config.PROOFREAD_MODE_DEEP,
+    glossary_text: str = "",
 ) -> ProofreadResult:
     """并发调用 proofread_chunk 校对所有 chunk，单块失败不中断其余块。
 
@@ -119,6 +129,9 @@ def proofread_document(
     状态（每次调用用的都是局部变量），天然线程安全，不需要额外加锁。
 
     mode 透传给每个 proofread_chunk 调用，控制校对规则子集，默认深度模式。
+    glossary_text 同样透传给每个 proofread_chunk 调用——全局术语表只在文档级
+    构建一次（core/workflow/run.py 调用 build_glossary），所有chunk共享同一份，
+    不是每个chunk各建各的。
     """
     total = len(chunked.chunks)
     if total == 0:
@@ -129,7 +142,7 @@ def proofread_document(
 
     with ThreadPoolExecutor(max_workers=total) as executor:
         future_to_index = {
-            executor.submit(proofread_chunk, chunk, chunked.source, mode): (i, chunk)
+            executor.submit(proofread_chunk, chunk, chunked.source, mode, glossary_text): (i, chunk)
             for i, chunk in enumerate(chunked.chunks)
         }
         # as_completed 本身在调用方（主线程）里顺序迭代，循环体不并发执行，

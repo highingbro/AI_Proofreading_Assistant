@@ -20,8 +20,11 @@ def _strip_code_fence(text: str) -> str:
 
 
 def _parse_json_array(raw_text: str) -> list[dict]:
+    """strict=False：LLM常在reason/suggestion等字符串字段里直接输出裸换行/制表符等控制
+    字符而不转义成\\n/\\t，标准json.loads(strict=True)会报"Invalid control character"，
+    但这类内容本身是合法的多行文本，不是LLM输出格式错误，不该被当成需要重试的坏JSON。"""
     stripped = _strip_code_fence(raw_text)
-    data = json.loads(stripped)
+    data = json.loads(stripped, strict=False)
     if not isinstance(data, list):
         raise ValueError("LLM输出不是JSON数组")
     return data

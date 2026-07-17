@@ -17,10 +17,10 @@ for _dir in (DATA_DIR, UPLOADS_DIR, EXPORTS_DIR):
     _dir.mkdir(parents=True, exist_ok=True)
 
 # ---------- 结果分层常量 ----------
-LAYER_CONFIRMED = "确定性错误"
-LAYER_DOUBTFUL = "存疑待核实"
+LAYER_CONFIRMED = "错误类"
+LAYER_DOUBTFUL = "存疑类"
 LAYER_QUOTATION = "引文类"
-LAYER_OPTIONAL = "风格可选"
+LAYER_OPTIONAL = "风格类"
 
 LAYERS = (LAYER_CONFIRMED, LAYER_DOUBTFUL, LAYER_QUOTATION, LAYER_OPTIONAL)
 
@@ -42,13 +42,19 @@ PROOFREAD_MODES = (PROOFREAD_MODE_DEEP, PROOFREAD_MODE_SIMPLIFIED)  # UI单选�
 
 SIMPLIFIED_RULE_NUMBERS = (1, 2, 9, 10)
 
+# 精简模式补丁：规则1(错别字与拼写)内部"汉字冒充标点符号"这类零歧义的纯排版惯例问题
+# （如数词"一"被当成破折号/连接号使用，形近但不是标点，读者理解完全不受影响），和"的/地/得"
+# 这类真正可能改变语义/引起误解的错别字不是一回事，精简模式下按风格可选处理。只用建议措辞
+# 命中下列连接类标点关键词识别，命中才降级；宁可漏判也不误伤真正的错别字。
+SIMPLIFIED_TYPO_PUNCTUATION_KEYWORDS = ("破折号", "连接号", "短横线", "分隔号", "间隔号")
+
 # ---------- LLM API 配置（阶段4使用）----------
 # 默认走 DashScope 兼容模式公开固定地址；仍支持 LLM_BASE_URL 环境变量覆盖（换服务商时不用改代码）。
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 # 实际使用的密钥环境变量是 DASHSCOPE_API_KEY（阿里云DashScope标准命名），这个没有默认值，必须设置。
 LLM_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 # 模型直接指定 qwen3.6-plus，不强制要求环境变量；仍支持 LLM_MODEL 环境变量覆盖。
-LLM_MODEL = os.environ.get("LLM_MODEL", "glm-5.1")
+LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.5-flash-2026-02-23")
 # 不设默认值：留空(None)时 chat_completion 按文本长度动态估算超时（见下方 LLM_TIMEOUT_* 四项）；
 # 一旦设置该环境变量，视为显式指定固定超时，不再动态估算。
 LLM_TIMEOUT = int(os.environ["LLM_TIMEOUT"]) if os.environ.get("LLM_TIMEOUT") else None
@@ -130,6 +136,19 @@ OVERLAP_BLOCKS = 2
 CHUNK_OVERLAP_MARK = "【上文回顾，仅供理解上下文，此部分的问题不要报告】"
 CHUNK_BODY_MARK = "【正文开始，请校对以下内容】"
 
+# ---------- 全局术语表配置（补丁：解决chunk间互不可见导致的一致性误判）----------
+# 校对前先统计文档里反复出现的候选词条（人名/机构名/专有术语候选），只把候选词条列表
+# （不是全文）交给一次LLM调用做语义分类+同名异写检测，产出"全局术语表"注入每个chunk的
+# 校对提示词，解决同一实体在不同chunk写法不一致（如"张三"/"张叁"）完全检测不到的问题。
+# 详见 core/glossary.py 模块docstring。
+GLOSSARY_NGRAM_MIN_LEN = 2
+GLOSSARY_NGRAM_MAX_LEN = 6
+# 候选词条最少重复出现次数，低于此值大概率是偶然片段而非有意义的实体/术语
+GLOSSARY_MIN_FREQUENCY = 3
+# 送去给LLM分类的候选词条上限（按频次降序截断），控制该次LLM调用的输入体量，
+# 不随文档长度线性增长
+GLOSSARY_CANDIDATE_TOP_K = 150
+
 # ---------- 结果分层配置（阶段5使用）----------
 # 规则C：block的OCR置信度低于该阈值时，"错别字/标点"类问题降级（很可能是OCR认错字而非原文真错，
 # 如 AI→A1、形近字误判）。初值是拍脑袋定的，等真实文档跑起来后按"被降级条目里真OCR错/真原文错"
@@ -172,8 +191,31 @@ RECENCY_DOUBT_KEYWORDS = (
     "较新", "尚未听说", "无法确认该时间点", "超出我的知识",
 )
 
+# ---------- 原稿比对配置（阶段9使用）----------
+# 句子级diff的切分标点：按这几个句末标点把段落切成句子列表再逐句比较，标点保留在
+# 前一句末尾（core/comparer.py::_split_sentences 用零宽断言切分，不消耗字符）。
+COMPARE_SENTENCE_SPLIT_PUNCTUATION = "。！？；"
+# replace区间内两段相似度（difflib.SequenceMatcher.ratio()）低于此值，判定不是同一段
+# 的改写，分别标记为删除+插入，不再往下做句子级diff。
+COMPARE_PARAGRAPH_MATCH_MIN_RATIO = 0.5
+
+DIFF_LAYER_SUBSTANTIVE = "实质性改动"
+DIFF_LAYER_FORMATTING = "排版调整"  # 当前实现不主动产出（归一化后完全相同的差异直接跳过），保留用于表结构完整性
+
 # ---------- 追问上下文配置（阶段7使用）----------
 # 追问时携带的原文上下文窗口：取issue所在block前后各N个block拼接，控制token成本（T5）。
 FOLLOWUP_CONTEXT_WINDOW_BLOCKS = 2
 # 同一条issue被多次追问时，只把最近N轮问答拼进prompt注入历史（更早的仍完整存库，只是不再喂给LLM）。
 FOLLOWUP_MAX_HISTORY_TURNS = 5
+
+# ---------- 用户反馈学习配置（阶段12使用）----------
+# 同一类问题（issue_type相同，原文精确重复或AI修改建议高度相似）累计被人工拒绝达到这个
+# 次数才自动降级为风格可选，避免手滑拒绝一次就永久压掉一类问题。用户指定初值3，太敏感/
+# 太迟钝都只改这里，不用碰 core/classifier/modifier_rules.py。
+FEEDBACK_REJECTION_THRESHOLD = 3
+# difflib.SequenceMatcher.ratio() 阈值，判断两条issue的AI修改建议(suggestion)或判定依据
+# (reason)——归一化去掉具体数字/引号内容后（core/feedback.py::_normalize_variable_parts）
+# ——是否属于同一种"没有意义的改动"（而非同一句原文的字面重复，也不要求同一份文档）。
+# 早期版本只用suggestion、阈值0.70；归一化上线后剥离了大部分误判来源，用户要求把reason也
+# 纳入判定、阈值调低到0.60，调阈值只改这里。
+FEEDBACK_SIMILARITY_THRESHOLD = 0.60

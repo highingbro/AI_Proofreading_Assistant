@@ -221,3 +221,66 @@ def get_records(db_path=None) -> list[dict]:
         return [dict(row) for row in rows]
     finally:
         conn.close()
+
+
+def add_feedback(
+    issue_type: str,
+    original_text: str,
+    suggestion: str,
+    reason: str | None = None,
+    source_issue_id: int | None = None,
+    source_record_id: int | None = None,
+    db_path=None,
+) -> int:
+    """插入一条人工反馈记录（阶段12：拒绝issue时调用），返回 feedback_id。"""
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO feedback (
+                created_at, issue_type, original_text, suggestion, reason,
+                source_issue_id, source_record_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now().isoformat(),
+                issue_type,
+                original_text,
+                suggestion,
+                reason,
+                source_issue_id,
+                source_record_id,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def get_feedback(issue_type: str | None = None, db_path=None) -> list[dict]:
+    """按时间倒序列出人工反馈记录，可选按 issue_type 过滤。"""
+    conn = get_connection(db_path)
+    try:
+        if issue_type is None:
+            rows = conn.execute(
+                "SELECT * FROM feedback ORDER BY created_at DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM feedback WHERE issue_type = ? ORDER BY created_at DESC",
+                (issue_type,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def delete_feedback(feedback_id: int, db_path=None) -> None:
+    """删除一条人工反馈记录（管理页"撤销"操作调用）。"""
+    conn = get_connection(db_path)
+    try:
+        conn.execute("DELETE FROM feedback WHERE feedback_id = ?", (feedback_id,))
+        conn.commit()
+    finally:
+        conn.close()

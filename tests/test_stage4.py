@@ -106,6 +106,37 @@ def test_parse_fenced_json(monkeypatch):
     assert issues[0].original_text == "围栏片段"
 
 
+def test_parse_json_with_raw_control_character_in_string_succeeds_without_retry(monkeypatch):
+    """回归测试：真实使用中LLM在reason字段里直接输出裸换行（未转义成\\n），
+    真实报错 "Invalid control character at: line 40 column 45"。这类内容本身是合法的
+    多行文本，不该被当成坏JSON触发重试（重试意味着整块再等一轮LLM调用，真实耗时178秒）。
+    """
+    block_text = "这段正文包含控制字符片段用于解析测试。"
+    blocks = [ParsedBlock(page=1, block_index=0, text=block_text, block_type="paragraph", source_location="第1段")]
+    parsed = _synthetic_doc(blocks)
+    chunk = _make_chunk(block_text, [0])
+
+    calls = []
+    # 手写JSON字符串，reason字段内嵌一个裸换行（不是"\\n"转义），模拟真实LLM输出。
+    raw_response = (
+        '[{"original_text": "控制字符片段", "issue_type": "标点符号问题", '
+        '"category": "normal", "confidence": "high", "suggestion": "建议修改", '
+        '"reason": "第一行依据\n第二行依据"}]'
+    )
+
+    def fake_chat_completion(system_prompt, user_content):
+        calls.append(user_content)
+        return raw_response
+
+    monkeypatch.setattr(proofreader, "chat_completion", fake_chat_completion)
+
+    issues = proofread_chunk(chunk, parsed)
+    assert len(calls) == 1  # 不应触发重试
+    assert len(issues) == 1
+    assert issues[0].original_text == "控制字符片段"
+    assert issues[0].reason == "第一行依据\n第二行依据"
+
+
 def test_parse_invalid_json_retries_then_succeeds(monkeypatch):
     block_text = "这段正文包含重试片段用于解析测试。"
     blocks = [ParsedBlock(page=1, block_index=0, text=block_text, block_type="paragraph", source_location="第1段")]
@@ -300,7 +331,7 @@ def test_proofread_document_forwards_mode_to_proofread_chunk(monkeypatch):
 
     captured_modes = []
 
-    def fake_proofread_chunk(chunk, parsed_doc, mode):
+    def fake_proofread_chunk(chunk, parsed_doc, mode, glossary_text=""):
         captured_modes.append(mode)
         return []
 
@@ -326,7 +357,7 @@ def test_proofread_document_isolates_chunk_failures(monkeypatch):
 
     call_count = [0]
 
-    def fake_proofread_chunk(chunk, parsed_doc, mode):
+    def fake_proofread_chunk(chunk, parsed_doc, mode, glossary_text=""):
         call_count[0] += 1
         if chunk.chunk_index == 0:
             raise LLMCallError("模拟调用失败")
@@ -370,7 +401,7 @@ def test_proofread_document_runs_chunks_concurrently(monkeypatch):
     in_flight = 0
     max_in_flight = 0
 
-    def fake_proofread_chunk(chunk, parsed_doc, mode):
+    def fake_proofread_chunk(chunk, parsed_doc, mode, glossary_text=""):
         nonlocal in_flight, max_in_flight
         with lock:
             in_flight += 1

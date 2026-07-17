@@ -8,12 +8,16 @@ from core.parser import ParsedDocument
 from db.models import add_issue, create_record
 
 
-def _build_context_snippet(parsed: ParsedDocument, block_index: int) -> str:
+def build_context_snippet(parsed: ParsedDocument, block_index: int) -> str:
     """取 block_index 前后各 config.FOLLOWUP_CONTEXT_WINDOW_BLOCKS 个block的文本拼接。
 
     直接用列表下标而不线性扫描 block_index 字段：core/parser 无论走PDF原生/OCR/Word
     哪条通道，都是按阅读顺序把 ParsedBlock append 进 blocks 列表的同时用同一个递增计数器
     赋 block_index，所以 parsed.blocks[i].block_index == i 恒成立。
+
+    原为 persist_result 私有（_build_context_snippet），阶段9原稿比对新增
+    persist_comparison_result 后需要复用同一份"取上下文窗口"逻辑，提升为公开函数，
+    不重复实现。
     """
     window = config.FOLLOWUP_CONTEXT_WINDOW_BLOCKS
     lo = max(0, block_index - window)
@@ -58,7 +62,7 @@ def persist_result(
     for issue in result.issues:
         context_snippet = None
         if parsed is not None and issue.block_index is not None:
-            context_snippet = _build_context_snippet(parsed, issue.block_index)
+            context_snippet = build_context_snippet(parsed, issue.block_index)
         issue_id = add_issue(
             record_id=record_id,
             page_location=issue.page_location,
@@ -67,6 +71,57 @@ def persist_result(
             priority=issue.priority,
             layer=issue.layer,
             suggestion=issue.suggestion,
+            context_snippet=context_snippet,
+            db_path=db_path,
+        )
+        issue_ids.append(issue_id)
+
+    return record_id, issue_ids
+
+
+def persist_comparison_result(
+    diffs: list[dict],
+    doc_name: str,
+    doc_version: str = "",
+    formatted: ParsedDocument | None = None,
+    db_path=None,
+) -> tuple[int, list[int]]:
+    """把原稿比对（core.comparer.compare_documents）产出的差异条目落库。
+
+    复用 records/issues 两张通用表，不新建表结构——task_type 固定为"原稿比对"，
+    issue_type/layer 填差异特有的值（"新增内容"/"删除内容"/"文字替换"，层级恒为
+    config.DIFF_LAYER_SUBSTANTIVE，因为 compare_documents 已经把归一化后相同的纯
+    排版差异过滤掉了）。priority 固定为 config.PRIORITY_MEDIUM，比对场景不像标准
+    校对那样需要区分优先级。
+
+    formatted 非空时用 build_context_snippet 计算每条已定位差异（diff['block_index']
+    非None）的上下文——与 persist_result 是同一份逻辑，diff['block_index'] 取自差异
+    条目在排版稿里对应的 ParsedBlock.block_index（纯新增的条目没有对应的原稿block，
+    block_index 为 None，context_snippet 留空）。
+
+    返回 (record_id, issue_ids)，issue_ids 与 diffs 顺序一一对应。
+    """
+    record_id = create_record(
+        doc_name=doc_name,
+        doc_version=doc_version,
+        task_type="原稿比对",
+        total_issues=len(diffs),
+        db_path=db_path,
+    )
+
+    issue_ids = []
+    for diff in diffs:
+        context_snippet = None
+        if formatted is not None and diff.get("block_index") is not None:
+            context_snippet = build_context_snippet(formatted, diff["block_index"])
+        issue_id = add_issue(
+            record_id=record_id,
+            page_location=diff["page_location"],
+            original_text=diff["original_text"],
+            issue_type=diff["diff_type"],
+            priority=config.PRIORITY_MEDIUM,
+            layer=diff["layer"],
+            suggestion=diff["suggestion"],
             context_snippet=context_snippet,
             db_path=db_path,
         )

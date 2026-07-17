@@ -62,6 +62,9 @@ def main() -> None:
     parser.add_argument("file_path")
     parser.add_argument("--max-chunks", type=int, default=None, help="全链路模式下只跑前N块（省额度）")
     parser.add_argument("--from-json", default=None, help="从--save-json保存的RawIssue JSON直接分层，不耗额度")
+    parser.add_argument(
+        "--mode", default=config.PROOFREAD_MODE_DEEP, choices=config.PROOFREAD_MODES, help="校对模式（精简/深度），默认深度"
+    )
     args = parser.parse_args()
 
     if args.from_json:
@@ -69,7 +72,7 @@ def main() -> None:
     else:
         result, parsed = _run_full_pipeline(args.file_path, args.max_chunks)
 
-    classified = classify_issues(result, parsed)
+    classified = classify_issues(result, parsed, mode=args.mode)
 
     for layer in config.LAYERS:
         layer_issues = [i for i in classified.issues if i.layer == layer]
