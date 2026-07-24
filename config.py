@@ -12,9 +12,14 @@ DATA_DIR = BASE_DIR / "data"
 UPLOADS_DIR = DATA_DIR / "uploads"
 EXPORTS_DIR = DATA_DIR / "exports"
 DB_PATH = DATA_DIR / "app.db"
+LOG_PATH = DATA_DIR / "app.log"
 
 for _dir in (DATA_DIR, UPLOADS_DIR, EXPORTS_DIR):
     _dir.mkdir(parents=True, exist_ok=True)
+
+# 上传文件落盘只是为了给 parse_document 一个路径读，用完即弃、不进 records 表，
+# 不删会无限堆积。每次写入后只保留最近这么多个文件（按修改时间），多余的直接删除。
+UPLOADS_RETENTION_COUNT = 10
 
 # ---------- 结果分层常量 ----------
 LAYER_CONFIRMED = "错误类"
@@ -32,7 +37,7 @@ PRIORITY_OPTIONAL = "可选"
 
 PRIORITIES = (PRIORITY_HIGH, PRIORITY_MEDIUM, PRIORITY_LOW, PRIORITY_OPTIONAL)
 
-# ---------- 校对模式配置（补丁：模式选择功能新增）----------
+# ---------- 校对模式配置 ----------
 # 深度=现有全十类行为（默认，向后兼容一切不显式传mode的旧调用方）；精简=仅保留
 # 机械性错别字检查(规则1)+语法结构(规则2)+两类高敏感度红线检查(规则9/10)，语义/
 # 引用/事实类判断(3-8)对不需要出版级严格校对的普通文档误报率相对更高，非必需。
@@ -42,34 +47,47 @@ PROOFREAD_MODES = (PROOFREAD_MODE_DEEP, PROOFREAD_MODE_SIMPLIFIED)  # UI单选�
 
 SIMPLIFIED_RULE_NUMBERS = (1, 2, 9, 10)
 
-# 精简模式补丁：规则1(错别字与拼写)内部"汉字冒充标点符号"这类零歧义的纯排版惯例问题
+# 精简模式下，规则1(错别字与拼写)内部"汉字冒充标点符号"这类零歧义的纯排版惯例问题
 # （如数词"一"被当成破折号/连接号使用，形近但不是标点，读者理解完全不受影响），和"的/地/得"
-# 这类真正可能改变语义/引起误解的错别字不是一回事，精简模式下按风格可选处理。只用建议措辞
-# 命中下列连接类标点关键词识别，命中才降级；宁可漏判也不误伤真正的错别字。
+# 这类真正可能改变语义/引起误解的错别字不是一回事，按风格可选处理。只用建议措辞命中下列
+# 连接类标点关键词识别，命中才降级；宁可漏判也不误伤真正的错别字。
 SIMPLIFIED_TYPO_PUNCTUATION_KEYWORDS = ("破折号", "连接号", "短横线", "分隔号", "间隔号")
 
-# ---------- LLM API 配置（阶段4使用）----------
+# ---------- 校对并发配置（core/proofreader/使用）----------
+# 原先不设并发上限（一次性提交全部块），实测账号RPM/TPM额度远够用；但 data/app.log
+# 真实数据显示瓶颈不是账号限流，而是模型服务端实际并发处理能力——29个块一次性
+# 全发时，先完成的也要170~230s（对比低并发下的47~66s），后完成的拖到300~570s甚至
+# 撞上超时上限集体失败，失败后的整批重试还会把同样的拥堵原样重演一次。改成分批、
+# 每批最多这么多个块并发，避免请求数超过服务端实际承载能力后排队时间反超收益。
+# 具体数值凭日志间接推断（不是精确压测得出），后续如有更多实测数据可调整。
+PROOFREAD_MAX_CONCURRENT_CHUNKS = 8
+
+# ---------- LLM API 配置（core/llm_client.py使用）----------
 # 默认走 DashScope 兼容模式公开固定地址；仍支持 LLM_BASE_URL 环境变量覆盖（换服务商时不用改代码）。
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 # 实际使用的密钥环境变量是 DASHSCOPE_API_KEY（阿里云DashScope标准命名），这个没有默认值，必须设置。
 LLM_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 # 模型直接指定 qwen3.6-plus，不强制要求环境变量；仍支持 LLM_MODEL 环境变量覆盖。
-LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.5-flash-2026-02-23")
+LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
 # 不设默认值：留空(None)时 chat_completion 按文本长度动态估算超时（见下方 LLM_TIMEOUT_* 四项）；
 # 一旦设置该环境变量，视为显式指定固定超时，不再动态估算。
 LLM_TIMEOUT = int(os.environ["LLM_TIMEOUT"]) if os.environ.get("LLM_TIMEOUT") else None
 # 动态超时估算参数：timeout = 基础值 + 总字符数(system_prompt+user_content) × 每字符系数，限定在[MIN, MAX]区间。
-# 系数来自阶段4实测（qwen3.6-plus，300秒超时下，3900~5600字总输入实际耗时178~212秒），
-# 同规模输入耗时波动可达20秒以上（推测与实际问题条数/输出长度有关，不只取决于输入长度），
-# 系数刻意取宽松，避免把仍在正常处理的请求判定超时、触发不必要的重试。
+# 系数原本来自实测（qwen3.6-plus，300秒超时下，3900~5600字总输入实际耗时178~212秒），
+# 但 data/app.log 真实数据显示当前实际使用的模型（默认LLM_MODEL="glm-5.1"，与这组系数
+# 实测时用的模型不一致）耗时经常逼近/超过按这组系数算出的估算值（约5400字输入估算
+# ~280s，真实成功耗时集中在210~274s，大量请求在280s边界被提前判超时、触发本可避免的
+# 重试），说明这组系数对当前模型偏紧。MIN/MAX 都改成 900，让 bounded 恒等于900，不再
+# 按输入长度动态估算——BASE/PER_CHAR 两个系数暂时不生效（仍保留，方便以后想恢复动态
+# 估算或用新数据重新拟合系数时参考），只改这两行就能整体调宽。
 LLM_TIMEOUT_BASE_SECONDS = 90
 LLM_TIMEOUT_PER_CHAR_SECONDS = 0.035
-LLM_TIMEOUT_MIN_SECONDS = 120
-LLM_TIMEOUT_MAX_SECONDS = 600
+LLM_TIMEOUT_MIN_SECONDS = 900
+LLM_TIMEOUT_MAX_SECONDS = 900
 LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "3"))
 LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0"))
 
-# ---------- 文档解析配置（阶段2使用）----------
+# ---------- 文档解析配置（core/parser/使用）----------
 # OCR 推理设备：'auto' 运行时自动检测（有可用GPU则用GPU，否则CPU）/'gpu'/'cpu'。
 # GPU 上推理比 CPU 快一到两个数量级，且不走 CPU 那条有已知算子兼容问题的
 # MKL-DNN+PIR 路径（见 core/parser.py 里对设备与 MKL-DNN 的处理）。
@@ -93,6 +111,14 @@ COLUMN_MIN_GAP_WIDTH_RATIO = 0.05
 # 会严重失衡，据此过滤误判。按块宽度过滤"宽块"并不可靠——同一版面解析
 # 模型对单栏/双栏文本的分块粒度本身就不稳定，窄块在两种情况下都很常见）
 COLUMN_BALANCE_MIN_RATIO = 0.25
+
+# A类：PyMuPDF把block内多行文本拼接时，判断相邻两个"line"是否其实是PyMuPDF自己误拆的
+# 同一视觉行（如项目符号用符号字体+和正文间有较大缩进间隙时，PyMuPDF行聚类偶尔会按字体/
+# 间隙把同一行拆成两个line对象）——y轴重叠长度占较小那个line自身高度的比例达到此阈值，
+# 判定为同一行，拼接时用空格而非换行符（避免"项目符号应换行"这类伪问题，见
+# core/parser/CLAUDE.md）。真实数据验证过：真正被误拆的同一行重叠比例是100%，真正
+# 不同行的重叠比例是0，阈值取中间值留出充分余量，不会误伤真正的换行。
+NATIVE_SAME_ROW_OVERLAP_MIN_RATIO = 0.5
 
 # B类（OCR）跨页检测：宽高比超过该阈值才可能是两页拼接的横版扫描
 SPREAD_ASPECT_RATIO_THRESHOLD = 1.6
@@ -120,7 +146,7 @@ PADDLEOCR_LANG = "ch"
 PADDLEOCR_DET_MODEL = None   # 备选 "PP-OCRv5_server_det"（本机已缓存），需先补更大样本A/B再启用
 PADDLEOCR_REC_MODEL = None   # 备选 "PP-OCRv5_server_rec"，理由同上
 
-# ---------- 长文档分块配置（阶段3使用）----------
+# ---------- 长文档分块配置（core/chunker/使用）----------
 # 目标块大小（字符数）：贪心装填时，加入下一个 block 会超过该值就收束当前块。
 # 中文场景下字符数与 token 数近似线性，不引入 tokenizer 依赖。
 CHUNK_SIZE_TARGET = 3000
@@ -131,25 +157,12 @@ CHUNK_SIZE_MAX = 4500
 # 每个块（第一块除外）携带的前向重叠 block 数，供LLM理解上下文
 OVERLAP_BLOCKS = 2
 
-# 分块文本中“重叠区”与“正文”的分隔标记。阶段4的校对提示词会引用同一常量，
+# 分块文本中“重叠区”与“正文”的分隔标记。core/proofreader/ 的校对提示词会引用同一常量，
 # 提醒模型重叠区问题不要重复报告。
 CHUNK_OVERLAP_MARK = "【上文回顾，仅供理解上下文，此部分的问题不要报告】"
 CHUNK_BODY_MARK = "【正文开始，请校对以下内容】"
 
-# ---------- 全局术语表配置（补丁：解决chunk间互不可见导致的一致性误判）----------
-# 校对前先统计文档里反复出现的候选词条（人名/机构名/专有术语候选），只把候选词条列表
-# （不是全文）交给一次LLM调用做语义分类+同名异写检测，产出"全局术语表"注入每个chunk的
-# 校对提示词，解决同一实体在不同chunk写法不一致（如"张三"/"张叁"）完全检测不到的问题。
-# 详见 core/glossary.py 模块docstring。
-GLOSSARY_NGRAM_MIN_LEN = 2
-GLOSSARY_NGRAM_MAX_LEN = 6
-# 候选词条最少重复出现次数，低于此值大概率是偶然片段而非有意义的实体/术语
-GLOSSARY_MIN_FREQUENCY = 3
-# 送去给LLM分类的候选词条上限（按频次降序截断），控制该次LLM调用的输入体量，
-# 不随文档长度线性增长
-GLOSSARY_CANDIDATE_TOP_K = 150
-
-# ---------- 结果分层配置（阶段5使用）----------
+# ---------- 结果分层配置（core/classifier/使用）----------
 # 规则C：block的OCR置信度低于该阈值时，"错别字/标点"类问题降级（很可能是OCR认错字而非原文真错，
 # 如 AI→A1、形近字误判）。初值是拍脑袋定的，等真实文档跑起来后按"被降级条目里真OCR错/真原文错"
 # 的实际比例调整——调阈值只改这里，不用碰 classifier.py。
@@ -178,7 +191,7 @@ STYLE_KEYWORDS = ("更通顺", "更简洁", "建议润色")
 # "优先标注、单独提醒"的要求），直接引用 proofread_rules.md 里的类目原文，不是新定义的名称。
 HIGH_PRIORITY_ISSUE_TYPES = ("政治敏感性表述", "民族与地名规范")
 
-# 规则G（补丁，真实使用中发现后追加，非stage5原始设计）：知识时效性误判豁免。
+# 规则G：知识时效性误判豁免。
 # LLM可能仅因为某个年份/日期超出了它的训练数据覆盖范围就怀疑"这看起来太新/我没见过"，
 # 但这种怀疑只针对"这个时间点本身是否存在"，不针对"该时间点发生的事是否属实"——是知识
 # 时效性局限造成的误判，不是真正的事实性错误。命中下面关键词+年份在容忍窗口内时，把该
@@ -191,7 +204,12 @@ RECENCY_DOUBT_KEYWORDS = (
     "较新", "尚未听说", "无法确认该时间点", "超出我的知识",
 )
 
-# ---------- 原稿比对配置（阶段9使用）----------
+# 规则J：LLM在reason/suggestion里自己描述"这是版式错乱/跨行错位/乱码"时的兜底降级
+# 关键词——真实数据（data/app.db 35号记录）里出现过的原话摘出，命中任一即认为
+# LLM自己都没看懂被打乱的版面，不是"一眼就能看出"的确定性语言错误。
+LAYOUT_ARTIFACT_KEYWORDS = ("排版错乱", "跨行", "错行", "错位", "乱码", "段落顺序", "图片位置")
+
+# ---------- 原稿比对配置（core/comparer.py使用）----------
 # 句子级diff的切分标点：按这几个句末标点把段落切成句子列表再逐句比较，标点保留在
 # 前一句末尾（core/comparer.py::_split_sentences 用零宽断言切分，不消耗字符）。
 COMPARE_SENTENCE_SPLIT_PUNCTUATION = "。！？；"
@@ -202,20 +220,25 @@ COMPARE_PARAGRAPH_MATCH_MIN_RATIO = 0.5
 DIFF_LAYER_SUBSTANTIVE = "实质性改动"
 DIFF_LAYER_FORMATTING = "排版调整"  # 当前实现不主动产出（归一化后完全相同的差异直接跳过），保留用于表结构完整性
 
-# ---------- 追问上下文配置（阶段7使用）----------
+# ---------- 追问上下文配置（core/followup.py使用）----------
 # 追问时携带的原文上下文窗口：取issue所在block前后各N个block拼接，控制token成本（T5）。
 FOLLOWUP_CONTEXT_WINDOW_BLOCKS = 2
 # 同一条issue被多次追问时，只把最近N轮问答拼进prompt注入历史（更早的仍完整存库，只是不再喂给LLM）。
 FOLLOWUP_MAX_HISTORY_TURNS = 5
 
-# ---------- 用户反馈学习配置（阶段12使用）----------
-# 同一类问题（issue_type相同，原文精确重复或AI修改建议高度相似）累计被人工拒绝达到这个
-# 次数才自动降级为风格可选，避免手滑拒绝一次就永久压掉一类问题。用户指定初值3，太敏感/
-# 太迟钝都只改这里，不用碰 core/classifier/modifier_rules.py。
+# ---------- 用户反馈学习配置（见core/feedback_rules.py）----------
+# 历史拒绝记录整批交给LLM做语义总结，只有真正同一类原因被拒绝的才归并成一条规则，
+# 注入校对提示词，让LLM在生成建议这一步就主动规避（不用字符串相似度比对——同一句式
+# 模板如"改为『A』或『B』"会让语义无关的建议被误判为同类，见core/feedback_rules.py
+# 模块docstring）。
+#
+# 总结出的每条规则必须有至少这么多条历史反馈佐证才成立——既写进
+# prompt/feedback_rules_system.md 提示LLM，也在 core/feedback_rules.py 里对LLM输出的
+# matched_feedback_ids数量做代码层校验（不完全信任LLM自报"是否够3次"）。太敏感/太迟钝
+# 都只改这里。
 FEEDBACK_REJECTION_THRESHOLD = 3
-# difflib.SequenceMatcher.ratio() 阈值，判断两条issue的AI修改建议(suggestion)或判定依据
-# (reason)——归一化去掉具体数字/引号内容后（core/feedback.py::_normalize_variable_parts）
-# ——是否属于同一种"没有意义的改动"（而非同一句原文的字面重复，也不要求同一份文档）。
-# 早期版本只用suggestion、阈值0.70；归一化上线后剥离了大部分误判来源，用户要求把reason也
-# 纳入判定、阈值调低到0.60，调阈值只改这里。
-FEEDBACK_SIMILARITY_THRESHOLD = 0.60
+
+# 事实类issue_type在总结规则前直接从输入里过滤掉，永远不参与总结——项目设计铁律"涉及
+# 人名/职务/历史事实的修改建议禁止确定性结论，必须保留人工复核机会"的延伸，见
+# core/feedback_rules.py::regenerate_rejection_rules。
+FEEDBACK_EXEMPT_ISSUE_TYPES = ("常识与事实性错误",)

@@ -1,4 +1,4 @@
-"""单条问题的状态/批注更新（阶段6实现，阶段8"批注"补丁新增 set_issue_note）。"""
+"""单条问题的状态/批注更新。"""
 
 from __future__ import annotations
 

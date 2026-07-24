@@ -230,8 +230,8 @@ def _run_structure(img: Image.Image) -> tuple[list[dict], float | None]:
         text = "\n".join(l["text"] for l in lines).strip()
         if block_type is None or not text:
             continue  # block_type为None表示这个标签本该丢弃（如图片区）；或者区域内没识别出任何文字，也丢弃
-        # 补丁：table类区域不再尝试结构识别重建（曾用TableRecognitionPipelineV2重建行列
-        # 结构，真实验证命中率接近零，见core/parser/CLAUDE.md）——这类区域绝大多数是说明性
+        # table类区域不做结构识别重建（曾用TableRecognitionPipelineV2重建行列结构，
+        # 真实验证命中率接近零，见core/parser/CLAUDE.md）——这类区域绝大多数是说明性
         # UI截图/菜单结构图，不是待校对正文，core/chunker.py 会在分块阶段整体跳过
         # block_type=="table" 的block，不送去LLM校对，此处保留按坐标拉平的文本即可
         # （仅供未来展示/导出等场景使用，不再需要为校对准确性投入结构重建）。

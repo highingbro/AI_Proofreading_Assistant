@@ -4,5 +4,7 @@ __pycache__/
 .venv/
 
 data/app.db
+data/app_*.db
+data/app.log
 data/uploads/*
 data/exports/*

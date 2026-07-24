@@ -25,6 +25,27 @@ def _zone_of(bbox: tuple[float, float, float, float], height: float) -> str:
     return "body"         # 其余都算正文区域
 
 
+def _lines_share_same_row(bbox_a: tuple[float, float, float, float], bbox_b: tuple[float, float, float, float]) -> bool:
+    """判断PyMuPDF给出的两个"line"是否其实是同一视觉行被误拆成的两段。
+
+    起因：真实文档里项目符号常用符号字体（如Wingdings）+ 和正文之间留一段缩进间隙，
+    PyMuPDF的行聚类算法偶尔会因为字体切换/水平间隙过大，把明明在同一水平位置的"符号+正文"
+    拆成两个独立的line对象——y轴（bbox第2/4个数字，即上下边界）却几乎完全重叠，真正在纵向
+    上不同行的line之间y轴不会有这种重叠。用y轴重叠长度占较小line自身高度的比例判断，
+    真实数据验证过：误拆的同一行重叠比例是100%，真正不同行是0，阈值
+    config.NATIVE_SAME_ROW_OVERLAP_MIN_RATIO 取值留了充分余量。
+    """
+    y0_a, y1_a = bbox_a[1], bbox_a[3]
+    y0_b, y1_b = bbox_b[1], bbox_b[3]
+    overlap = min(y1_a, y1_b) - max(y0_a, y0_b)
+    if overlap <= 0:
+        return False
+    smaller_height = min(y1_a - y0_a, y1_b - y0_b)
+    if smaller_height <= 0:
+        return False
+    return overlap / smaller_height >= config.NATIVE_SAME_ROW_OVERLAP_MIN_RATIO
+
+
 def _extract_native_page_raw(page: "fitz.Page") -> tuple[list[dict], float]:
     """从有文字层的PDF页面里，按PyMuPDF给出的坐标提取所有文本块的原始信息。
 
@@ -38,18 +59,25 @@ def _extract_native_page_raw(page: "fitz.Page") -> tuple[list[dict], float]:
         if b.get("type") != 0:
             continue  # type!=0 是图片块，跳过（只保留文字块）
         lines_text = []
+        line_bboxes = []
         sizes = []
         for line in b["lines"]:
             # 一个block可能包含多行(line)，每行又由多个span组成（比如中途换了字体/字号）
             t = "".join(s["text"] for s in line["spans"])
             if t.strip():
                 lines_text.append(t.strip())
+                line_bboxes.append(line["bbox"])
             sizes.extend(s["size"] for s in line["spans"])  # 记录这一行里每个span的字号
-        # 用换行符而非空格拼接：block内每一行在原文里就是独立的一行（可能是标题+正文、
-        # 列表项、版式换行等不同语义单元），拼成空格会让LLM把它们读成一句连续的话，
-        # 导致把"排版换行"误判成"语法/标点问题"（换行标记本身不新增block，不改变
-        # block_index颗粒度，下游分块/去重/追问上下文窗口都不受影响）。
-        text = "\n".join(lines_text)
+        # 拼接block内多行文本：默认用换行符——block内每一行在原文里通常是独立的一行
+        # （标题+正文、列表项、版式换行等不同语义单元），拼成空格会让LLM把它们读成一句
+        # 连续的话，误判成"语法/标点问题"。但相邻两行若判定为_lines_share_same_row
+        # （PyMuPDF把同一视觉行错误拆成了两个line），改用空格拼接，避免"项目符号应换行"
+        # 这类因误拆产生的伪问题（换行/空格标记都不新增block，不改变block_index颗粒度，
+        # 下游分块/去重/追问上下文窗口都不受影响）。
+        text = lines_text[0] if lines_text else ""
+        for i in range(1, len(lines_text)):
+            sep = " " if _lines_share_same_row(line_bboxes[i - 1], line_bboxes[i]) else "\n"
+            text += sep + lines_text[i]
         if not text:
             continue
         avg_size = sum(sizes) / len(sizes) if sizes else 0.0  # 这个block的平均字号，供后续判断是否为标题用

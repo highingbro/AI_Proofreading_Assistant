@@ -1,20 +1,17 @@
 """修饰规则（在基础归层结果之上叠加，非互斥）。
 
-对应设计文档的规则C(OCR低置信度降级)/D(未定位封顶)/G(知识时效性豁免，补丁)/
-H(分块边界截断豁免，补丁)/I(PDF换行转写空格伪影豁免，补丁)/J(人工反馈学习自动
-降级，补丁)，以及优先级覆盖（政治敏感/民族地名）。
+对应设计文档的规则C(OCR低置信度降级)/D(未定位封顶)/G(知识时效性豁免)/
+H(分块边界截断豁免)/I(PDF换行转写空格伪影豁免)，以及优先级覆盖（政治敏感/民族地名）。
 
-补丁（重构，非阶段5原始设计）：原实现是 classify_issue 里手写的四行连续函数调用，
-每个函数签名都不一样（有的碰priority有的不碰），叠加顺序完全靠这四行的书写顺序
-隐式表达，没有任何地方声明"规则G必须在H之前跑"。改成 _ClassificationState 统一
-状态载体 + _MODIFIER_RULES 显式有序注册表：所有修饰规则（含原来连名字都没有、
-也不往layer_notes留痕的优先级覆盖）统一签名 (raw, block, tail_blocks, state,
-learned_feedback) -> state，想知道叠加顺序看 _MODIFIER_RULES 这一个列表就够了，
-不用通读整个函数体；以后加新规则只是往列表里插一条并写清楚为什么插在这个位置。
-详细设计背景见 core/classifier/CLAUDE.md。
+所有修饰规则（含不往layer_notes留痕的优先级覆盖）统一签名
+(raw, block, tail_blocks, state) -> state，由 _ClassificationState 统一状态
+载体 + _MODIFIER_RULES 显式有序注册表编排：想知道叠加顺序看 _MODIFIER_RULES
+这一个列表就够了，不用通读整个函数体；加新规则只是往列表里插一条并写清楚为什么
+插在这个位置。详细设计背景见 core/classifier/CLAUDE.md。
 
-learned_feedback 参数（阶段12新增）只有规则J真正使用，其余规则忽略即可——与
-base_rules.py当初给所有基础规则统一加宽 mode 参数是同一惯例，不是这里新发明的风格。
+本模块不接受任何反馈相关参数——人工反馈改在校对提示词阶段规避，不在分类器里做
+事后降级，详见 core/feedback_rules.py 模块docstring；分类器保持"纯规则逻辑，
+不调用LLM、不查库"。
 """
 
 from __future__ import annotations
@@ -24,14 +21,13 @@ from dataclasses import replace
 import config
 from core.chunker import ChunkedDocument
 from core.classifier._types import _ClassificationState
-from core.classifier.heuristics import _YEAR_RE, _has_factual_feature
-from core.feedback import LearnedFeedback, count_similar_rejections
+from core.classifier.heuristics import _YEAR_RE
+from core.classifier.postprocess import _extract_replacement_pair, _normalize_lookalike, _strip_whitespace
 from core.parser import ParsedBlock
 from core.proofreader import RawIssue
 
 _OCR_DOWNGRADE_ISSUE_TYPES = ("错别字与拼写", "标点符号问题")
 _SENTENCE_TERMINAL_PUNCT = "。！？"
-_FEEDBACK_EXEMPT_ISSUE_TYPES = ("常识与事实性错误",)
 
 
 def _apply_ocr_downgrade(
@@ -39,7 +35,6 @@ def _apply_ocr_downgrade(
     block: ParsedBlock | None,
     tail_blocks: set[int],
     state: _ClassificationState,
-    learned_feedback: list[LearnedFeedback],
 ) -> _ClassificationState:
     if block is None or block.ocr_confidence is None:
         return state
@@ -59,7 +54,6 @@ def _apply_unlocated_cap(
     block: ParsedBlock | None,
     tail_blocks: set[int],
     state: _ClassificationState,
-    learned_feedback: list[LearnedFeedback],
 ) -> _ClassificationState:
     if raw.located:
         return state
@@ -73,9 +67,8 @@ def _apply_linewrap_space_artifact_downgrade(
     block: ParsedBlock | None,
     tail_blocks: set[int],
     state: _ClassificationState,
-    learned_feedback: list[LearnedFeedback],
 ) -> _ClassificationState:
-    """规则I（补丁，真实使用中发现后追加）：PDF换行符被LLM转写成空格的解析伪影豁免。
+    """规则I：PDF换行符被LLM转写成空格的解析伪影豁免。
 
     起因：core/parser/native_pdf.py 用换行符(\\n)拼接同一block内的多个PDF行（见
     core/parser/CLAUDE.md），但PDF按页宽自动换行不认汉字词语边界，经常把一个双字词从
@@ -112,6 +105,57 @@ def _apply_linewrap_space_artifact_downgrade(
     return replace(state, layer=config.LAYER_DOUBTFUL, priority=config.PRIORITY_LOW, suggestion=suggestion, notes=notes)
 
 
+def _apply_layout_and_space_artifact_downgrade(
+    raw: RawIssue,
+    block: ParsedBlock | None,
+    tail_blocks: set[int],
+    state: _ClassificationState,
+) -> _ClassificationState:
+    """规则J：解析伪影兜底降级——版式错乱措辞 / 建议与原文仅空格差异。
+
+    起因：即使 core/classifier/postprocess.py 的丢弃过滤器（_filter_visually_no_op）
+    已经拦掉大部分部首/异体字替代型和控制字符乱码型假问题，真实数据（data/app.db
+    35号记录）显示仍有残留：有的suggestion只描述了original_text里某个片段的替换、
+    但那个片段不足以支撑discard过滤器判定"整条零改动"；有的LLM会自己在reason/
+    suggestion里承认这是"排版错乱""跨行错位""乱码"（PDF多栏/表格/图注版式被解析
+    打乱语序、拼接错行），这不是语言本身的错误，只是LLM也没看懂被打乱的版面；有的
+    建议和原文的唯一差异是空格数量（装饰性字间距、跨行拼接等排版原因导致，原文是否
+    真的多/少这个空格无法仅凭文本判断）。三种情况的共同点——都不是"一眼就能看出"的
+    确定性错误，必须至少降级为存疑，不能留在错误类。
+
+    只在仍是"确定性错误"时生效（比这更宽松的层级已经不需要再降）。空格差异判定要
+    先套一遍 _normalize_lookalike 再比较（而不是直接比较原始文本去空格），是因为
+    真实案例里空格差异经常和部首替代字同时出现在同一条issue里（如"2 0 2 5年9⽉1
+    1⽇"→"2025年9月11日"，⽉是部首替代字、其余是空格差异），只看原始文本去空格
+    会因为部首字符不相等而漏判。
+    """
+    if state.layer != config.LAYER_CONFIRMED:
+        return state
+
+    combined = f"{raw.reason}{raw.suggestion}"
+    if any(k in combined for k in config.LAYOUT_ARTIFACT_KEYWORDS):
+        notes = state.notes + ["建议措辞疑似描述版式错乱/乱码，降级为存疑待核实"]
+        suggestion = (
+            "该问题疑似由文档排版错乱或解析乱码导致，不是确定性的语言错误，"
+            "建议对照原文核实后再处理：" + state.suggestion
+        )
+        return replace(state, layer=config.LAYER_DOUBTFUL, priority=config.PRIORITY_LOW, suggestion=suggestion, notes=notes)
+
+    pair = _extract_replacement_pair(raw)
+    if pair is not None:
+        old, new = pair
+        has_real_space_diff = _strip_whitespace(old) != old.strip() or _strip_whitespace(new) != new.strip()
+        if has_real_space_diff and _strip_whitespace(_normalize_lookalike(old)) == _strip_whitespace(_normalize_lookalike(new)):
+            notes = state.notes + ["建议与原文仅空格差异，疑似解析产生的空白伪影，降级为存疑待核实"]
+            suggestion = (
+                "该问题与原文的差异只有空格，疑似解析产生的空白伪影而非原文真实错误，"
+                "建议对照原文核实后再处理：" + state.suggestion
+            )
+            return replace(state, layer=config.LAYER_DOUBTFUL, priority=config.PRIORITY_LOW, suggestion=suggestion, notes=notes)
+
+    return state
+
+
 def _has_recency_doubt_wording(text: str) -> bool:
     return any(k in text for k in config.RECENCY_DOUBT_KEYWORDS)
 
@@ -125,7 +169,6 @@ def _apply_recency_downgrade(
     block: ParsedBlock | None,
     tail_blocks: set[int],
     state: _ClassificationState,
-    learned_feedback: list[LearnedFeedback],
 ) -> _ClassificationState:
     """规则G：LLM单纯因知识时效性（年份超出训练数据覆盖范围）而怀疑，不是真的事实性错误。
 
@@ -182,9 +225,8 @@ def _apply_chunk_boundary_downgrade(
     block: ParsedBlock | None,
     tail_blocks: set[int],
     state: _ClassificationState,
-    learned_feedback: list[LearnedFeedback],
 ) -> _ClassificationState:
-    """规则H（补丁，真实使用中发现后追加）：分块(chunk)边界截断误判豁免。
+    """规则H：分块(chunk)边界截断误判豁免。
 
     起因：真实文档里一段悬挂缩进排版的列表被PyMuPDF拆成了两个ParsedBlock，又恰好被分块
     算法切在两个不同chunk里——LLM校对前一个chunk时，正文原文在此处硬生生截断，看到的就是
@@ -220,76 +262,11 @@ def _apply_chunk_boundary_downgrade(
     return replace(state, layer=config.LAYER_DOUBTFUL, priority=config.PRIORITY_LOW, suggestion=suggestion, notes=notes)
 
 
-def _is_factual_issue(raw: RawIssue) -> bool:
-    """事实类判定口径，与 _rule_factual（base_rules.py）完全一致的三个信号。
-
-    规则J（下面）用它来豁免事实类问题——不能只查 category/issue_type 两个信号，
-    否则会漏掉"LLM没自报factual、但命中了人名/职务/机构/年份特征启发式"这一类，
-    达不到"事实类问题永不自动降级"的设计要求。
-    """
-    return (
-        raw.category == "factual"
-        or raw.issue_type in _FEEDBACK_EXEMPT_ISSUE_TYPES
-        or _has_factual_feature(raw)
-    )
-
-
-def _apply_learned_feedback_downgrade(
-    raw: RawIssue,
-    block: ParsedBlock | None,
-    tail_blocks: set[int],
-    state: _ClassificationState,
-    learned_feedback: list[LearnedFeedback],
-) -> _ClassificationState:
-    """规则J（补丁，阶段12新增）：同一类问题被人工反复拒绝达到阈值后，自动降级为风格可选。
-
-    起因：用户实测发现，同一类被人工判定"判错了"的问题（点击"拒绝"）会在后续校对里
-    反复出现，需要重新拒绝一遍。真实例子：原文"管理控台一组织权限一用户管理"，
-    issue_type=错别字与拼写，suggestion="将'一'改为'-'或'>'等规范的路径分隔符"——这是
-    没有意义的改动，用户每次都会拒绝。
-
-    判定条件：同 issue_type 前提下，历史反馈里 original_text 精确匹配或 suggestion
-    相似度（core/feedback.py::count_similar_rejections，用 difflib，不引入语义模型）
-    达到阈值的累计命中次数达到 config.FEEDBACK_REJECTION_THRESHOLD 才生效，避免手滑
-    拒绝一次就永久压掉一类问题。
-
-    豁免：引文层(LAYER_QUOTATION)和已经是风格可选(LAYER_OPTIONAL)的问题不处理（前者
-    是独立于"风格可选"的保护层级，语义不同，不应被这条规则改写；后者已经到底不需要
-    重复处理）；事实类问题（_is_factual_issue）永久不参与——即使被反复拒绝次数远超
-    阈值也不降级，这是设计铁律"事实性内容必须始终保留人工复核机会"的延伸，已与用户
-    确认（见 core/classifier/CLAUDE.md 规则J一节）。
-
-    放在 _MODIFIER_RULES 里其余降级规则(C/D/I/G/H)之后、优先级覆盖之前——这条规则要
-    看的是"系统层其它规则都处理完之后的最终层级"，人工反馈的降级判断不应该被其他规则
-    的处理顺序打断。这是第一条会把 layer 一路降到 LAYER_OPTIONAL 的 modifier 规则
-    （C/D/G/H/I 都只把 LAYER_CONFIRMED 封顶降到 LAYER_DOUBTFUL），详见
-    core/classifier/CLAUDE.md 里对这一点的架构提醒。
-    """
-    if state.layer in (config.LAYER_QUOTATION, config.LAYER_OPTIONAL):
-        return state
-    if _is_factual_issue(raw):
-        return state
-    if not learned_feedback:
-        return state
-    count = count_similar_rejections(raw.issue_type, raw.original_text, raw.suggestion, raw.reason, learned_feedback)
-    if count < config.FEEDBACK_REJECTION_THRESHOLD:
-        return state
-
-    notes = state.notes + [
-        f"该类问题此前已被人工拒绝{count}次(阈值{config.FEEDBACK_REJECTION_THRESHOLD})，自动降级为风格可选"
-    ]
-    suggestion = f"系统提示：此类问题已被人工多次拒绝({count}次)，自动归为风格可选，仅供参考：" + state.suggestion
-    return replace(
-        state, layer=config.LAYER_OPTIONAL, priority=config.PRIORITY_OPTIONAL, suggestion=suggestion, notes=notes
-    )
-
-
 def _apply_priority_override(
     raw: RawIssue,
     block: ParsedBlock | None,
     tail_blocks: set[int],
     state: _ClassificationState,
-    learned_feedback: list[LearnedFeedback],
 ) -> _ClassificationState:
     """优先级覆盖：政治敏感性表述/民族与地名规范，无论落在哪层都强制最高优先级。
 
@@ -310,8 +287,8 @@ _MODIFIER_RULES = (
     ("OCR低置信度降级(规则C)", _apply_ocr_downgrade),
     ("未定位封顶(规则D)", _apply_unlocated_cap),
     ("PDF换行符转写成空格的伪影豁免(规则I)", _apply_linewrap_space_artifact_downgrade),
+    ("版式错乱/空格差异兜底降级(规则J)", _apply_layout_and_space_artifact_downgrade),
     ("知识时效性豁免(规则G，依赖前面规则已判定的层级)", _apply_recency_downgrade),
     ("分块边界截断豁免(规则H，只在仍是确定性错误时生效，需在G之后跑)", _apply_chunk_boundary_downgrade),
-    ("人工反馈学习自动降级(规则J，需在其余降级规则之后跑，看最终态)", _apply_learned_feedback_downgrade),
     ("高优先级覆盖(政治敏感/民族地名，与layer无关，放最后)", _apply_priority_override),
 )

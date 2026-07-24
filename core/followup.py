@@ -1,11 +1,11 @@
-"""对话追问处理模块（阶段7实现）。
+"""对话追问处理模块。
 
-针对某一条已分层的问题追问，携带该条的原文上下文（阶段6/本阶段
-core/workflow.py::persist_result 落库时算好的 context_snippet）调用 LLM 回答。
-回答只影响该条，不重新校对全文、不改变该条的 layer/priority/status。
+针对某一条已分层的问题追问，携带该条的原文上下文（core/workflow/persist.py::
+persist_result 落库时算好的 context_snippet）调用 LLM 回答。回答只影响该条，
+不重新校对全文、不改变该条的 layer/priority/status。
 
 多轮追问通过在 user_content 里拼接历史问答文本实现（chat_completion 只有单轮
-system+user 接口，阶段4已验收冻结，不改其签名）；为控制token成本，只把最近
+system+user 接口，不改其签名）；为控制token成本，只把最近
 config.FOLLOWUP_MAX_HISTORY_TURNS 轮历史拼进prompt，更早的历史仍完整存库。
 
 `answer_followup(issue_id, question, db_path=None) -> str` 是唯一的追问入口。

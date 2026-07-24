@@ -14,8 +14,8 @@
 
 起因：真实文档诊断（见 [core/parser/CLAUDE.md](../parser/CLAUDE.md) "表格结构识别方案"一节）发现，"确定性错误"层77%(72/93)的问题定位在table类区域，且这些区域绝大多数是文档里插入的说明性UI截图（如菜单结构对比图），根本不是需要校对的正文——截图内容不该被当作作者撰写的文字挑错别字，无论OCR/表格结构识别得多准都治标不治本。
 
-`fill_units.py::_build_fill_units` 遇到 `block_type=="table"` 直接跳过，不生成任何填充单元；`ParsedBlock.text` 本身不受影响（仍是解析阶段产出的文本，供未来展示/导出等场景使用），只是不再出现在任何 `Chunk.text` 里。之前"超长表格整块独占一个chunk"那条规则已随之删除（表格不再产生填充单元，这条规则无从触发）。
+`fill_units.py::_build_fill_units` 遇到 `block_type=="table"` 直接跳过，不生成任何填充单元；`ParsedBlock.text` 本身不受影响（仍是解析阶段产出的文本，供未来展示/导出等场景使用），只是不再出现在任何 `Chunk.text` 里。
 
 这是有意识的取舍（宁可漏判不复杂化）：如果文档里真的存在需要校对的表格化正文，会被这条规则连带跳过——目前没有可靠信号能区分"表格化正文"和"截图/示意图"（LayoutDetection只给"table"一个标签，不含语义），留给以后真遇到这种文档再解决。
 
-测试见 `tests/test_stage3.py`"补丁回归测试：block_type=="table"的区域整体不进入任何chunk"一节两条用例（`test_table_blocks_excluded_from_chunking`/`test_document_with_only_table_blocks_produces_no_chunks`），以及真实样本冒烟测试 `test_real_sample_smoke` 里"覆盖到的block集合应等于非table的block集合"这条断言。
+测试见 `tests/test_chunker.py`"block_type=="table"的区域整体不进入任何chunk"一节两条用例（`test_table_blocks_excluded_from_chunking`/`test_document_with_only_table_blocks_produces_no_chunks`），以及真实样本冒烟测试 `test_real_sample_smoke` 里"覆盖到的block集合应等于非table的block集合"这条断言。

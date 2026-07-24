@@ -1,7 +1,8 @@
-"""SQLite 连接与建表（阶段1实现）。
+"""SQLite 连接与建表。
 
-定义三张表：records（流程记录表）、issues（问题明细表）与 feedback（阶段12新增，
-人工反馈学习记录表）。
+定义四张表：records（流程记录表）、issues（问题明细表）、feedback（人工反馈原始
+记录表）与 feedback_rules（反馈语义总结规则表，见 core/feedback_rules.py 模块
+docstring）。
 """
 
 import sqlite3
@@ -59,6 +60,15 @@ CREATE TABLE IF NOT EXISTS feedback (
 )
 """
 
+_CREATE_FEEDBACK_RULES_SQL = """
+CREATE TABLE IF NOT EXISTS feedback_rules (
+    rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_text TEXT NOT NULL,
+    matched_feedback_ids TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)
+"""
+
 
 def get_connection(db_path=None) -> sqlite3.Connection:
     """获取 SQLite 连接，并开启外键约束。
@@ -88,7 +98,7 @@ def _migrate_reject_reason_to_note(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_add_mode_column(conn: sqlite3.Connection) -> None:
-    """给旧库的 records 表补上 mode 列（补丁：模式选择功能新增，非原始设计）。
+    """给旧库的 records 表补上 mode 列。
 
     CREATE TABLE IF NOT EXISTS 对已存在的表不会做任何列变更，真实使用中的
     data/app.db 早于本次改动就已经建过 records 表（没有 mode 列），必须显式迁移。
@@ -102,6 +112,31 @@ def _migrate_add_mode_column(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+_LEGACY_LAYER_LABELS = {
+    "确定性错误": "错误类",
+    "存疑待核实": "存疑类",
+    "风格可选": "风格类",
+    # "引文类" 改名前后一致，不需要迁移
+}
+
+
+def _migrate_rename_layer_labels(conn: sqlite3.Connection) -> None:
+    """把 issues 表里旧版 layer 字段值迁移成 config.py 现在的 LAYER_* 常量值。
+
+    config.LAYER_CONFIRMED/LAYER_DOUBTFUL/LAYER_OPTIONAL 现在的值是"错误类"/
+    "存疑类"/"风格类"，但历史 issues 行落库时写入的是改名前的旧字符串"确定性错误"/
+    "存疑待核实"/"风格可选"。历史记录页按
+    config.LAYERS（新值）筛选时，这些旧行的 layer 字段谁都匹配不上，页面上四个
+    分层折叠框会显示成"0条"，看起来像数据丢了——实际数据完好，只是新旧标签对不上
+    （真实复现：record_id=28，74条issues全部因此显示不出来，只有layer本就没改名的
+    "引文类"能正常匹配）。用 UPDATE 原地把旧值改成新值，天然幂等——重复调用时
+    WHERE条件只会命中还没迁移过的行，已迁移的行不会被误伤。
+    """
+    for old, new in _LEGACY_LAYER_LABELS.items():
+        conn.execute("UPDATE issues SET layer = ? WHERE layer = ?", (new, old))
+    conn.commit()
+
+
 def init_db(db_path=None) -> None:
     """首次运行自动建表（若表已存在则跳过），并对旧库做必要的列迁移。"""
     conn = get_connection(db_path)
@@ -109,8 +144,10 @@ def init_db(db_path=None) -> None:
         conn.execute(_CREATE_RECORDS_SQL)
         conn.execute(_CREATE_ISSUES_SQL)
         conn.execute(_CREATE_FEEDBACK_SQL)
+        conn.execute(_CREATE_FEEDBACK_RULES_SQL)
         conn.commit()
         _migrate_reject_reason_to_note(conn)
         _migrate_add_mode_column(conn)
+        _migrate_rename_layer_labels(conn)
     finally:
         conn.close()

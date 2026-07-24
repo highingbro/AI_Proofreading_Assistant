@@ -1,12 +1,12 @@
-"""文档解析模块（阶段2实现，阶段N进行了目录拆分，逻辑未改动）。
+"""文档解析模块。
 
 统一解析三类输入：
   A类：有文字层的 PDF —— 见 native_pdf.py。
   B类：无文字层的扫描 PDF —— 见 ocr_pdf.py。
   C类：Word 文档 —— 见 docx_parser.py。
 
-只做解析，不分块、不接校对LLM（对应阶段3/4）。详细设计背景（分栏检测判定、
-OCR补丁历史、编码踩坑记录）见本目录下 CLAUDE.md。
+只做解析，不分块、不接校对LLM。详细设计背景（分栏检测判定、OCR相关细节、
+编码踩坑记录）见本目录下 CLAUDE.md。
 """
 
 from __future__ import annotations

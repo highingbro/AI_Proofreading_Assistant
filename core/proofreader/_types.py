@@ -17,7 +17,7 @@ class LLMResponseError(Exception):
 class RawIssue:
     original_text: str
     issue_type: str
-    category: str        # LLM自报，待阶段5校验
+    category: str        # LLM自报，待 core/classifier/ 校验
     confidence: str
     suggestion: str
     reason: str

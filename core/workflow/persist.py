@@ -1,4 +1,4 @@
-"""分层结果落库（阶段6实现，阶段7新增 context_snippet 计算）。"""
+"""分层结果落库（含 context_snippet 计算）。"""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ def build_context_snippet(parsed: ParsedDocument, block_index: int) -> str:
     哪条通道，都是按阅读顺序把 ParsedBlock append 进 blocks 列表的同时用同一个递增计数器
     赋 block_index，所以 parsed.blocks[i].block_index == i 恒成立。
 
-    原为 persist_result 私有（_build_context_snippet），阶段9原稿比对新增
-    persist_comparison_result 后需要复用同一份"取上下文窗口"逻辑，提升为公开函数，
+    原为 persist_result 私有（_build_context_snippet），因为原稿比对的
+    persist_comparison_result 同样需要复用这份"取上下文窗口"逻辑，提升为公开函数，
     不重复实现。
     """
     window = config.FOLLOWUP_CONTEXT_WINDOW_BLOCKS
@@ -37,8 +37,7 @@ def persist_result(
     """把分层结果落库：先建 record（分层统计取自 result.stats），再逐条 add_issue。
 
     parsed 非空时，为每条已定位（block_index非None）的issue计算 context_snippet
-    （原文前后文窗口，阶段7追问用）；不传 parsed 或issue未定位时 context_snippet 留空，
-    与阶段6原行为一致。
+    （原文前后文窗口，供追问使用）；不传 parsed 或issue未定位时 context_snippet 留空。
 
     mode 记录本次校对实际使用的模式（精简/深度），写入 records.mode 供历史记录页展示。
 

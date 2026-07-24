@@ -1,6 +1,6 @@
 """基础归层规则（互斥，先命中先生效，_rule_default 保底必命中）。
 
-对应设计文档的规则A(引文保护)/B(事实置信度)/E(风格)/F(默认兜底)，以及两条精简模式补丁
+对应设计文档的规则A(引文保护)/B(事实置信度)/E(风格)/F(默认兜底)，以及两条精简模式规则
 _rule_simplified_grammar_as_style/_rule_simplified_typo_as_punctuation（详见
 core/classifier/CLAUDE.md）。
 """
@@ -62,9 +62,9 @@ def _rule_factual(raw: RawIssue, mode: str):
 
 
 def _rule_simplified_grammar_as_style(raw: RawIssue, mode: str):
-    """精简模式补丁：语法结构问题(规则2)统一按风格可选处理，不再判定确定性错误/存疑待核实。
+    """精简模式：语法结构问题(规则2)统一按风格可选处理，不再判定确定性错误/存疑待核实。
 
-    真实使用中发现，精简模式服务的是容忍度较高的普通/技术文档，"语法结构问题"命中率不低，
+    精简模式服务的是容忍度较高的普通/技术文档，"语法结构问题"命中率不低，
     但常常是"怎么写都通"的润色（典型信号：LLM建议里出现"改为A或B"这种平级备选写法，
     说明没有唯一正确写法），走 _rule_default 兜底判成确定性错误/存疑待核实过于严格。
     深度模式不受影响；引文/事实保护（_rule_quotation/_rule_factual）排在此规则之前，
@@ -83,7 +83,7 @@ def _rule_simplified_grammar_as_style(raw: RawIssue, mode: str):
 
 
 def _rule_simplified_typo_as_punctuation(raw: RawIssue, mode: str):
-    """精简模式补丁：规则1(错别字与拼写)里"汉字冒充标点符号"这类零歧义问题按风格可选处理。
+    """精简模式：规则1(错别字与拼写)里"汉字冒充标点符号"这类零歧义问题按风格可选处理。
 
     起因：如数词"一"被当成破折号/连接号使用，字形近似但不是标点混用，读者理解完全不受影响，
     是纯排版惯例问题，和"的/地/得"这类可能真正改变语义/引起误解的错别字不是一回事，精简模式
