@@ -1,10 +1,10 @@
-"""长文档分块模块（阶段3实现，阶段N做了目录拆分）。
+"""长文档分块模块。
 
-把 core/parser 产出的 ParsedDocument 切成一组 Chunk，供阶段4作为逐次LLM
-校对调用的正文。只在 block 边界切分（超长 block 例外），块间保留前向重叠
-上下文，且每块都能回溯到原始 block_index，供阶段5/8做问题定位。
+把 core/parser 产出的 ParsedDocument 切成一组 Chunk，供 core/proofreader/
+逐次LLM校对调用的正文。只在 block 边界切分（超长 block 例外），块间保留前向
+重叠上下文，且每块都能回溯到原始 block_index，供问题定位/导出使用。
 
-详细设计背景（table区域跳过补丁的真实诊断数据）见 core/chunker/CLAUDE.md。
+详细设计背景（table区域跳过规则的真实诊断数据）见 core/chunker/CLAUDE.md。
 """
 
 from __future__ import annotations

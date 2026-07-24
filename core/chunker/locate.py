@@ -1,4 +1,4 @@
-"""定位辅助函数（供阶段5/8做问题定位回溯）。"""
+"""定位辅助函数（供 core/classifier/、core/exporter.py 做问题定位回溯）。"""
 
 from __future__ import annotations
 

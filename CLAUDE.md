@@ -19,7 +19,7 @@
 | 8 | Excel导出 | ✅ 已实现（`core/exporter.py`） |
 | 7 | 对话式追问处理 | ✅ 已实现（`core/followup.py`） |
 | 9 | 原稿比对工作流 | ✅ 已实现（`core/comparer.py` + `core/workflow/`） |
-| 10 | 收尾（异常处理、历史轮次查看页） | 🟡 历史记录详情页已实现（`app.py`）；异常处理已随阶段4/6分散实现（LLM重试、解析/校对异常兜底），未单独验收 |
+| 10 | 收尾（异常处理、历史轮次查看页） | 🟡 历史记录详情页已实现（`app.py`）；异常处理已随 `core/llm_client.py`/`app.py` 分散实现（LLM重试、解析/校对异常兜底），未单独验收 |
 
 **未实现的模块目前只有函数签名和 docstring，函数体是 `raise NotImplementedError`——这是有意为之的阶段占位，不是 bug。** 除非明确要开发对应阶段，不要动这些函数体。
 
@@ -35,15 +35,15 @@ core/
   proofreader/      校对提示词组装 + 单块/全文档校对（已实现）——子目录拆成 _types.py/prompt_builder.py/response_parser.py/locator.py，详见 core/proofreader/CLAUDE.md
   classifier/       结果分层（已实现）——子目录拆成 _types.py/heuristics.py/base_rules.py/modifier_rules.py/postprocess.py，详见 core/classifier/CLAUDE.md
   workflow/         标准校对流程编排（已实现）——子目录拆成 run.py/persist.py/status.py，详见 core/workflow/CLAUDE.md
-  glossary.py       全局术语表构建（已实现，单文件）——解决chunk间互不可见导致的跨块一致性误判，设计决策见文件顶部 docstring
   exporter.py       Excel导出（已实现，单文件）——设计决策见文件顶部 docstring
   followup.py       对话追问（已实现，单文件）——设计决策见文件顶部 docstring
-  feedback.py       人工反馈学习（已实现，单文件）——记录issue被拒绝的反馈、驱动 core/classifier 规则J自动降级，设计决策见文件顶部 docstring
+  feedback.py       人工反馈原始记录（已实现，单文件）——记录/撤销issue被拒绝的反馈，薄封装，设计决策见文件顶部 docstring
+  feedback_rules.py 反馈语义总结（已实现，单文件）——把历史拒绝记录交给LLM总结成规则注入校对提示词，替换早期字符串相似度自动降级，设计决策见文件顶部 docstring
   comparer.py       原稿比对（已实现，单文件）——归一化+段落对齐+句子级diff，设计决策见文件顶部 docstring
 db/
-  database.py       SQLite连接与建表（records、issues、feedback 三张表）
+  database.py       SQLite连接与建表（records、issues、feedback、feedback_rules 四张表）
   models.py         数据访问函数（CRUD，支持传入 db_path 便于测试用临时库）
-tests/              每阶段一个测试文件（test_stage1.py、test_stage2.py…）
+tests/              按 core/ 模块命名的测试文件（test_parser.py、test_chunker.py、test_classifier.py…）
 tools/preview_parse.py    手动预览 core/parser/ 解析结果的调试脚本
 tools/preview_chunks.py   手动预览 core/chunker/ 分块结果的调试脚本
 tools/run_proofread.py    串起 解析→分块→校对 全链路，跑LLM调用的调试脚本（耗API额度，支持 --save-json 保存RawIssue供离线调分层规则）
@@ -55,10 +55,10 @@ prompt/followup_system.md    追问系统提示词模板（含占位符，组装
 pytest.ini          注册 integration marker，默认 `pytest`/`pytest tests/` 自动跳过耗额度的集成冒烟
 ```
 
-各模块的详细设计背景（补丁起因、真实使用中发现的问题、测试策略）按模块拆到了各自的说明文件里，只在真正要改对应代码/排查对应问题时才需要读：
+各模块的详细设计背景（现在为什么这么设计、非显而易见的取舍、测试策略）按模块拆到了各自的说明文件里，只在真正要改对应代码/排查对应问题时才需要读：
 
 - 拆成目录的模块（`core/parser/`、`core/chunker/`、`core/proofreader/`、`core/classifier/`、`core/workflow/`）——读该目录下的 `CLAUDE.md`。
-- 仍是单文件的模块（`core/llm_client.py`、`core/exporter.py`、`core/followup.py`、`core/glossary.py`、`core/feedback.py`、`core/comparer.py`）——读文件顶部的 docstring。
+- 仍是单文件的模块（`core/llm_client.py`、`core/exporter.py`、`core/followup.py`、`core/feedback.py`、`core/feedback_rules.py`、`core/comparer.py`）——读文件顶部的 docstring。
 - `app.py` 的 UI 设计决策（session_state 生命周期、按钮key惯例、历史记录页两处状态同步的坑等）——读文件顶部的 docstring。
 
 ## 设计铁律（改动分层/校对逻辑前必读）
@@ -73,13 +73,14 @@ pytest.ini          注册 integration marker，默认 `pytest`/`pytest tests/` 
 # 激活虚拟环境（已存在 .venv，Windows PowerShell）
 .venv\Scripts\Activate.ps1
 
-streamlit run app.py          # 启动应用
-pytest tests/test_stage4.py   # 跑指定阶段的测试（不带 -m integration 时自动跳过耗额度的集成冒烟）
-pytest -m integration         # 手动跑耗真实API额度的集成冒烟测试
+streamlit run app.py            # 启动应用
+pytest tests/test_classifier.py # 跑指定模块的测试（不带 -m integration 时自动跳过耗额度的集成冒烟）
+pytest -m integration           # 手动跑耗真实API额度的集成冒烟测试
 ```
 
 ## 开发约定
 
-- 每个阶段独立可测试，对应一个 `tests/test_stageN.py`。开发新阶段前先看 `prompt/阶段N提示词_*.md`（如存在）和框架文档第10章对应行的验收标准。
+- 每个模块独立可测试，对应一个 `tests/test_<模块名>.py`。开发新功能前先看 `prompt/阶段N提示词_*.md`（如存在，按框架文档第10章的阶段编号归档，属历史开发记录，不随代码重命名）和框架文档第10章对应行的验收标准。
 - `db/models.py` 的函数都支持传入 `db_path` 参数，测试时传临时数据库路径，不要依赖 `config.DB_PATH` 指向的真实库。
+- **文档/注释只写现在为什么这么设计**（非显而易见的取舍、真实数据支撑的阈值），不写"以前怎样、后来改成怎样"的过程记述——这类变更历史交给 git commit message（英文、简短），不进代码注释，避免文件顶部随时间越堆越长、"现在到底是什么样"反而被历史叙事淹没。
 - **模块拆分与文档记录的选择标准**：单文件超过约200行、或内部存在多个彼此独立又相互依赖顺序的关注点时，拆成 `core/模块名/` 目录（`_types.py` 放数据结构、按关注点拆若干私有子模块、`__init__.py` 做编排入口+对外`__all__`），详细设计背景写进该目录的 `CLAUDE.md`；否则保持单文件，设计背景写进文件顶部 docstring。拆目录时若已有测试用字符串路径 `unittest.mock.patch("core.模块名.某私有名字", ...)` 或 `monkeypatch.setattr(模块, "某私有名字", ...)` 直接打桩模块属性，要先确认被测函数和打桩目标是否会落在同一个子模块——这类打桩只在两者位于同一模块全局命名空间时才生效，拆分时若把被测函数和它依赖的名字拆到了不同子模块，需要同步把测试的打桩路径改成新的子模块路径（`core/parser/`、`core/proofreader/`、`core/workflow/` 的 CLAUDE.md 里各记录了一次真实踩坑案例）。

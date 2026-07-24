@@ -1,10 +1,10 @@
-"""标准校对流程编排层（阶段6实现，阶段N做了目录拆分）。
+"""标准校对流程编排层。
 
 串起 parse_document → chunk_document → proofread_document → classify_issues
 全链路，并把结果落库、维护采纳/拒绝状态。不依赖 Streamlit，供 app.py 调用，
 也便于脱离 Streamlit 运行时单独测试。
 
-详细设计背景（阶段6/7/8 期间的签名演变、context_snippet 计算时机、批注补丁）
+详细设计背景（函数签名的演变、context_snippet 计算时机、批注与状态解耦）
 见 core/workflow/CLAUDE.md。
 """
 

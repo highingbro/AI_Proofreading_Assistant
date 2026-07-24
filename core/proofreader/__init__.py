@@ -1,11 +1,11 @@
-"""校对提示词组装与单块/全文档校对（阶段4实现，阶段N做了目录拆分）。
+"""校对提示词组装与单块/全文档校对。
 
 把 core/chunker.py 产出的 Chunk 送入 LLM 校对，解析/校验/容错 LLM 的 JSON
-输出，并把每条问题回填定位到原始 block_index/page_location。本阶段只输出
-LLM自报的结构化判断（category/confidence 未经强制归层校验），阶段5负责
-按规则做归层强制校验。
+输出，并把每条问题回填定位到原始 block_index/page_location。本模块只输出
+LLM自报的结构化判断（category/confidence 未经强制归层校验），core/classifier/
+负责按规则做归层强制校验。
 
-详细设计背景（相对阶段4提示词原文的调整、动态超时估算、并发执行设计决策）
+详细设计背景（提示词原文的调整、动态超时估算、并发执行设计决策）
 见 core/proofreader/CLAUDE.md。
 """
 
@@ -39,23 +39,22 @@ def proofread_chunk(
     chunk: Chunk,
     parsed: ParsedDocument,
     mode: str = config.PROOFREAD_MODE_DEEP,
-    glossary_text: str = "",
+    rejection_rules_text: str = "",
 ) -> list[RawIssue]:
     """对单个文本块执行校对，返回结构化问题列表。
 
-    注：相对阶段4提示词给出的单参数签名 proofread_chunk(chunk: Chunk)，这里
-    多接一个 parsed: ParsedDocument 参数——Chunk 本身不持有到 ParsedDocument
+    注：多接一个 parsed: ParsedDocument 参数——Chunk 本身不持有到 ParsedDocument
     的反向引用，而 RawIssue.page_location 需要调用 locate_block(parsed, block_index)
     才能得到。proofread_document 内部会用 chunked.source 传入。
 
     mode 控制注入LLM的校对规则子集（config.PROOFREAD_MODE_DEEP/PROOFREAD_MODE_SIMPLIFIED），
-    默认深度模式，与该参数新增前的行为一致。
+    默认深度模式。
 
-    glossary_text：core/glossary.py::build_glossary()+format_glossary_for_prompt() 产出
-    的全局术语表文本（默认空字符串=没有这份参照），透传给 _build_system_prompt 注入
-    提示词，解决chunk间互不可见导致的跨块一致性误判（详见 core/glossary.py 模块docstring）。
+    rejection_rules_text：core/feedback_rules.py::load_rejection_rules_text() 产出的
+    历史反馈总结规则文本（默认空字符串=没有这份参照），让LLM在生成建议这一步就规避
+    曾被人工拒绝的问题模式（详见 core/feedback_rules.py 模块docstring）。
     """
-    system_prompt = _build_system_prompt(mode, glossary_text)
+    system_prompt = _build_system_prompt(mode, rejection_rules_text)
     body_text, overlap_text = _split_body_overlap(chunk.text)
 
     user_content = chunk.text
@@ -119,19 +118,20 @@ def proofread_document(
     chunked: ChunkedDocument,
     progress_callback=None,
     mode: str = config.PROOFREAD_MODE_DEEP,
-    glossary_text: str = "",
+    rejection_rules_text: str = "",
 ) -> ProofreadResult:
     """并发调用 proofread_chunk 校对所有 chunk，单块失败不中断其余块。
 
-    全部块一次性并发提交（不分批），不设并发数上限——账号实测 RPM 15000/TPM
-    1200000，即使上百个chunk的文档同时发起请求也远不会触发限流，人为设并发
-    上限只会白白拖慢速度。chat_completion/proofread_chunk 内部没有共享可变
-    状态（每次调用用的都是局部变量），天然线程安全，不需要额外加锁。
+    并发数上限 config.PROOFREAD_MAX_CONCURRENT_CHUNKS，块数不足该值时相当于
+    全部并发。账号RPM/TPM额度虽够用，但 data/app.log 真实数据显示瓶颈是模型
+    服务端实际并发处理能力，不设上限会导致请求数远超服务端承载后集体排队、
+    单块耗时被拖到超时上限，失败重试还会把同样的拥堵重演一次——详见
+    core/proofreader/CLAUDE.md。chat_completion/proofread_chunk 内部没有共享
+    可变状态（每次调用用的都是局部变量），天然线程安全，不需要额外加锁。
 
     mode 透传给每个 proofread_chunk 调用，控制校对规则子集，默认深度模式。
-    glossary_text 同样透传给每个 proofread_chunk 调用——全局术语表只在文档级
-    构建一次（core/workflow/run.py 调用 build_glossary），所有chunk共享同一份，
-    不是每个chunk各建各的。
+    rejection_rules_text 同样透传，只在校对开始前读一次
+    （core/workflow/run.py 调用 load_rejection_rules_text），所有chunk共享。
     """
     total = len(chunked.chunks)
     if total == 0:
@@ -140,9 +140,11 @@ def proofread_document(
     issues_by_index: dict[int, list[RawIssue]] = {}
     warnings_by_index: dict[int, str] = {}
 
-    with ThreadPoolExecutor(max_workers=total) as executor:
+    with ThreadPoolExecutor(max_workers=min(total, config.PROOFREAD_MAX_CONCURRENT_CHUNKS)) as executor:
         future_to_index = {
-            executor.submit(proofread_chunk, chunk, chunked.source, mode, glossary_text): (i, chunk)
+            executor.submit(
+                proofread_chunk, chunk, chunked.source, mode, rejection_rules_text
+            ): (i, chunk)
             for i, chunk in enumerate(chunked.chunks)
         }
         # as_completed 本身在调用方（主线程）里顺序迭代，循环体不并发执行，

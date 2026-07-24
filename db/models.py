@@ -1,9 +1,10 @@
-"""数据访问函数（阶段1实现基础 CRUD）。
+"""数据访问函数（基础 CRUD）。
 
 所有函数支持通过 db_path 参数指定数据库文件（便于测试使用临时数据库），
 不传时使用 config.DB_PATH。
 """
 
+import json
 from datetime import datetime
 
 from db.database import get_connection
@@ -232,7 +233,7 @@ def add_feedback(
     source_record_id: int | None = None,
     db_path=None,
 ) -> int:
-    """插入一条人工反馈记录（阶段12：拒绝issue时调用），返回 feedback_id。"""
+    """插入一条人工反馈记录（拒绝issue时调用），返回 feedback_id。"""
     conn = get_connection(db_path)
     try:
         cursor = conn.execute(
@@ -282,5 +283,42 @@ def delete_feedback(feedback_id: int, db_path=None) -> None:
     try:
         conn.execute("DELETE FROM feedback WHERE feedback_id = ?", (feedback_id,))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def replace_feedback_rules(rules: list[dict], db_path=None) -> None:
+    """整体替换 feedback_rules 表内容（core/feedback_rules.py 重新总结规则后调用）。
+
+    rules 每项含 "rule_text"/"matched_feedback_ids"（后者是 list[int]，这里序列化成
+    JSON字符串存TEXT列）。规则集合是每次重新总结的完整产出，不是增量更新，因此在
+    同一个连接内先清空旧表再逐条插入，不逐条diff。
+    """
+    conn = get_connection(db_path)
+    try:
+        conn.execute("DELETE FROM feedback_rules")
+        conn.executemany(
+            "INSERT INTO feedback_rules (rule_text, matched_feedback_ids, created_at) VALUES (?, ?, ?)",
+            [
+                (rule["rule_text"], json.dumps(rule["matched_feedback_ids"]), datetime.now().isoformat())
+                for rule in rules
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_feedback_rules(db_path=None) -> list[dict]:
+    """按 rule_id 顺序列出当前生效的反馈规则，matched_feedback_ids 还原成 list[int]。"""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute("SELECT * FROM feedback_rules ORDER BY rule_id").fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["matched_feedback_ids"] = json.loads(item["matched_feedback_ids"])
+            result.append(item)
+        return result
     finally:
         conn.close()

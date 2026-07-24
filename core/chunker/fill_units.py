@@ -26,17 +26,15 @@ class _FillUnit:
 def _build_fill_units(blocks: list[ParsedBlock], max_size: int, warnings: list[str]) -> list[_FillUnit]:
     """把 block 列表转成贪心装填用的填充单元。
 
-    补丁（真实使用中发现后追加，非阶段3原始设计）：block_type=="table" 的区域
-    整体跳过，不生成任何 _FillUnit，也就不会出现在任何 chunk.text 里——即不
-    会被送去LLM校对。起因：真实文档（record_id=17诊断）里这类区域绝大多数是
-    说明性UI截图/菜单结构图，不是作者撰写的待校对正文；且真实数据显示77%
-    (72/93)的"确定性错误"层问题定位在table类block里，其中大量是版面检测框把
-    无关侧边栏内容混入、或无边框并排列表被按坐标拉平导致的结构性伪影（表格结
-    构识别曾专门做过一版重建补丁，真实验证发现命中率接近零，见
-    core/parser/CLAUDE.md），根本不是原文档的错误。跳过这整类block比"识别后
-    再降级"更直接：这类内容压根不该进入校对判断。ParsedBlock 本身不受影响
-    （parsed.blocks 仍保留完整的table区域文本，供未来展示/导出等场景使用），
-    只是分块阶段不再把它纳入送审文本。详细诊断数据见 core/chunker/CLAUDE.md。
+    block_type=="table" 的区域整体跳过，不生成任何 _FillUnit，也就不会出现在
+    任何 chunk.text 里——即不会被送去LLM校对。起因：这类区域绝大多数是说明性
+    UI截图/菜单结构图，不是作者撰写的待校对正文；真实数据显示77%(72/93)的
+    "确定性错误"层问题定位在table类block里，其中大量是版面检测框把无关侧边栏
+    内容混入、或无边框并排列表被按坐标拉平导致的结构性伪影，根本不是原文档的
+    错误。跳过这整类block比"识别后再降级"更直接：这类内容压根不该进入校对
+    判断。ParsedBlock 本身不受影响（parsed.blocks 仍保留完整的table区域文本，
+    供未来展示/导出等场景使用），只是分块阶段不再把它纳入送审文本。详细诊断
+    数据见 core/chunker/CLAUDE.md。
     """
     units: list[_FillUnit] = []
     for b in blocks:

@@ -1,8 +1,8 @@
-"""LLM 调用封装（阶段4实现）。
+"""LLM 调用封装。
 
 封装大模型 API 调用（DashScope 兼容模式 REST 接口：POST {base_url}/chat/completions），
 处理网络错误/限流/5xx 的指数退避重试。不做流式；本函数自身不发起并发请求，
-但每次调用只用局部变量、无共享可变状态，天然线程安全——阶段6起
+但每次调用只用局部变量、无共享可变状态，天然线程安全——
 core.proofreader.proofread_document 会用线程池并发调用本函数校对多个chunk。
 
 `chat_completion()` 是唯一的LLM调用入口，网络错误/超时/429/5xx 按 1s/4s/16s
@@ -12,31 +12,28 @@ core.proofreader.proofread_document 会用线程池并发调用本函数校对�
 注意变量名不对称）是真正必填项，缺失会在调用时抛 LLMCallError，不会在
 `import config` 时就报错。
 
-相对 prompt/阶段4提示词_LLM调用封装.md 原文，因实际情况做了以下调整（均已
-当面确认，不是擅自改动）：
+几个非显而易见的行为点：
 
-1. LLM_API_KEY 实际读取环境变量 DASHSCOPE_API_KEY，不是提示词写的
-   LLM_API_KEY——这是实际环境变量命名（阿里云DashScope标准命名）。config.py
-   里属性名仍叫 LLM_API_KEY，只是内部命名，读取源已改。这是唯一没有默认值、
-   真正必填的一项。
-2. LLM_MODEL 直接给默认值 "qwen3.6-plus"，不强制要求环境变量——按实际使用
-   方式，不设 LLM_MODEL 也能跑，仍支持该环境变量覆盖换模型。
-3. LLM_BASE_URL 默认给了 DashScope 兼容模式公开固定地址
-   （https://dashscope.aliyuncs.com/compatible-mode/v1）——起因是运行环境里
-   只设了 DASHSCOPE_API_KEY、没设 LLM_BASE_URL，问过后按意愿加的默认值，同样
-   支持环境变量覆盖。
-4. LLM_TIMEOUT 从"固定120秒"改成"按文本长度动态估算"——详见下方专门一段。
-5. LLM调用用 requests 直接发REST请求，没有引入 openai/dashscope SDK——提示
-   词允许"二选一说明理由"，理由见 requirements.txt 里的注释：避免额外SDK依赖
-   与版本兼容负担，REST接口本身足够简单直接。
+1. LLM_API_KEY 实际读取环境变量 DASHSCOPE_API_KEY（阿里云DashScope标准命名），
+   不是字面的 LLM_API_KEY——config.py 里属性名仍叫 LLM_API_KEY，只是内部命名，
+   读取源不同。这是唯一没有默认值、真正必填的一项。
+2. LLM_MODEL 默认值 "qwen3.6-plus"，不强制要求设置环境变量，仍支持该环境
+   变量覆盖换模型。
+3. LLM_BASE_URL 默认是 DashScope 兼容模式公开固定地址
+   （https://dashscope.aliyuncs.com/compatible-mode/v1），同样支持环境变量
+   覆盖。
+4. LLM_TIMEOUT 按文本长度动态估算，不是固定值——详见下方专门一段。
+5. LLM调用用 requests 直接发REST请求，没有引入 openai/dashscope SDK：避免
+   额外SDK依赖与版本兼容负担，REST接口本身足够简单直接（见 requirements.txt
+   里的注释）。
 
 超时是按文本长度动态估算的，不是固定值：config.LLM_TIMEOUT 默认不设
 （None），本函数内部用 _estimate_timeout() 按 system_prompt+user_content
 总字符数算：timeout = LLM_TIMEOUT_BASE_SECONDS + 总字符数 ×
 LLM_TIMEOUT_PER_CHAR_SECONDS，限定在
 [LLM_TIMEOUT_MIN_SECONDS, LLM_TIMEOUT_MAX_SECONDS] 区间（都在 config.py
-里，带实测依据的注释）。起因是实测发现：真实文档大小的chunk（约3000~5000字
-总输入）用固定120秒超时会稳定超时失败（4次重试全部撞线），而实际耗时普遍在
+里，带实测依据的注释）。起因：真实文档大小的chunk（约3000~5000字总输入）
+用固定120秒超时会稳定超时失败（4次重试全部撞线），而实际耗时普遍在
 180~212秒——500字左右的小样本能在120秒内勉强成功纯属侥幸。优先级：显式传
 timeout= 参数 > 环境变量 LLM_TIMEOUT（一旦设置就固定用它，不再动态估算）>
 动态估算。系数是从有限的几个实测样本粗略拟合的，同规模输入的真实耗时本身

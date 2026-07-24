@@ -1,13 +1,9 @@
-"""阶段4调试辅助脚本：串起 解析→分块→构建全局术语表→校对 全链路，跑真实LLM调用。
+"""调试辅助脚本：串起 解析→分块→校对 全链路，跑真实LLM调用。
 
 用法：
     python tools/run_proofread.py <file_path> [--max-chunks N]
 
 会消耗真实API额度，--max-chunks 可限制只跑前N块。
-
-补丁：接入 core/glossary.py::build_glossary（详见其模块docstring），跟真实
-run_standard_proofread() 的管线保持一致，否则这个调试工具就测不到全局术语表
-是否真的生效。
 """
 
 from __future__ import annotations
@@ -22,7 +18,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.chunker import chunk_document  # noqa: E402
-from core.glossary import build_glossary, format_glossary_for_prompt  # noqa: E402
 from core.parser import parse_document  # noqa: E402
 from core.proofreader import LLMResponseError, proofread_chunk  # noqa: E402
 from core.llm_client import LLMCallError  # noqa: E402
@@ -34,25 +29,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="解析→分块→校对全链路调试")
     parser.add_argument("file_path")
     parser.add_argument("--max-chunks", type=int, default=None, help="只跑前N块（省额度）")
-    parser.add_argument("--save-json", default=None, help="把RawIssue原始结果存成JSON，供阶段5离线反复调规则")
+    parser.add_argument("--save-json", default=None, help="把RawIssue原始结果存成JSON，供离线反复调规则")
     args = parser.parse_args()
 
     parsed = parse_document(args.file_path)
     chunked = chunk_document(parsed)
     chunks = chunked.chunks if args.max_chunks is None else chunked.chunks[: args.max_chunks]
 
-    glossary_entries = build_glossary(parsed)
-    glossary_text = format_glossary_for_prompt(glossary_entries)
-    print("=== 全局术语表 ===")
-    print(glossary_text or "（空）")
-    print("---")
-
     all_issues = []
     failed_chunks: list[str] = []
 
     for chunk in chunks:
         try:
-            issues = proofread_chunk(chunk, parsed, glossary_text=glossary_text)
+            issues = proofread_chunk(chunk, parsed)
         except (LLMCallError, LLMResponseError) as exc:
             msg = f"第{chunk.chunk_index}块校对失败: {exc}"
             print(msg)
