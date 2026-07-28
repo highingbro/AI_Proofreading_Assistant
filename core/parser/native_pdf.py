@@ -5,14 +5,19 @@
 
 from __future__ import annotations
 
+import bisect
 import re
 import statistics
 from collections import Counter
 
 import config
-from core.parser._common import _detect_column_split, _source_location
+from core.parser._common import _detect_column_boundaries, _source_location
 
 _NUMERIC_ZONE_RE = re.compile(r"^[\dIVXLCDMivxlcdm\-\.\s]{1,10}$")      # 匹配纯页码/罗马数字页码/带破折号的页码范围/带逗号，长度不超过10字符
+
+# 以这些字符收尾的行，视为"内容说完了主动换行"，不当续写行处理。只收句末/收束类
+# 标点，不含"，、"——逗号顿号收尾恰恰是句子没说完、下一行还要接着排的强信号。
+_LINE_STOP_CHARS = "。！？；…：.!?;:）)》」』】〕》\"'”’"
 
 
 def _zone_of(bbox: tuple[float, float, float, float], height: float) -> str:
@@ -44,6 +49,28 @@ def _lines_share_same_row(bbox_a: tuple[float, float, float, float], bbox_b: tup
     if smaller_height <= 0:
         return False
     return overlap / smaller_height >= config.NATIVE_SAME_ROW_OVERLAP_MIN_RATIO
+
+
+def _is_wrapped_continuation(text: str, bbox: tuple[float, float, float, float], right_edge: float, font_size: float) -> bool:
+    """这一行是不是"被页宽顶到头才换行"的续写行——即下一行是同一句话的直接延续。
+
+    两个信号必须同时成立才算（都不成立的判法太松，会把标题/列表项跟正文粘成病句）：
+    收尾没有句末/收束标点（`_LINE_STOP_CHARS`），且右边界离本栏最右不足一个字的宽度
+    （剩不下一个字，说明这行是被宽度顶回来的，不是内容说完了主动换的）。一个字的宽度
+    用字号近似——中文全角字符宽度就约等于字号。
+    """
+    if not text or text[-1] in _LINE_STOP_CHARS:
+        return False
+    tolerance = max(font_size, 1.0) * config.NATIVE_WRAP_RIGHT_EDGE_TOLERANCE_CHARS
+    return bbox[2] >= right_edge - tolerance
+
+
+def _lines_vertically_adjacent(bbox_a: tuple[float, float, float, float], bbox_b: tuple[float, float, float, float]) -> bool:
+    """b 是不是紧接在 a 下面的一行（而不是隔了一个段落间距/跨了一个版块）。"""
+    height_a = bbox_a[3] - bbox_a[1]
+    if height_a <= 0 or bbox_b[1] <= bbox_a[1]:
+        return False
+    return (bbox_b[1] - bbox_a[3]) <= height_a * config.NATIVE_WRAP_MAX_LINE_GAP_RATIO
 
 
 def _extract_native_page_raw(page: "fitz.Page") -> tuple[list[dict], float]:
@@ -131,79 +158,72 @@ def _classify_native_block_type(avg_size: float, body_size: float, zone: str) ->
 
 
 def _order_native_page(raw_blocks: list[dict], width: float, force_layout: str) -> tuple[list[dict], str]:
-    """把一页里提取出来的文本块，按"正确阅读顺序"重新排列，并判断这页是单栏还是双栏。
+    """把一页里提取出来的文本块，按"正确阅读顺序"重新排列，并判断这页是单栏还是分栏。
 
-    返回 (排好序的块列表, 'single'或'double')。
+    返回 (排好序的块列表, 'single'或'double')。mode 只有这两个取值——'double' 表示
+    "分栏"（可能是两栏也可能是四栏），栏数体现在每个块的 column 字段上，不再往
+    mode 里加新取值：mode 只被 ParsedDocument.layout_mode 用来做全文档级的粗粒度
+    描述，多加取值会让 _majority_layout_mode 把"两栏页+四栏页"的正常刊物判成 'mixed'。
     """
-    # 先决定这页是单栏还是双栏：force_layout 手动指定的话直接用；否则用自动检测
     if force_layout == "single":
-        mode = "single"
-    elif force_layout == "double":
-        mode = "double"
+        boundaries: list[float] = []
     else:
-        split_x = _detect_column_split(raw_blocks, width)
-        mode = "double" if split_x is not None else "single"
+        boundaries = _detect_column_boundaries(raw_blocks, width)
+        if force_layout == "double" and not boundaries:
+            boundaries = [width / 2]  # 强制分栏但没检测出分栏线时，退化为对半分
+    mode = "double" if boundaries else "single"
 
     if mode == "single":
         # 单栏很简单：直接按y坐标（bbox[1]，即上边界）从上到下排序即可
         ordered = sorted(raw_blocks, key=lambda b: b["bbox"][1])
         for b in ordered:
-            b["column"] = None  # 单栏没有栏位概念，统一置空，跟双栏分支保持字段结构一致
+            b["column"] = None  # 单栏没有栏位概念，统一置空，跟分栏分支保持字段结构一致
         return ordered, mode
 
-    # ---- 双栏排序逻辑 ----
-    # 上面为了决定mode已经调用过一次_detect_column_split，这里再调一次是为了拿到具体的
-    # 分栏线x坐标split_x（上面那次调用只用了它的返回值是否为None，没保留具体数值）
-    split_x = _detect_column_split(raw_blocks, width)
-    if split_x is None:
-        split_x = width / 2  # 双栏但没找到精确分栏线（如force_layout强制指定双栏）时，退化为对半分
-
-    col_width_est = width / 2  # 估算单栏应有的宽度，用于判断块是否"跨栏"
-    spanning, left, right = [], [], []  # 三类块：跨两栏的、左栏的、右栏的
+    # ---- 分栏排序逻辑 ----
+    n_cols = len(boundaries) + 1
+    # 两栏沿用"左栏/右栏"这个说法；三栏以上没有直观的左右可言，改成第几栏
+    labels = ["left", "right"] if n_cols == 2 else [f"col{i + 1}" for i in range(n_cols)]
+    col_width_est = width / n_cols  # 估算单栏应有的宽度，用于判断块是否"跨栏"
+    columns: list[list[dict]] = [[] for _ in range(n_cols)]
+    spanning: list[dict] = []
     for b in raw_blocks:
         x0, _, x1, _ = b["bbox"]
         if (x1 - x0) > col_width_est * 1.4:
-            # 块宽度明显超过单栏宽度（超过1.4倍），说明它横跨了左右两栏（如通栏标题）
+            # 块宽度明显超过单栏宽度（超过1.4倍），说明它横跨了多栏（如通栏标题）
+            b["column"] = "span"
             spanning.append(b)
-        else:
-            center = (x0 + x1) / 2
-            if center < split_x:
-                b["column"] = "left"
-                left.append(b)
-            else:
-                b["column"] = "right"
-                right.append(b)
+            continue
+        center = (x0 + x1) / 2
+        ci = bisect.bisect_right(boundaries, center)  # 中心点落在第几条分栏线右边，就属于第几栏
+        b["column"] = labels[ci]
+        columns[ci].append(b)
 
-    # 左栏、右栏、跨栏块各自按y坐标（从上到下）排序
-    left.sort(key=lambda b: b["bbox"][1])
-    right.sort(key=lambda b: b["bbox"][1])
+    # 每一栏、以及跨栏块，各自按y坐标（从上到下）排序
+    for col in columns:
+        col.sort(key=lambda b: b["bbox"][1])
     spanning.sort(key=lambda b: b["bbox"][1])
-    for b in spanning:
-        b["column"] = "span"
 
     if not spanning:
-        # 没有跨栏块：最简单的双栏阅读顺序就是"左栏从头到尾，再右栏从头到尾"
-        return left + right, mode
+        # 没有跨栏块：阅读顺序就是"逐栏从左到右，每栏从头到尾"
+        return [b for col in columns for b in col], mode
 
-    # 有跨栏块（比如页面中间插了一个通栏标题）：需要把左栏、右栏内容和跨栏块
-    # 按纵向位置(y坐标)交替合并，而不是简单地"左栏全部+右栏全部+跨栏块"，
-    # 否则跨栏标题下方本该紧跟的内容，阅读顺序上会被打乱到标题之前或太靠后
-    ordered = []
-    li = ri = 0  # 分别指向左栏、右栏"还没被消费"的下一个块
+    # 有跨栏块（比如页面中间插了一个通栏标题）：需要把各栏内容和跨栏块按纵向位置
+    # (y坐标)交替合并，而不是简单地"各栏全部+跨栏块"，否则跨栏标题下方本该紧跟的
+    # 内容，阅读顺序上会被打乱到标题之前或太靠后
+    ordered: list[dict] = []
+    cursors = [0] * n_cols  # 分别指向每一栏"还没被消费"的下一个块
     for sp in spanning:
         sp_y = sp["bbox"][1]  # 这个跨栏块所在的纵向位置
-        # 把左栏里"比这个跨栏块更靠上"（y更小）的块，都先按顺序放进结果里
-        while li < len(left) and left[li]["bbox"][1] < sp_y:
-            ordered.append(left[li])
-            li += 1
-        # 右栏同理
-        while ri < len(right) and right[ri]["bbox"][1] < sp_y:
-            ordered.append(right[ri])
-            ri += 1
+        for ci, col in enumerate(columns):
+            # 把这一栏里"比这个跨栏块更靠上"（y更小）的块，都先按顺序放进结果里
+            while cursors[ci] < len(col) and col[cursors[ci]]["bbox"][1] < sp_y:
+                ordered.append(col[cursors[ci]])
+                cursors[ci] += 1
         ordered.append(sp)  # 该轮到这个跨栏块本身出场了
-    # 循环结束后，把左右栏里剩下的（在最后一个跨栏块下方的）内容依次追加进去
-    ordered.extend(left[li:])
-    ordered.extend(right[ri:])
+    # 循环结束后，把各栏里剩下的（在最后一个跨栏块下方的）内容依次追加进去
+    for ci, col in enumerate(columns):
+        ordered.extend(col[cursors[ci]:])
     return ordered, mode
 
 
