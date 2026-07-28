@@ -177,7 +177,7 @@ def test_ocr_region_multiline_join_uses_newline(monkeypatch):
     monkeypatch.setattr(parser, "_get_ocr_pipeline", lambda: _FakeOCRPipeline())
 
     img = Image.new("RGB", (100, 100), color="white")
-    blocks, _ = parser._run_structure(img)
+    blocks, _, _ = parser._run_structure(img)
 
     assert len(blocks) == 1
     assert blocks[0]["text"] == "第一行\n第二行"
@@ -216,7 +216,7 @@ def test_table_region_keeps_flat_joined_text(monkeypatch):
     monkeypatch.setattr(parser, "_get_ocr_pipeline", lambda: _FakeOCRPipelineTable())
 
     img = Image.new("RGB", (200, 200), color="white")
-    blocks, _ = parser._run_structure(img)
+    blocks, _, _ = parser._run_structure(img)
 
     assert len(blocks) == 1
     assert blocks[0]["block_type"] == "table"

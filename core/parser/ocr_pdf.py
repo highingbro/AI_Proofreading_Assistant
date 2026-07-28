@@ -177,11 +177,14 @@ def _find_nearest_region(cx: float, cy: float, regions: list[dict]) -> int:
     return best_i
 
 
-def _run_structure(img: Image.Image) -> tuple[list[dict], float | None]:
+def _run_structure(img: Image.Image) -> tuple[list[dict], float | None, str | None]:
     """对一张页面图片，分别跑版面检测和OCR识别两个独立模型，再把两边结果拼到一起，
     并用 XY-Cut 算法还原出正确的阅读顺序。
 
-    返回 (按阅读顺序排好的块列表, 整页平均置信度)。
+    返回 (按阅读顺序排好的块列表, 整页平均置信度, 期刊页码)。期刊页码取自版面
+    检测模型自己标注的 "number" 标签区域（页码/页眉页脚这类区域该模型本就单独
+    打标，不需要像A类原生PDF那样靠正则猜形状），一页多个"number"区域时取第一个；
+    该区域本就要被 _label_to_block_type 判 None 丢弃，这里只是丢弃前顺手记下文字。
     """
     # 延迟到函数内部才 import，避免模块加载时就承担这个依赖的开销
     from paddlex.inference.pipelines.layout_parsing.xycut_enhanced.xycuts import sort_by_xycut
@@ -200,7 +203,7 @@ def _run_structure(img: Image.Image) -> tuple[list[dict], float | None]:
     # 把版面检测出的每个区域框，转换成本函数内部用的字典结构，先准备好一个空的"lines"列表待填充
     regions = [{"label": b["label"], "bbox": tuple(b["coordinate"]), "lines": []} for b in layout_result["boxes"]]
     if not regions:
-        return [], None  # 版面检测没识别出任何区域，直接返回空结果
+        return [], None, None  # 版面检测没识别出任何区域，直接返回空结果
 
     # 把OCR识别出的每一行文字，分配到它所属的版面区域里
     for text, score, box in zip(ocr_result["rec_texts"], ocr_result["rec_scores"], ocr_result["rec_boxes"]):
@@ -219,6 +222,7 @@ def _run_structure(img: Image.Image) -> tuple[list[dict], float | None]:
 
     blocks = []
     scores = []
+    doc_page: str | None = None
     for idx in order:  # 按XY-Cut算好的顺序，依次处理每个区域
         region = regions[idx]
         block_type = _label_to_block_type(region["label"])
@@ -228,6 +232,8 @@ def _run_structure(img: Image.Image) -> tuple[list[dict], float | None]:
         # 无法辨读的乱码式长句，让LLM把纯粹的解析伪影误判成错别字/语法问题。
         lines = sorted(region["lines"], key=lambda l: (l["bbox"][1], l["bbox"][0]))
         text = "\n".join(l["text"] for l in lines).strip()
+        if region["label"] == "number" and text and doc_page is None:
+            doc_page = text
         if block_type is None or not text:
             continue  # block_type为None表示这个标签本该丢弃（如图片区）；或者区域内没识别出任何文字，也丢弃
         # table类区域不做结构识别重建（曾用TableRecognitionPipelineV2重建行列结构，
@@ -241,14 +247,14 @@ def _run_structure(img: Image.Image) -> tuple[list[dict], float | None]:
         blocks.append({"text": text, "block_type": block_type, "bbox": region["bbox"], "confidence": conf})
 
     page_conf = sum(scores) / len(scores) if scores else None  # 整页平均置信度，供上层判断是否要写warning
-    return blocks, page_conf
+    return blocks, page_conf, doc_page
 
 
-def _ocr_and_order(img: Image.Image, force_layout: str) -> tuple[list[dict], float | None, str]:
+def _ocr_and_order(img: Image.Image, force_layout: str) -> tuple[list[dict], float | None, str, str | None]:
     """在 _run_structure 的基础上，再做一遍"过滤低质量块"+"判断单双栏并标注column"，
     是 B类通道对外暴露的主要函数（core.parser._parse_pdf 直接调用它）。
     """
-    raw_blocks, page_conf = _run_structure(img)
+    raw_blocks, page_conf, doc_page = _run_structure(img)
 
     # 过滤明显的识别乱码：置信度很低 且 文字很短的块，大概率是图片背景/水印等干扰造成的误识别
     filtered = []
@@ -278,7 +284,7 @@ def _ocr_and_order(img: Image.Image, force_layout: str) -> tuple[list[dict], flo
         for b in filtered:
             b["column"] = None  # 单栏，跟A类通道一样，统一置空保持字段结构一致
 
-    return filtered, page_conf, mode
+    return filtered, page_conf, mode, doc_page
 
 
 # ---------------------------------------------------------------------------
