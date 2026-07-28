@@ -157,6 +157,36 @@ def test_export_page_location_none_shows_unlocated(db_path, tmp_path, monkeypatc
     assert row[0] == "未定位"
 
 
+def test_export_doc_page_column_blank_when_not_extracted(db_path, tmp_path, monkeypatch):
+    """_build_record_with_issues 构造的记录全部没传 doc_page，导出应留空——
+    不该用PDF页码顶替（PDF页码信息已经在"页码/位置"列里）。"""
+    monkeypatch.setattr(config, "EXPORTS_DIR", tmp_path)
+    record_id, issue_specs, _ = _build_record_with_issues(db_path)
+
+    path = export_issues_to_excel(record_id, db_path=db_path)
+    ws = load_workbook(path).active
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        assert row[1] is None or row[1] == ""
+
+
+def test_export_doc_page_column_shows_value_when_extracted(db_path, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "EXPORTS_DIR", tmp_path)
+    record_id = create_record(doc_name="期刊.pdf", doc_version="", task_type="标准校对", db_path=db_path)
+    add_issue(
+        record_id=record_id, page_location="文档第12页左栏", doc_page="12", original_text="期刊正文",
+        issue_type="错别字与拼写", priority=config.PRIORITY_MEDIUM, layer=config.LAYER_CONFIRMED,
+        suggestion="改为正确写法", status="已采纳", db_path=db_path,
+    )
+
+    path = export_issues_to_excel(record_id, db_path=db_path)
+    ws = load_workbook(path).active
+
+    row = next(r for r in ws.iter_rows(min_row=2, values_only=True) if r[2] == "期刊正文")
+    assert row[0] == "文档第12页左栏"
+    assert row[1] == "12"
+
+
 def test_export_note_column_shows_value_and_status_is_plain(db_path, tmp_path, monkeypatch):
     """批注不再和拒绝绑定：处理状态列只显示原始status，批注单独一列，无批注时留空。"""
     monkeypatch.setattr(config, "EXPORTS_DIR", tmp_path)
