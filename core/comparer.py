@@ -138,9 +138,11 @@ def _make_entry(kind, orig_block=None, fmt_block=None, span=None) -> dict:
     if fmt_block is not None:
         page_location = fmt_block.source_location
         block_index = fmt_block.block_index
+        doc_page = fmt_block.doc_page
     else:
         page_location = f"(原稿){orig_block.source_location}"
         block_index = None
+        doc_page = None
 
     if kind == "insert":
         suggestion = "排版稿新增内容，原稿无对应文字"
@@ -151,6 +153,7 @@ def _make_entry(kind, orig_block=None, fmt_block=None, span=None) -> dict:
 
     return {
         "page_location": page_location,
+        "doc_page": doc_page,
         "block_index": block_index,
         "original_text": original_text,
         "formatted_text": formatted_text,

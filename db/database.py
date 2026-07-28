@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS issues (
     issue_id INTEGER PRIMARY KEY AUTOINCREMENT,
     record_id INTEGER NOT NULL,
     page_location TEXT,
+    doc_page TEXT,
     original_text TEXT,
     issue_type TEXT,
     priority TEXT,
@@ -137,6 +138,19 @@ def _migrate_rename_layer_labels(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_add_doc_page_column(conn: sqlite3.Connection) -> None:
+    """给旧库的 issues 表补上 doc_page 列（双栏页提取到的期刊自身页码）。
+
+    旧记录该列取值为 NULL——迁移前的行本来就没有做过这项提取，NULL 如实表达
+    "该功能上线前的数据"，导出时按现有"未提取到就留空"的规则展示，不会显示成
+    "PDF第x页"这种臆造值。
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(issues)")}
+    if "doc_page" not in cols:
+        conn.execute("ALTER TABLE issues ADD COLUMN doc_page TEXT")
+        conn.commit()
+
+
 def init_db(db_path=None) -> None:
     """首次运行自动建表（若表已存在则跳过），并对旧库做必要的列迁移。"""
     conn = get_connection(db_path)
@@ -149,5 +163,6 @@ def init_db(db_path=None) -> None:
         _migrate_reject_reason_to_note(conn)
         _migrate_add_mode_column(conn)
         _migrate_rename_layer_labels(conn)
+        _migrate_add_doc_page_column(conn)
     finally:
         conn.close()

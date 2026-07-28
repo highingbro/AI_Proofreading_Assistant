@@ -109,6 +109,7 @@ def add_issue(
     note: str | None = None,
     context_snippet: str | None = None,
     followup_history: str | None = None,
+    doc_page: str | None = None,
     db_path=None,
 ) -> int:
     """插入一条问题，返回 issue_id。"""
@@ -117,14 +118,15 @@ def add_issue(
         cursor = conn.execute(
             """
             INSERT INTO issues (
-                record_id, page_location, original_text, issue_type, priority,
+                record_id, page_location, doc_page, original_text, issue_type, priority,
                 layer, suggestion, status, note, context_snippet,
                 followup_history
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record_id,
                 page_location,
+                doc_page,
                 original_text,
                 issue_type,
                 priority,
