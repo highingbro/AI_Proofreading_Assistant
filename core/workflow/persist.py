@@ -71,6 +71,7 @@ def persist_result(
             layer=issue.layer,
             suggestion=issue.suggestion,
             context_snippet=context_snippet,
+            doc_page=issue.doc_page,
             db_path=db_path,
         )
         issue_ids.append(issue_id)
@@ -122,6 +123,7 @@ def persist_comparison_result(
             layer=diff["layer"],
             suggestion=diff["suggestion"],
             context_snippet=context_snippet,
+            doc_page=diff.get("doc_page"),
             db_path=db_path,
         )
         issue_ids.append(issue_id)

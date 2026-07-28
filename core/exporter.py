@@ -51,11 +51,18 @@ ValueError。
    过滤 get_issues() 的结果，无条件过滤，不做成可选参数（没有"导出全部状态"
    的需求，加一个用不到的开关只会增加复杂度）。"处理状态"列直接显示原始
    status（导出结果里恒为"已采纳"），独立的"批注"列显示 note（未写则留空）。
-   _HEADER 共8列。
+
+"文档页码"列（issues.doc_page）：双栏期刊类文档自带印刷页码，跟PDF物理页码
+经常对不上，编辑核对回纸质刊物要看的是期刊页码，不是PDF页码（详见
+core/parser/CLAUDE.md）。这一列只在提取到期刊页码时才有值，没提取到（单栏
+文档，或双栏但那一页本身没有页码，如目录/封面）留空——不臆造、也不拿PDF
+页码顶替，PDF页码信息已经在"页码/位置"列里（双栏页提取不到期刊页码时会
+显示"PDF第N页"作为退路）。_HEADER 共9列。
 
 回归测试：tests/test_exporter.py::test_export_note_column_shows_value_and_status_is_plain、
 test_export_only_includes_accepted_issues、
-test_export_record_with_no_accepted_issues_generates_header_only_file。
+test_export_record_with_no_accepted_issues_generates_header_only_file、
+test_export_doc_page_column_blank_when_not_extracted。
 """
 
 from __future__ import annotations
@@ -70,7 +77,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 import config
 from db.models import get_issues, get_records, update_record_stats
 
-_HEADER = ("页码/位置", "原文", "问题类型", "优先级", "分层标注", "修改建议", "处理状态", "批注")
+_HEADER = ("页码/位置", "文档页码", "原文", "问题类型", "优先级", "分层标注", "修改建议", "处理状态", "批注")
 
 _HEADER_FILL = PatternFill("solid", fgColor="FFD9D9D9")
 _HIGH_PRIORITY_FILL = PatternFill("solid", fgColor="FFFFC7CE")
@@ -112,6 +119,7 @@ def export_issues_to_excel(record_id: int, db_path=None) -> Path:
         ws.append(
             (
                 row["page_location"] or "未定位",
+                row["doc_page"] or "",
                 row["original_text"],
                 row["issue_type"],
                 row["priority"],
@@ -135,7 +143,7 @@ def export_issues_to_excel(record_id: int, db_path=None) -> Path:
                 cell.fill = fill
 
     wrap = Alignment(wrap_text=True, vertical="top")
-    for col_idx, width in zip(range(1, 9), (14, 50, 16, 10, 12, 50, 12, 30)):
+    for col_idx, width in zip(range(1, 10), (14, 10, 50, 16, 10, 12, 50, 12, 30)):
         letter = ws.cell(row=1, column=col_idx).column_letter
         ws.column_dimensions[letter].width = width
     for row_cells in ws.iter_rows(min_row=2):

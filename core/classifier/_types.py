@@ -24,6 +24,7 @@ class ClassifiedIssue:
     llm_category: str          # LLM原始自报，追问溯源用
     llm_confidence: str
     original_suggestion: str   # 改写前的LLM原始建议
+    doc_page: str | None = None  # 继承自 RawIssue.doc_page，未提取到期刊页码时为None
 
 
 @dataclass
