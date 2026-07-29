@@ -31,12 +31,23 @@ def _table_columns(db_path, table_name):
         conn.close()
 
 
+def _task(db_path) -> int:
+    """建一个任务——records.task_id 是必填的，任何 create_record 之前都要先有任务。"""
+    return models.create_task("测试任务", db_path=db_path)
+
+
 def test_tables_created_with_expected_columns(db_path):
+    task_columns = _table_columns(db_path, "tasks")
+    expected_task_columns = {
+        "task_id", "name", "description", "status", "created_at", "created_by",
+    }
+    assert expected_task_columns.issubset(task_columns)
+
     record_columns = _table_columns(db_path, "records")
     expected_record_columns = {
-        "record_id", "created_at", "doc_name", "doc_version", "task_type",
-        "total_issues", "count_confirmed", "count_doubtful", "count_quotation",
-        "count_optional", "high_priority_count", "accepted_count",
+        "record_id", "task_id", "author", "created_at", "doc_name", "doc_version",
+        "task_type", "total_issues", "count_confirmed", "count_doubtful",
+        "count_quotation", "count_optional", "high_priority_count", "accepted_count",
         "rejected_count", "result_path",
     }
     assert expected_record_columns.issubset(record_columns)
@@ -52,6 +63,7 @@ def test_tables_created_with_expected_columns(db_path):
 
 def test_full_chain_create_add_update_get(db_path):
     record_id = models.create_record(
+        task_id=_task(db_path),
         doc_name="测试文档.docx",
         doc_version="v1",
         task_type="标准校对",
@@ -83,7 +95,8 @@ def test_full_chain_create_add_update_get(db_path):
 
 def test_get_issues_filter_by_layer(db_path):
     record_id = models.create_record(
-        doc_name="测试文档.docx", doc_version="v1", task_type="标准校对", db_path=db_path
+        task_id=_task(db_path), doc_name="测试文档.docx", doc_version="v1",
+        task_type="标准校对", db_path=db_path,
     )
     models.add_issue(
         record_id=record_id, page_location="p1", original_text="a",
@@ -246,3 +259,89 @@ def test_foreign_key_constraint_enforced(db_path):
             suggestion="改为b",
             db_path=db_path,
         )
+
+
+def test_init_db_migrates_legacy_records_into_archive_task(tmp_path):
+    """回归测试：真实使用中 data/app.db 里已有几十条早于"任务"概念的记录（没有
+    task_id/author 列）。init_db() 必须补上两列、把这些记录整批归入"历史归档"任务，
+    重复调用不能一次次冒出新的空任务（幂等）。"""
+    legacy_path = tmp_path / "legacy_tasks.db"
+    conn = sqlite3.connect(str(legacy_path))
+    conn.execute(
+        """
+        CREATE TABLE records (
+            record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            doc_name TEXT,
+            doc_version TEXT,
+            task_type TEXT,
+            total_issues INTEGER,
+            count_confirmed INTEGER,
+            count_doubtful INTEGER,
+            count_quotation INTEGER,
+            count_optional INTEGER,
+            high_priority_count INTEGER,
+            accepted_count INTEGER,
+            rejected_count INTEGER,
+            result_path TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO records (created_at, doc_name, task_type)"
+        " VALUES ('2026-01-01', '旧文档.docx', '标准校对')"
+    )
+    conn.execute(
+        "INSERT INTO records (created_at, doc_name, task_type)"
+        " VALUES ('2026-01-02', '旧文档2.docx', '标准校对')"
+    )
+    conn.commit()
+    conn.close()
+
+    database.init_db(legacy_path)
+    database.init_db(legacy_path)  # 幂等：不应再建一个同名任务、也不应报错
+
+    columns = _table_columns(legacy_path, "records")
+    assert {"task_id", "author"}.issubset(columns)
+
+    tasks = models.get_tasks(db_path=legacy_path)
+    assert [t["name"] for t in tasks] == [config.LEGACY_TASK_NAME]
+    assert tasks[0]["status"] == config.TASK_STATUS_ACTIVE
+
+    archive_id = tasks[0]["task_id"]
+    records = models.get_records(db_path=legacy_path)
+    assert len(records) == 2
+    assert {r["task_id"] for r in records} == {archive_id}
+    assert {r["author"] for r in records} == {None}
+
+
+def test_init_db_on_fresh_db_creates_no_archive_task(db_path):
+    """空库没有任何待回填的历史记录，就不该冒出一个"历史归档"空任务。"""
+    assert models.get_tasks(db_path=db_path) == []
+
+
+def test_task_status_update_and_record_scoping(db_path):
+    """任务的状态流转、按任务筛选记录、改归属任务三件事的最小闭环。"""
+    task_a = models.create_task("期刊A", created_by="张三", db_path=db_path)
+    task_b = models.create_task("期刊B", db_path=db_path)
+
+    record_id = models.create_record(
+        task_id=task_a, doc_name="第1期.pdf", doc_version="", task_type="标准校对",
+        author="李四", db_path=db_path,
+    )
+
+    assert [r["record_id"] for r in models.get_records(task_id=task_a, db_path=db_path)] == [record_id]
+    assert models.get_records(task_id=task_b, db_path=db_path) == []
+    assert models.count_records_by_task(db_path=db_path) == {task_a: 1}
+    # 署名候选来自 records.author ∪ tasks.created_by，不单建人员表
+    assert models.get_authors(db_path=db_path) == ["张三", "李四"]
+
+    models.update_record_task(record_id, task_b, db_path=db_path)
+    assert models.get_records(task_id=task_a, db_path=db_path) == []
+    assert len(models.get_records(task_id=task_b, db_path=db_path)) == 1
+
+    models.update_task_status(task_a, config.TASK_STATUS_CLOSED, db_path=db_path)
+    assert models.get_task(task_a, db_path=db_path)["status"] == config.TASK_STATUS_CLOSED
+    active = models.get_tasks(status=config.TASK_STATUS_ACTIVE, db_path=db_path)
+    assert [t["task_id"] for t in active] == [task_b]
+    assert models.get_task(9999, db_path=db_path) is None

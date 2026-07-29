@@ -152,6 +152,91 @@ def test_native_pdf_barely_overlapping_lines_still_join_with_newline():
     assert raw_blocks[0]["text"] == "第一行文字：\n第二行文字。"
 
 
+class _FakeNativePageSpreadMisjoin:
+    """补丁回归测试用：跨页对开版面（一个物理页印着左右两个页码）里，左页和右页同一
+    水平线上两块**毫不相干**的文字，y轴100%重叠但横向相距半个页面，被PyMuPDF聚成了
+    同一个block。坐标取自真实文档（活动手册第30/29页对开：右页最右的"联系方式"信息框
+    标题 + 左页栏1的正文），只按y轴判定会把两者空格拼成一句串文喂给LLM。"""
+
+    def get_text(self, mode):
+        assert mode == "dict"
+        return {
+            "width": 1009.0,
+            "height": 720.0,
+            "blocks": [
+                {
+                    "type": 0,
+                    "bbox": (44.5, 128.2, 821.8, 141.8),
+                    "lines": [
+                        {"bbox": (765.2, 128.2, 821.8, 141.8), "spans": [{"text": "联系方式", "size": 13.0}]},
+                        {
+                            "bbox": (44.5, 130.2, 243.0, 138.7),
+                            "spans": [{"text": "造运营系统建设思路；通过课堂培训与实际演练相结", "size": 8.5}],
+                        },
+                    ],
+                }
+            ],
+        }
+
+
+def test_native_pdf_spread_far_apart_lines_join_with_newline():
+    """y轴完全重叠但横向隔了半个页面（61倍行高），不能当作同一视觉行用空格拼接。"""
+    from core.parser.native_pdf import _extract_native_page_raw
+
+    raw_blocks, _ = _extract_native_page_raw(_FakeNativePageSpreadMisjoin())
+
+    assert len(raw_blocks) == 1
+    assert raw_blocks[0]["text"] == "联系方式\n造运营系统建设思路；通过课堂培训与实际演练相结"
+
+
+# ---------------------------------------------------------------------------
+# 补丁回归测试：跨页对开版面里横跨整幅的"误聚块"不得污染半区内容范围
+# （真实文档诊断：PyMuPDF把左右两页同一水平线上的文字聚成一个777pt宽的block，
+# 其中心点落进左半区后，把左半区内容范围从[44,466]撑成[44,953]整页宽，band随之
+# 落到主分栏线附近而不是栏1栏2之间的真实间隙，四栏版面被判成两栏，栏1栏2内容
+# 按y坐标交错输出；见 core/parser/CLAUDE.md"跨页对开版面"一节）
+# ---------------------------------------------------------------------------
+
+def _symmetric_four_column_blocks() -> list[dict]:
+    """左右对称的四栏页：栏1 x50-240、栏2 x260-450、栏3 x550-740、栏4 x760-950（页宽1000）。"""
+    blocks = []
+    for col_x0, col_x1 in ((50.0, 240.0), (260.0, 450.0), (550.0, 740.0), (760.0, 950.0)):
+        for i in range(5):
+            y = 150.0 + i * 20.0
+            blocks.append({"text": "正文内容占位文字正文内容占位文字", "bbox": (col_x0, y, col_x1, y + 12.0)})
+    return blocks
+
+
+def test_content_extent_excludes_spanning_blocks():
+    """半区内容范围必须和 _split_region 用同一把尺子排除通栏块，否则会被撑到整页宽。"""
+    from core.parser._common import _content_extent
+
+    half = [
+        {"text": "栏1正文", "bbox": (50.0, 150.0, 240.0, 162.0)},
+        {"text": "栏2正文", "bbox": (260.0, 150.0, 450.0, 162.0)},
+        {"text": "跨页误聚块", "bbox": (50.0, 100.0, 830.0, 115.0)},
+    ]
+
+    # 半区名义宽度500：780pt宽的误聚块超过 500*0.7，不该把内容范围撑到830
+    assert _content_extent(half, 500.0) == (50.0, 450.0)
+
+
+def test_detect_column_boundaries_finds_four_columns():
+    from core.parser._common import _detect_column_boundaries
+
+    assert len(_detect_column_boundaries(_symmetric_four_column_blocks(), 1000.0)) == 3
+
+
+def test_spread_merged_block_does_not_break_four_column_detection():
+    """加一个横跨整幅、中心点落在左半区的误聚块，四栏检测仍应成立。"""
+    from core.parser._common import _detect_column_boundaries
+
+    blocks = _symmetric_four_column_blocks()
+    blocks.append({"text": "联系方式\n造运营系统建设思路", "bbox": (50.0, 100.0, 830.0, 115.0)})
+
+    assert len(_detect_column_boundaries(blocks, 1000.0)) == 3
+
+
 class _FakeLayoutPipeline:
     def predict(self, path):
         return [{"boxes": [{"label": "text", "coordinate": (0, 0, 100, 100)}]}]
@@ -457,6 +542,59 @@ def test_repair_dangling_relationships_returns_original_path_when_no_dangling_re
 
     result = _repair_dangling_relationships(clean_path)
     assert result == clean_path
+
+
+# ---------------------------------------------------------------------------
+# 补丁回归测试：段落文字被 <w:sdt>（Word/WPS内容控件，常见于第三方审阅工具留下的
+# 标记span）包裹时，python-docx 原生 Paragraph.text 会静默丢字
+# （真实文档诊断：某份docx经WPS审阅工具处理后，其中一段文字被 tag="reviewtag_" 的
+# 内容控件包住，解析结果里这段文字整体消失，导致后续送审文本出现文档里根本不存在
+# 的数量不一致，LLM据此报出的"错误"实为解析层丢字的伪影；见
+# core/parser/docx_parser.py::_paragraph_full_text 模块内文档）
+# ---------------------------------------------------------------------------
+
+def _build_docx_with_sdt_wrapped_text(tmp_path) -> Path:
+    """构造一份段落文字被 <w:sdt> 拦腰截断的docx：模拟真实文档里审阅工具留下的内容控件。"""
+    import docx as docx_module
+    from docx.oxml import parse_xml
+    from docx.oxml.ns import nsdecls
+
+    doc = docx_module.Document()
+    p = doc.add_paragraph()
+    xml = f"""<w:p {nsdecls("w")}>
+      <w:r><w:t>目前公司有四种</w:t></w:r>
+      <w:sdt>
+        <w:sdtPr><w:tag w:val="reviewtag_"/></w:sdtPr>
+        <w:sdtContent>
+          <w:r><w:t>业务类型：企业</w:t></w:r>
+        </w:sdtContent>
+      </w:sdt>
+      <w:r><w:t>业务、厂商业务、政府业务、咨询业务。</w:t></w:r>
+    </w:p>"""
+    new_p = parse_xml(xml)
+    p._p.getparent().replace(p._p, new_p)
+
+    path = tmp_path / "sdt_wrapped.docx"
+    doc.save(path)
+    return path
+
+
+def test_parse_docx_reads_text_wrapped_in_content_control(tmp_path):
+    from core.parser.docx_parser import parse_docx
+
+    path = _build_docx_with_sdt_wrapped_text(tmp_path)
+
+    # 修复前的对照：python-docx原生 Paragraph.text 确实会漏掉sdt包裹的内容（问题真实存在）
+    import docx as docx_module
+
+    raw_text = docx_module.Document(str(path)).paragraphs[0].text
+    assert "业务类型：企业" not in raw_text
+
+    parsed = parse_docx(path)
+    assert any(
+        "目前公司有四种业务类型：企业业务、厂商业务、政府业务、咨询业务。" in b.text
+        for b in parsed.blocks
+    )
 
 
 # ---------------------------------------------------------------------------
