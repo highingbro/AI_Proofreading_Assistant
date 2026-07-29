@@ -1,17 +1,38 @@
 """SQLite 连接与建表。
 
-定义四张表：records（流程记录表）、issues（问题明细表）、feedback（人工反馈原始
-记录表）与 feedback_rules（反馈语义总结规则表，见 core/feedback_rules.py 模块
-docstring）。
+定义五张表：tasks（任务表）、records（流程记录表）、issues（问题明细表）、
+feedback（人工反馈原始记录表）与 feedback_rules（反馈语义总结规则表，见
+core/feedback_rules.py 模块 docstring）。
+
+层级是 任务 → 校对轮次(records) → 问题(issues)：一件持续的校对工作（如"期刊A"）
+是一个 task，它下面的每一次校对/比对是一条 record。
 """
 
 import sqlite3
+from datetime import datetime
 
 import config
 
+_CREATE_TASKS_SQL = """
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL DEFAULT '激活',
+    created_at TEXT NOT NULL,
+    created_by TEXT
+)
+"""
+
+# task_id 在 DDL 上可空、由应用层保证必填（db.models.create_record 的 task_id 是必传
+# 参数，app.py 未选任务时根本进不到校对功能）：SQLite 的 ALTER TABLE ADD COLUMN 无法
+# 给已有行的新列加 NOT NULL 约束，若只在建表语句里写 NOT NULL，会导致"新建的库"和
+# "迁移过来的库"schema 不一致——两边一致比多一个 DDL 约束更有价值。
 _CREATE_RECORDS_SQL = """
 CREATE TABLE IF NOT EXISTS records (
     record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER REFERENCES tasks (task_id),
+    author TEXT,
     created_at TEXT NOT NULL,
     doc_name TEXT,
     doc_version TEXT,
@@ -151,10 +172,62 @@ def _migrate_add_doc_page_column(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+def _migrate_add_task_and_author_columns(conn: sqlite3.Connection) -> None:
+    """给旧库的 records 表补上 task_id（所属任务）与 author（谁跑的这轮校对）两列。
+
+    ADD COLUMN 带 REFERENCES 子句在 SQLite 里合法的前提是新列默认值为 NULL，这里
+    正好满足；task_id 的回填交给 _migrate_backfill_legacy_task。author 旧行留 NULL
+    ——引入署名之前的记录本来就没有"谁做的"这个信息，不臆造。
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(records)")}
+    if "task_id" not in cols:
+        conn.execute("ALTER TABLE records ADD COLUMN task_id INTEGER REFERENCES tasks (task_id)")
+    if "author" not in cols:
+        conn.execute("ALTER TABLE records ADD COLUMN author TEXT")
+    conn.commit()
+
+
+def _migrate_backfill_legacy_task(conn: sqlite3.Connection) -> None:
+    """把 task_id still NULL 的历史记录统一归入 config.LEGACY_TASK_NAME 这个任务。
+
+    引入任务之后，应用层任何路径都不可能再写出 task_id 为 NULL 的 record（未选任务
+    时进不到校对功能），所以"task_id IS NULL"精确等价于"该功能上线前的历史数据"，
+    可以放心整批回填。空库/已回填过的库里没有这样的行，此时连任务都不会建——天然
+    幂等，重复调用 init_db() 不会一次次冒出新的空任务。
+    """
+    pending = conn.execute("SELECT COUNT(*) AS n FROM records WHERE task_id IS NULL").fetchone()
+    if not pending["n"]:
+        return
+
+    row = conn.execute(
+        "SELECT task_id FROM tasks WHERE name = ?", (config.LEGACY_TASK_NAME,)
+    ).fetchone()
+    if row is None:
+        cursor = conn.execute(
+            "INSERT INTO tasks (name, description, status, created_at) VALUES (?, ?, ?, ?)",
+            (
+                config.LEGACY_TASK_NAME,
+                "引入任务概念之前的历史校对记录，可在任务页逐条改归属到真实任务。",
+                config.TASK_STATUS_ACTIVE,
+                datetime.now().isoformat(),
+            ),
+        )
+        task_id = cursor.lastrowid
+    else:
+        task_id = row["task_id"]
+
+    conn.execute("UPDATE records SET task_id = ? WHERE task_id IS NULL", (task_id,))
+    conn.commit()
+
+
 def init_db(db_path=None) -> None:
-    """首次运行自动建表（若表已存在则跳过），并对旧库做必要的列迁移。"""
+    """首次运行自动建表（若表已存在则跳过），并对旧库做必要的列迁移。
+
+    tasks 必须先于 records 建——records.task_id 声明了指向它的外键。
+    """
     conn = get_connection(db_path)
     try:
+        conn.execute(_CREATE_TASKS_SQL)
         conn.execute(_CREATE_RECORDS_SQL)
         conn.execute(_CREATE_ISSUES_SQL)
         conn.execute(_CREATE_FEEDBACK_SQL)
@@ -164,5 +237,7 @@ def init_db(db_path=None) -> None:
         _migrate_add_mode_column(conn)
         _migrate_rename_layer_labels(conn)
         _migrate_add_doc_page_column(conn)
+        _migrate_add_task_and_author_columns(conn)
+        _migrate_backfill_legacy_task(conn)
     finally:
         conn.close()

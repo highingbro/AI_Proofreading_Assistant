@@ -9,11 +9,46 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import docx
+from docx.oxml.ns import qn
 
 from core.parser._types import ParsedBlock, ParsedDocument
 
 _RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 ET.register_namespace("", _RELS_NS)  # 避免重新序列化时ElementTree生成丑陋的ns0:前缀
+
+_TAB = qn("w:tab")
+_BREAK_TAGS = (qn("w:br"), qn("w:cr"))
+_TEXT_TAG = qn("w:t")
+_NO_BREAK_HYPHEN = qn("w:noBreakHyphen")
+
+
+def _paragraph_full_text(para) -> str:
+    """按文档顺序拼出段落全文，包含被 `<w:sdt>`（内容控件）包裹的文字。
+
+    起因（真实文档诊断）：python-docx 的 `Paragraph.text` 只走 `self._p.xpath("w:r | w:hyperlink")`，
+    xpath不带`.//`意味着只认`<w:p>`的直接子元素——`<w:r>`被包在`<w:sdt><w:sdtContent>`里（Word/WPS
+    的"内容控件"，常见于第三方审阅/校对工具留下的标记span，实测文档里就是一段review工具打的
+    `tag="reviewtag_"`）时会被静默跳过，读到的正文中间生生缺一截，且没有任何异常或警告。这份被
+    截断的文字送进LLM后，会产生文档里根本不存在的"数量/逻辑不一致"，LLM报出的"错误"实为我们
+    自己解析层丢字导致的伪影，不是原文真的有问题。
+
+    改用`para._p.iter()`遍历段落下所有后代元素（不限层级，document order），只挑文本类子元素
+    翻译成对应字符——不止修`w:sdt`这一种壳，`w:ins`（追踪的插入修订）等任何"文字被包了一层非
+    `w:r`直接子元素"的情况一并覆盖。`w:delText`（追踪修订里被删除的文字）不在识别范围内，本来
+    就不该算作当前正文。
+    """
+    parts: list[str] = []
+    for el in para._p.iter():
+        tag = el.tag
+        if tag == _TEXT_TAG:
+            parts.append(el.text or "")
+        elif tag == _TAB:
+            parts.append("\t")
+        elif tag in _BREAK_TAGS:
+            parts.append("\n")
+        elif tag == _NO_BREAK_HYPHEN:
+            parts.append("-")
+    return "".join(parts)
 
 
 def _resolve_relationship_target(rels_member_name: str, target: str) -> str:
@@ -94,7 +129,7 @@ def parse_docx(path: Path) -> ParsedDocument:
     blocks: list[ParsedBlock] = []
     idx = 0  # 剔除空段落后的顺序号，与下面循环里的 i（原始段落序号）不是同一个数
     for i, para in enumerate(document.paragraphs, start=1):
-        text = para.text.strip()
+        text = _paragraph_full_text(para).strip()
         if not text:
             continue  # 空段落（纯换行/纯空格）直接跳过，不产出 ParsedBlock
         # para.style 是 Word 里作者手动设置的段落样式（点击"标题1"/"正文"等按钮时写入的元数据），

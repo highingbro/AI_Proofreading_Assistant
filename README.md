@@ -11,56 +11,67 @@
 - 反馈学习：同一类问题被人工多次拒绝后，历史反馈会经LLM总结成规则注入后续校对提示词，减少反复报同类无意义问题
 - 对话式追问：针对某条问题继续追问校对依据
 - 原稿比对：原稿Word + 排版稿PDF/Word 逐句diff，识别实质性内容改动
-- Streamlit 界面：标准校对、原稿比对、历史记录（可查看/继续操作任意历史流程）、反馈学习管理
-- 用户名隔离：按用户名分开保存各自的校对记录/上传文档，不填用户名默认沿用同一份数据
+- 任务管理：每次校对都归属于一个任务（比如某本期刊），任务下可累积多轮记录，带 激活/已解决/已关闭 状态
+- Streamlit 界面：标准校对、原稿比对、历史记录（可查看/继续操作本任务的任意历史流程）、反馈学习管理
+- 署名：每条记录标注完成人，供多人协作时追溯是谁做的（不是登录账号，无鉴权）
 - Excel 导出
 
-## 启动方式
+## 安装与启动
+
+需要 Python 3.11。
 
 ```bash
-# 创建虚拟环境（首次运行）
-python -m venv .venv
+git clone https://github.com/highingbro/AI_Proofreading_Assistant.git
+cd AI_Proofreading_Assistant
 
-# 激活虚拟环境
-# Windows PowerShell:
-.venv\Scripts\Activate.ps1
-# macOS/Linux:
-source .venv/bin/activate
+# 创建并激活虚拟环境
+python -m venv .venv
+.venv\Scripts\Activate.ps1     # Windows PowerShell
+source .venv/bin/activate      # macOS/Linux
 
 # 安装依赖
 pip install -r requirements.txt
 
-# 启动应用前需设置环境变量 DASHSCOPE_API_KEY（DashScope密钥）
-# LLM_BASE_URL / LLM_MODEL 可选，不设置则使用默认值
+# 单独安装 PaddlePaddle（扫描件OCR用，requirements.txt 装不了——
+# 它要按本机有无GPU/CUDA版本选择不同的下载源）
+pip install paddlepaddle==3.3.1                        # 纯CPU
+# 有 NVIDIA GPU 时改装 GPU 版，例如 CUDA 12.6：
+# pip install paddlepaddle-gpu==3.3.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+
+# 配置密钥（必填），LLM_BASE_URL / LLM_MODEL 可选，不设则用默认值
+$env:DASHSCOPE_API_KEY = "sk-你的密钥"                  # Windows PowerShell
+export DASHSCOPE_API_KEY="sk-你的密钥"                  # macOS/Linux
+
 streamlit run app.py
 ```
 
-
-
-```
-
-`config.py` 里 `PADDLE_DEVICE = "auto"` 会在运行时自动探测是否有可用 GPU
+首次启动会自动创建 `data/` 下的数据库和目录，浏览器打开后落在**任务选择界面**——新建一个任务
+（比如"期刊A"）并进入，才会出现左侧的功能入口。
 
 ### 其他环境要求
 
+- `config.py` 里 `PADDLE_DEVICE = "auto"` 会在运行时自动探测是否有可用 GPU，不需要手动改。
 - 首次运行 OCR 会自动下载模型权重到 `~/.paddlex/official_models`，需要能访问外网；之后复用本地缓存。
-
-
-多人共用同一份部署时，建议每个人在侧边栏"当前用户"里填自己的名字——各自的校对记录和上传文档会分开保存
+- 只处理有文字层的 PDF/Word 时用不到 OCR，PaddlePaddle 可以先不装（遇到扫描件才会报错提示）。
 
 ## 数据存放位置
 
-- `data/app.db`（或用户名隔离下的 `data/app_<用户名>.db`）：所有校对记录、问题明细、反馈学习数据
+数据全部在本地，不上传任何服务器（除了送给 LLM 校对的正文片段）。
+
+- `data/app.db`：所有任务、校对记录、问题明细、反馈学习数据
 - `data/uploads/`：上传文件的临时落盘目录，仅供解析读取用，会自动清理旧文件
 - `data/exports/`：导出的 Excel 文件
 - `data/app.log`：运行日志
 
-
+以上都在 `.gitignore` 里，不会被提交。
 
 ## 运行测试
 
 ```bash
-pytest tests/               # 跑全部阶段测试（默认跳过耗真实API额度的集成冒烟）
-pytest tests/test_stage5.py # 跑指定阶段的测试
-pytest -m integration       # 手动跑耗真实API额度的集成冒烟测试
+pytest tests/                    # 跑全部测试（默认跳过耗真实API额度的集成冒烟）
+pytest tests/test_classifier.py  # 跑指定模块的测试
+pytest -m integration            # 手动跑耗真实API额度的集成冒烟测试
 ```
+
+注：`tests/samples/` 下的 PDF 样例文件没有提交到仓库（体积大且含真实稿件），
+`test_parser.py`/`test_chunker.py` 里依赖这些样例的用例在 clone 后会失败，其余测试不受影响。
