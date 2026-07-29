@@ -82,8 +82,8 @@ PROOFREAD_MAX_CONCURRENT_CHUNKS = 8
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 # 实际使用的密钥环境变量是 DASHSCOPE_API_KEY（阿里云DashScope标准命名），这个没有默认值，必须设置。
 LLM_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
-# 模型直接指定 qwen3.6-plus，不强制要求环境变量；仍支持 LLM_MODEL 环境变量覆盖。
-LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
+
+LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v3.2")
 # 不设默认值：留空(None)时 chat_completion 按文本长度动态估算超时（见下方 LLM_TIMEOUT_* 四项）；
 # 一旦设置该环境变量，视为显式指定固定超时，不再动态估算。
 LLM_TIMEOUT = int(os.environ["LLM_TIMEOUT"]) if os.environ.get("LLM_TIMEOUT") else None

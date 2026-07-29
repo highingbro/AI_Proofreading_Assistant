@@ -18,7 +18,7 @@ import config
 from core.exporter import export_issues_to_excel
 from core.parser import ParsedDocument
 from db import database
-from db.models import add_issue, create_record, get_records
+from db.models import add_issue, create_record, create_task, get_records, get_tasks
 
 _HEADER = ("页码/位置", "文档页码", "原文", "问题类型", "优先级", "分层标注", "修改建议", "处理状态", "批注")
 
@@ -30,6 +30,22 @@ def db_path(tmp_path):
     return path
 
 
+def _enter_task(db_path) -> int:
+    """预置一个当前任务，跳过 app.py 的任务闸门。
+
+    app.py 是"先选任务再选功能"的线性流程——没有当前任务时只渲染任务选择界面、
+    连"功能入口"radio 都不存在。这些UI冒烟测试要测的是任务之内的各个页面，所以直接
+    预置 session_state["task_id"]；闸门本身由 tests/test_app_tasks.py 单独覆盖。
+    """
+    tasks = get_tasks(db_path=db_path)
+    return tasks[0]["task_id"] if tasks else create_task("测试任务", db_path=db_path)
+
+
+def _task(db_path) -> int:
+    """建一个任务——records.task_id 是必填的，任何 create_record 之前都要先有任务。"""
+    return create_task("测试任务", db_path=db_path)
+
+
 def _build_record_with_issues(db_path):
     """构造覆盖四层、高优先级、引文类、引文+高优先级、未定位的记录。
 
@@ -38,7 +54,8 @@ def _build_record_with_issues(db_path):
     "只导出已采纳"这条行为本身由 test_export_only_includes_accepted_issues 单独覆盖。
     """
     record_id = create_record(
-        doc_name="测试文档.pdf", doc_version="v1", task_type="标准校对", db_path=db_path
+        task_id=_task(db_path), doc_name="测试文档.pdf", doc_version="v1",
+        task_type="标准校对", db_path=db_path,
     )
 
     issue_specs = [
@@ -172,7 +189,7 @@ def test_export_doc_page_column_blank_when_not_extracted(db_path, tmp_path, monk
 
 def test_export_doc_page_column_shows_value_when_extracted(db_path, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "EXPORTS_DIR", tmp_path)
-    record_id = create_record(doc_name="期刊.pdf", doc_version="", task_type="标准校对", db_path=db_path)
+    record_id = create_record(task_id=_task(db_path), doc_name="期刊.pdf", doc_version="", task_type="标准校对", db_path=db_path)
     add_issue(
         record_id=record_id, page_location="文档第12页左栏", doc_page="12", original_text="期刊正文",
         issue_type="错别字与拼写", priority=config.PRIORITY_MEDIUM, layer=config.LAYER_CONFIRMED,
@@ -213,7 +230,7 @@ def test_export_note_column_shows_value_and_status_is_plain(db_path, tmp_path, m
 def test_export_only_includes_accepted_issues(db_path, tmp_path, monkeypatch):
     """真实使用中发现的行为变更：待处理/已拒绝的问题不应出现在导出结果里。"""
     monkeypatch.setattr(config, "EXPORTS_DIR", tmp_path)
-    record_id = create_record(doc_name="混合状态文档.pdf", doc_version="", task_type="标准校对", db_path=db_path)
+    record_id = create_record(task_id=_task(db_path), doc_name="混合状态文档.pdf", doc_version="", task_type="标准校对", db_path=db_path)
     add_issue(
         record_id=record_id, page_location="第1页", original_text="待处理问题",
         issue_type="错别字与拼写", priority=config.PRIORITY_MEDIUM, layer=config.LAYER_CONFIRMED,
@@ -241,7 +258,7 @@ def test_export_only_includes_accepted_issues(db_path, tmp_path, monkeypatch):
 def test_export_record_with_no_accepted_issues_generates_header_only_file(db_path, tmp_path, monkeypatch):
     """记录里有问题，但一条都没被采纳——导出应是只有表头的空清单，不抛异常。"""
     monkeypatch.setattr(config, "EXPORTS_DIR", tmp_path)
-    record_id = create_record(doc_name="全部待处理文档.pdf", doc_version="", task_type="标准校对", db_path=db_path)
+    record_id = create_record(task_id=_task(db_path), doc_name="全部待处理文档.pdf", doc_version="", task_type="标准校对", db_path=db_path)
     add_issue(
         record_id=record_id, page_location="第1页", original_text="待处理问题",
         issue_type="错别字与拼写", priority=config.PRIORITY_MEDIUM, layer=config.LAYER_CONFIRMED,
@@ -343,7 +360,7 @@ def test_export_backfills_result_path_on_record(db_path, tmp_path, monkeypatch):
 
 def test_export_record_with_zero_issues_still_generates_header_only_file(db_path, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "EXPORTS_DIR", tmp_path)
-    record_id = create_record(doc_name="空文档.pdf", doc_version="", task_type="标准校对", db_path=db_path)
+    record_id = create_record(task_id=_task(db_path), doc_name="空文档.pdf", doc_version="", task_type="标准校对", db_path=db_path)
 
     path = export_issues_to_excel(record_id, db_path=db_path)
 
@@ -369,7 +386,8 @@ def test_export_nonexistent_record_id_raises(db_path, tmp_path, monkeypatch):
 # app.py UI 冒烟
 # ---------------------------------------------------------------------------
 
-def test_app_export_button_downloads_file(tmp_path, monkeypatch):
+def test_app_export_button_downloads_file(tmp_path, monkeypatch, db_path):
+    monkeypatch.setattr(config, "DB_PATH", db_path)
     from unittest.mock import MagicMock
 
     from core.classifier import ClassifiedIssue, ClassifiedResult
@@ -425,6 +443,7 @@ def test_app_export_button_downloads_file(tmp_path, monkeypatch):
          patch("core.feedback_rules.regenerate_rejection_rules"), \
          patch("core.exporter.export_issues_to_excel", return_value=fake_export_path) as mock_export:
         at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+        at.session_state["task_id"] = _enter_task(db_path)
         at.run()
 
         at.file_uploader[0].upload("test.pdf", b"dummy pdf bytes", "application/pdf").run()
@@ -439,5 +458,5 @@ def test_app_export_button_downloads_file(tmp_path, monkeypatch):
         # AppTest（当前版本）不支持 st.download_button 元素访问（无 at.download_button
         # 属性），退化为"不崩溃 + 导出函数被正确调用一次 + 成功提示展示"这条较弱断言。
         assert not at.exception
-        mock_export.assert_called_once_with(1, db_path=None)
+        mock_export.assert_called_once_with(1)
         assert len(at.success) >= 1

@@ -31,7 +31,7 @@ from core.parser import ParsedDocument
 from core.proofreader import ProofreadResult
 from core.workflow.run import run_standard_proofread
 from db import database
-from db.models import add_feedback, delete_feedback, get_feedback, get_feedback_rules, replace_feedback_rules
+from db.models import add_feedback, create_task, delete_feedback, get_feedback, get_feedback_rules, get_tasks, replace_feedback_rules
 
 
 @pytest.fixture
@@ -39,6 +39,17 @@ def db_path(tmp_path):
     path = tmp_path / "test_app.db"
     database.init_db(path)
     return path
+
+
+def _enter_task(db_path) -> int:
+    """预置一个当前任务，跳过 app.py 的任务闸门。
+
+    app.py 是"先选任务再选功能"的线性流程——没有当前任务时只渲染任务选择界面、
+    连"功能入口"radio 都不存在。这些UI冒烟测试要测的是任务之内的各个页面，所以直接
+    预置 session_state["task_id"]；闸门本身由 tests/test_app_tasks.py 单独覆盖。
+    """
+    tasks = get_tasks(db_path=db_path)
+    return tasks[0]["task_id"] if tasks else create_task("测试任务", db_path=db_path)
 
 
 _PATH_SEP_SUGGESTION = "将'一'改为'-'或'>'等规范的路径分隔符"
@@ -380,6 +391,7 @@ def test_app_reject_button_records_feedback_without_regenerating_rules(db_path, 
          patch("core.feedback.record_rejection") as mock_record, \
          patch("core.feedback_rules.regenerate_rejection_rules") as mock_regenerate:
         at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+        at.session_state["task_id"] = _enter_task(db_path)
         at.run()
 
         at.file_uploader[0].upload("test.pdf", b"dummy pdf bytes", "application/pdf").run()
@@ -420,6 +432,7 @@ def test_app_standard_export_triggers_rule_regeneration(db_path, tmp_path, monke
          patch("core.exporter.export_issues_to_excel", return_value=fake_export_path), \
          patch("core.feedback_rules.regenerate_rejection_rules") as mock_regenerate:
         at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+        at.session_state["task_id"] = _enter_task(db_path)
         at.run()
 
         at.file_uploader[0].upload("test.pdf", b"dummy pdf bytes", "application/pdf").run()
@@ -438,6 +451,8 @@ def test_feedback_management_page_shows_placeholder_when_empty(db_path, monkeypa
     from streamlit.testing.v1 import AppTest
 
     at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+
+    at.session_state["task_id"] = _enter_task(db_path)
     at.run()
 
     nav = next(r for r in at.radio if r.label == "功能入口")
@@ -458,6 +473,8 @@ def test_feedback_management_page_shows_current_rules(db_path, monkeypatch):
     from streamlit.testing.v1 import AppTest
 
     at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+
+    at.session_state["task_id"] = _enter_task(db_path)
     at.run()
 
     nav = next(r for r in at.radio if r.label == "功能入口")
@@ -473,6 +490,7 @@ def test_feedback_management_page_regenerate_button_calls_regenerate(db_path, mo
 
     with patch("core.feedback_rules.regenerate_rejection_rules") as mock_regenerate:
         at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+        at.session_state["task_id"] = _enter_task(db_path)
         at.run()
 
         nav = next(r for r in at.radio if r.label == "功能入口")
@@ -495,6 +513,8 @@ def test_feedback_management_page_forget_button_deletes_entry(db_path, monkeypat
     from streamlit.testing.v1 import AppTest
 
     at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+
+    at.session_state["task_id"] = _enter_task(db_path)
     at.run()
 
     nav = next(r for r in at.radio if r.label == "功能入口")
