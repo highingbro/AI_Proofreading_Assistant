@@ -15,7 +15,7 @@ import config
 from core.chunker import chunk_document, chunk_for_block, locate_block
 from core.parser import ParsedBlock, ParsedDocument, parse_document
 
-SAMPLES_DIR = Path(__file__).resolve().parent / "samples"
+SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
 
 
 def _make_text(seed: int, length: int) -> str:

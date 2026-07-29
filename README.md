@@ -73,5 +73,5 @@ pytest tests/test_classifier.py  # 跑指定模块的测试
 pytest -m integration            # 手动跑耗真实API额度的集成冒烟测试
 ```
 
-注：`tests/samples/` 下的 PDF 样例文件没有提交到仓库（体积大且含真实稿件），
+
 `test_parser.py`/`test_chunker.py` 里依赖这些样例的用例在 clone 后会失败，其余测试不受影响。
