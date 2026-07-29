@@ -39,6 +39,13 @@ def _lines_share_same_row(bbox_a: tuple[float, float, float, float], bbox_b: tup
     上不同行的line之间y轴不会有这种重叠。用y轴重叠长度占较小line自身高度的比例判断，
     真实数据验证过：误拆的同一行重叠比例是100%，真正不同行是0，阈值
     config.NATIVE_SAME_ROW_OVERLAP_MIN_RATIO 取值留了充分余量。
+
+    纵向重叠是必要条件但不充分：跨页对开版面（一个物理页印着两个页码的左右两页）里，
+    左页和右页同一水平线上的两块**毫不相干**的文字，纵向同样可以100%重叠，PyMuPDF照样
+    把它们聚成一个block。所以再加一道横向闸门——两个line的水平间隙不能超过较小那个line
+    自身高度的 config.NATIVE_SAME_ROW_MAX_GAP_HEIGHT_RATIO 倍（行高≈字号≈一个汉字宽度，
+    这个倍数约等于"最多隔几个字"）。用行高当尺子而不是绝对pt值，是为了对不同字号/不同
+    渲染尺度的文档自适应。间隙为负（两个line横向有交叠）时自然通过，不需要另外判断。
     """
     y0_a, y1_a = bbox_a[1], bbox_a[3]
     y0_b, y1_b = bbox_b[1], bbox_b[3]
@@ -48,7 +55,10 @@ def _lines_share_same_row(bbox_a: tuple[float, float, float, float], bbox_b: tup
     smaller_height = min(y1_a - y0_a, y1_b - y0_b)
     if smaller_height <= 0:
         return False
-    return overlap / smaller_height >= config.NATIVE_SAME_ROW_OVERLAP_MIN_RATIO
+    if overlap / smaller_height < config.NATIVE_SAME_ROW_OVERLAP_MIN_RATIO:
+        return False
+    gap = max(bbox_a[0], bbox_b[0]) - min(bbox_a[2], bbox_b[2])
+    return gap <= smaller_height * config.NATIVE_SAME_ROW_MAX_GAP_HEIGHT_RATIO
 
 
 def _is_wrapped_continuation(text: str, bbox: tuple[float, float, float, float], right_edge: float, font_size: float) -> bool:

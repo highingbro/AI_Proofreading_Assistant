@@ -11,6 +11,8 @@
 
 **拆分子模块时需要注意的坑**：`tests/test_app_standard_flow.py::test_run_standard_proofread_calls_pipeline_in_order`/`test_run_standard_proofread_forwards_mode_to_proofread_document` 用 `unittest.mock.patch("core.workflow.parse_document", ...)` 这类字符串路径直接测试 `run_standard_proofread()` 内部如何调用它的管线依赖（`parse_document`/`chunk_document`/`proofread_document`/`load_rejection_rules_text`/`classify_issues`）——`run_standard_proofread` 定义在 `core/workflow/run.py` 里，这些依赖名字也是在 `run.py` 自己的模块命名空间里 `import` 的，所以patch目标是 `core.workflow.run.parse_document` 等（不是 `core.workflow.parse_document`，否则 `unittest.mock.patch` 会因为该属性在 `core.workflow` 包上不存在而报错）。而 `patch("core.workflow.run_standard_proofread", ...)`/`persist_result`/`set_issue_status`/`set_issue_note`（`app.py` UI冒烟测试用来打桩顶层入口的那些）**不受这条规则影响**——`app.py` 是通过 `from core import workflow` + `workflow.run_standard_proofread(...)` 这种属性访问方式调用的，而不是 `from core.workflow import run_standard_proofread` 后裸调用，所以只要 `core/workflow/__init__.py` re-export 了这四个名字，`core.workflow.X` 属性就依然存在且能被正确patch。这个坑与 [core/parser/CLAUDE.md](../parser/CLAUDE.md)/[core/proofreader/CLAUDE.md](../proofreader/CLAUDE.md) 里记录的 monkeypatch 目标问题是同一类。
 
+`persist_result`/`persist_comparison_result` 的 `task_id` 是必传参数、`author` 选填：每条 record 都归属于一个任务，署名记"这轮是谁做的"，两者都由 `app.py` 从 session_state 取当前值传进来（层级与迁移见根 [CLAUDE.md](../../CLAUDE.md)"数据层级"一节）。
+
 **`issues` 表 `record_id NOT NULL` 外键，决定了 `persist_result` 必须先建 `record` 再逐条写 issue**——`persist_result` 因此同时承担"建 record 写统计字段"和"写 issue 明细"两件事，`core/exporter.py` 导出时不需要再建 record，只回填 `result_path`（详见 `core/exporter.py` 模块docstring）。
 
 ## context_snippet 计算时机（为何不能等追问时才现算）
