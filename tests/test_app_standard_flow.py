@@ -20,7 +20,7 @@ from core.parser import ParsedDocument
 from core.proofreader import ProofreadResult
 from core.workflow import persist_result, run_standard_proofread, set_issue_note, set_issue_status
 from db import database
-from db.models import get_issues, get_records
+from db.models import create_task, get_issues, get_records, get_tasks
 
 
 @pytest.fixture
@@ -28,6 +28,22 @@ def db_path(tmp_path):
     path = tmp_path / "test_app.db"
     database.init_db(path)
     return path
+
+
+def _enter_task(db_path) -> int:
+    """预置一个当前任务，跳过 app.py 的任务闸门。
+
+    app.py 是"先选任务再选功能"的线性流程——没有当前任务时只渲染任务选择界面、
+    连"功能入口"radio 都不存在。这些UI冒烟测试要测的是任务之内的各个页面，所以直接
+    预置 session_state["task_id"]；闸门本身由 tests/test_app_tasks.py 单独覆盖。
+    """
+    tasks = get_tasks(db_path=db_path)
+    return tasks[0]["task_id"] if tasks else create_task("测试任务", db_path=db_path)
+
+
+def _task(db_path) -> int:
+    """建一个任务——records.task_id 是必填的，persist_result 之前都要先有任务。"""
+    return create_task("测试任务", db_path=db_path)
 
 
 def _classified_issue(**overrides) -> ClassifiedIssue:
@@ -135,7 +151,7 @@ def test_run_standard_proofread_forwards_mode_to_proofread_document():
 def test_persist_result_writes_record_and_issues_to_temp_db(db_path):
     result = _classified_result_all_layers()
 
-    record_id, issue_ids = persist_result(result, doc_name="测试文档.pdf", db_path=db_path)
+    record_id, issue_ids = persist_result(result, task_id=_task(db_path), doc_name="测试文档.pdf", db_path=db_path)
 
     assert len(issue_ids) == 4
 
@@ -171,7 +187,8 @@ def test_persist_result_writes_mode_to_record(db_path):
     result = _classified_result_all_layers()
 
     record_id, _ = persist_result(
-        result, doc_name="测试文档.pdf", mode=config.PROOFREAD_MODE_SIMPLIFIED, db_path=db_path
+        result, task_id=_task(db_path), doc_name="测试文档.pdf",
+        mode=config.PROOFREAD_MODE_SIMPLIFIED, db_path=db_path,
     )
 
     record = get_records(db_path=db_path)[0]
@@ -181,7 +198,7 @@ def test_persist_result_writes_mode_to_record(db_path):
 
 def test_set_issue_status_updates_issue_and_record_counts(db_path):
     result = _classified_result_all_layers()
-    record_id, issue_ids = persist_result(result, doc_name="测试文档.pdf", db_path=db_path)
+    record_id, issue_ids = persist_result(result, task_id=_task(db_path), doc_name="测试文档.pdf", db_path=db_path)
 
     set_issue_status(issue_ids[0], "已采纳", record_id=record_id, db_path=db_path)
     set_issue_status(issue_ids[1], "已拒绝", record_id=record_id, db_path=db_path)
@@ -197,7 +214,7 @@ def test_set_issue_status_updates_issue_and_record_counts(db_path):
 
 def test_set_issue_status_without_record_id_only_updates_issue(db_path):
     result = _classified_result_all_layers()
-    record_id, issue_ids = persist_result(result, doc_name="测试文档.pdf", db_path=db_path)
+    record_id, issue_ids = persist_result(result, task_id=_task(db_path), doc_name="测试文档.pdf", db_path=db_path)
 
     set_issue_status(issue_ids[0], "已采纳", db_path=db_path)
 
@@ -210,7 +227,7 @@ def test_set_issue_status_without_record_id_only_updates_issue(db_path):
 def test_set_issue_note_independent_of_status(db_path):
     """批注与采纳/拒绝状态无关：拒绝后写批注不影响status，status变化也不清空批注。"""
     result = _classified_result_all_layers()
-    record_id, issue_ids = persist_result(result, doc_name="测试文档.pdf", db_path=db_path)
+    record_id, issue_ids = persist_result(result, task_id=_task(db_path), doc_name="测试文档.pdf", db_path=db_path)
 
     set_issue_status(issue_ids[0], "已拒绝", record_id=record_id, db_path=db_path)
     set_issue_note(issue_ids[0], "个人核实过，确实需要修改", db_path=db_path)
@@ -229,17 +246,21 @@ def test_set_issue_note_independent_of_status(db_path):
 # app.py UI 冒烟（streamlit.testing.v1.AppTest）
 # ---------------------------------------------------------------------------
 
-def test_app_initial_render_no_exception():
+def test_app_initial_render_no_exception(monkeypatch, db_path):
+    monkeypatch.setattr(config, "DB_PATH", db_path)
     from streamlit.testing.v1 import AppTest
 
     at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+
+    at.session_state["task_id"] = _enter_task(db_path)
     at.run()
 
     assert not at.exception
     assert len(at.file_uploader) == 1
 
 
-def test_app_upload_and_classify_flow_with_mocked_workflow(tmp_path, monkeypatch):
+def test_app_upload_and_classify_flow_with_mocked_workflow(tmp_path, monkeypatch, db_path):
+    monkeypatch.setattr(config, "DB_PATH", db_path)
     from streamlit.testing.v1 import AppTest
 
     fake_result = _classified_result_all_layers()
@@ -251,6 +272,7 @@ def test_app_upload_and_classify_flow_with_mocked_workflow(tmp_path, monkeypatch
          patch("core.workflow.set_issue_status") as mock_set_status, \
          patch("core.followup.get_followup_history", return_value=[]):
         at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+        at.session_state["task_id"] = _enter_task(db_path)
         at.run()
         assert not at.exception
 
@@ -271,11 +293,12 @@ def test_app_upload_and_classify_flow_with_mocked_workflow(tmp_path, monkeypatch
         accept_button.click().run()
 
         assert not at.exception
-        mock_set_status.assert_called_once_with(101, "已采纳", record_id=1, db_path=None)
+        mock_set_status.assert_called_once_with(101, "已采纳", record_id=1)
         assert at.session_state["issue_status"][101]["status"] == "已采纳"
 
 
-def test_app_rerun_button_reclassifies_same_file_immediately(tmp_path, monkeypatch):
+def test_app_rerun_button_reclassifies_same_file_immediately(tmp_path, monkeypatch, db_path):
+    monkeypatch.setattr(config, "DB_PATH", db_path)
     """回归测试：校对完成后，"开始校对"按钮消失（classified_result非None时不再渲染），
     换文件判断又是按内容md5哈希比对，导致同一份文件校对完想再来一遍时没有任何按钮能
     触发——必须先换成别的文件再换回来才行。修复后结果展示区顶部的"重新校对本文件"
@@ -291,6 +314,7 @@ def test_app_rerun_button_reclassifies_same_file_immediately(tmp_path, monkeypat
          patch("core.workflow.persist_result", return_value=(1, [101, 102, 103, 104])) as mock_persist, \
          patch("core.followup.get_followup_history", return_value=[]):
         at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+        at.session_state["task_id"] = _enter_task(db_path)
         at.run()
 
         at.file_uploader[0].upload("test.pdf", b"dummy pdf bytes", "application/pdf").run()
@@ -312,7 +336,8 @@ def test_app_rerun_button_reclassifies_same_file_immediately(tmp_path, monkeypat
         assert at.session_state["classified_result"] is fake_result
 
 
-def test_app_rerun_button_falls_back_to_reupload_prompt_when_file_lost(tmp_path, monkeypatch):
+def test_app_rerun_button_falls_back_to_reupload_prompt_when_file_lost(tmp_path, monkeypatch, db_path):
+    monkeypatch.setattr(config, "DB_PATH", db_path)
     """uploaded_file 因切页丢失（浏览器安全限制）时，"重新校对本文件"没有文件字节
     可用，没法直接重跑，应该退回清空缓存+提示重新上传，而不是报错/静默什么都不做。"""
     from streamlit.testing.v1 import AppTest
@@ -325,6 +350,7 @@ def test_app_rerun_button_falls_back_to_reupload_prompt_when_file_lost(tmp_path,
          patch("core.workflow.persist_result", return_value=(1, [101, 102, 103, 104])), \
          patch("core.followup.get_followup_history", return_value=[]):
         at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+        at.session_state["task_id"] = _enter_task(db_path)
         at.run()
 
         at.file_uploader[0].upload("test.pdf", b"dummy pdf bytes", "application/pdf").run()
@@ -343,7 +369,8 @@ def test_app_rerun_button_falls_back_to_reupload_prompt_when_file_lost(tmp_path,
         assert at.session_state["classified_result"] is None
 
 
-def test_app_mode_radio_selection_forwarded_to_workflow(tmp_path, monkeypatch):
+def test_app_mode_radio_selection_forwarded_to_workflow(tmp_path, monkeypatch, db_path):
+    monkeypatch.setattr(config, "DB_PATH", db_path)
     """校对模式单选框：选择"精简"后点击"开始校对"，run_standard_proofread/persist_result
     都应以 mode="精简" 被调用（而不是默认的"深度"）。"""
     from streamlit.testing.v1 import AppTest
@@ -356,6 +383,7 @@ def test_app_mode_radio_selection_forwarded_to_workflow(tmp_path, monkeypatch):
          patch("core.workflow.persist_result", return_value=(1, [101, 102, 103, 104])) as mock_persist, \
          patch("core.followup.get_followup_history", return_value=[]):
         at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+        at.session_state["task_id"] = _enter_task(db_path)
         at.run()
 
         at.file_uploader[0].upload("test.pdf", b"dummy pdf bytes", "application/pdf").run()
@@ -374,7 +402,8 @@ def test_app_mode_radio_selection_forwarded_to_workflow(tmp_path, monkeypatch):
         assert at.session_state["mode"] == config.PROOFREAD_MODE_SIMPLIFIED
 
 
-def test_app_note_input_saves_independent_of_status(tmp_path, monkeypatch):
+def test_app_note_input_saves_independent_of_status(tmp_path, monkeypatch, db_path):
+    monkeypatch.setattr(config, "DB_PATH", db_path)
     """批注输入框：与采纳/拒绝完全独立，改动即通过 on_change 落库，不需要单独的保存按钮。"""
     from streamlit.testing.v1 import AppTest
 
@@ -387,6 +416,7 @@ def test_app_note_input_saves_independent_of_status(tmp_path, monkeypatch):
          patch("core.workflow.set_issue_note") as mock_set_note, \
          patch("core.followup.get_followup_history", return_value=[]):
         at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+        at.session_state["task_id"] = _enter_task(db_path)
         at.run()
 
         at.file_uploader[0].upload("test.pdf", b"dummy pdf bytes", "application/pdf").run()
@@ -398,10 +428,11 @@ def test_app_note_input_saves_independent_of_status(tmp_path, monkeypatch):
         note_input.set_value("这条我核实过，建议保留").run()
 
         assert not at.exception
-        mock_set_note.assert_called_once_with(101, "这条我核实过，建议保留", db_path=None)
+        mock_set_note.assert_called_once_with(101, "这条我核实过，建议保留")
 
 
-def test_app_cached_result_survives_file_uploader_reset(tmp_path, monkeypatch):
+def test_app_cached_result_survives_file_uploader_reset(tmp_path, monkeypatch, db_path):
+    monkeypatch.setattr(config, "DB_PATH", db_path)
     """回归测试：切换到其他功能页再切回来时，浏览器会把 file_uploader 的已选文件
     重置为 None（Streamlit/浏览器的已知限制，非bug），但已校对完的结果不应因此消失。
     用 file_uploader.clear() 模拟这个"uploaded_file 变回 None"的状态。"""
@@ -415,6 +446,7 @@ def test_app_cached_result_survives_file_uploader_reset(tmp_path, monkeypatch):
          patch("core.workflow.persist_result", return_value=(1, [101, 102, 103, 104])), \
          patch("core.followup.get_followup_history", return_value=[]):
         at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+        at.session_state["task_id"] = _enter_task(db_path)
         at.run()
         at.file_uploader[0].upload("test.pdf", b"dummy pdf bytes", "application/pdf").run()
         start_button = next(b for b in at.button if b.label == "开始校对")
@@ -428,7 +460,8 @@ def test_app_cached_result_survives_file_uploader_reset(tmp_path, monkeypatch):
         assert len([b for b in at.button if b.key == "accept_101"]) == 1
 
 
-def test_app_corrupted_file_shows_error_without_crashing(tmp_path, monkeypatch):
+def test_app_corrupted_file_shows_error_without_crashing(tmp_path, monkeypatch, db_path):
+    monkeypatch.setattr(config, "DB_PATH", db_path)
     """上传损坏/非法内容的文件：parse_document 会真实抛异常（不打桩，不耗LLM额度），
     页面必须用 st.error 兜住、不崩溃，且不应该走到 persist_result。"""
     from streamlit.testing.v1 import AppTest
@@ -437,6 +470,7 @@ def test_app_corrupted_file_shows_error_without_crashing(tmp_path, monkeypatch):
 
     with patch("core.workflow.persist_result") as mock_persist:
         at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+        at.session_state["task_id"] = _enter_task(db_path)
         at.run()
 
         at.file_uploader[0].upload("broken.pdf", b"this is not a real pdf file", "application/pdf").run()
@@ -451,7 +485,8 @@ def test_app_corrupted_file_shows_error_without_crashing(tmp_path, monkeypatch):
         assert at.session_state["classified_result"] is None
 
 
-def test_app_standard_proofread_reinitializes_when_issue_status_preexists(tmp_path, monkeypatch):
+def test_app_standard_proofread_reinitializes_when_issue_status_preexists(tmp_path, monkeypatch, db_path):
+    monkeypatch.setattr(config, "DB_PATH", db_path)
     """回归：历史记录/原稿比对页会 setdefault issue_status；曾用它当"是否初始化过"的哨兵，
     先逛那两个页面（issue_status 已建）再回标准校对时会跳过初始化，导致 classified_result
     缺失、访问时 KeyError。改用标准校对专属的 classified_result 当哨兵后，即使 issue_status
@@ -461,6 +496,8 @@ def test_app_standard_proofread_reinitializes_when_issue_status_preexists(tmp_pa
     monkeypatch.setattr(config, "UPLOADS_DIR", tmp_path)
 
     at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+
+    at.session_state["task_id"] = _enter_task(db_path)
     # 模拟"别的页面先建好了 issue_status，但标准校对的键一个都还没建"的状态
     at.session_state["issue_status"] = {}
     at.run()
