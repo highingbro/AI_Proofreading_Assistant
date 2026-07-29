@@ -177,10 +177,141 @@ def test_ocr_region_multiline_join_uses_newline(monkeypatch):
     monkeypatch.setattr(parser, "_get_ocr_pipeline", lambda: _FakeOCRPipeline())
 
     img = Image.new("RGB", (100, 100), color="white")
-    blocks, _ = parser._run_structure(img)
+    blocks, _, _ = parser._run_structure(img)
 
     assert len(blocks) == 1
     assert blocks[0]["text"] == "第一行\n第二行"
+
+
+# ---------------------------------------------------------------------------
+# 双栏页期刊页码提取：A类(_strip_headers_footers)靠正则猜形状，
+# B类(_run_structure)直接读版面模型自己打的"number"标签，两条通道分别验证
+# ---------------------------------------------------------------------------
+
+def test_strip_headers_footers_extracts_numeric_zone_text_as_doc_page():
+    from core.parser.native_pdf import _strip_headers_footers
+
+    pages_raw = [
+        [
+            {"text": "12", "zone": "bottom"},
+            {"text": "正文内容", "zone": "body"},
+        ]
+    ]
+    stripped, doc_pages = _strip_headers_footers(pages_raw)
+
+    assert doc_pages == ["12"]
+    # 页码文本本身应从保留的块里剔除，不当正文送审
+    assert [b["text"] for b in stripped[0]] == ["正文内容"]
+
+
+def test_strip_headers_footers_no_numeric_zone_text_returns_none():
+    from core.parser.native_pdf import _strip_headers_footers
+
+    pages_raw = [
+        [
+            {"text": "目录", "zone": "top"},
+            {"text": "正文内容", "zone": "body"},
+        ]
+    ]
+    stripped, doc_pages = _strip_headers_footers(pages_raw)
+
+    assert doc_pages == [None]
+    assert [b["text"] for b in stripped[0]] == ["目录", "正文内容"]
+
+
+def test_strip_headers_footers_repeated_header_text_not_treated_as_doc_page():
+    """跨页重复的页眉/栏目名（哪怕碰巧被判为"repeated"）不该被当成页码——
+    页码逐页递增，天然不会在2页以上原样重复出现，这里只验证 repeated 分支
+    和 doc_page 提取分支互不干扰。"""
+    from core.parser.native_pdf import _strip_headers_footers
+
+    pages_raw = [
+        [{"text": "某某期刊", "zone": "top"}, {"text": "第一页正文", "zone": "body"}],
+        [{"text": "某某期刊", "zone": "top"}, {"text": "第二页正文", "zone": "body"}],
+    ]
+    stripped, doc_pages = _strip_headers_footers(pages_raw)
+
+    assert doc_pages == [None, None]
+    assert [b["text"] for b in stripped[0]] == ["第一页正文"]
+    assert [b["text"] for b in stripped[1]] == ["第二页正文"]
+
+
+class _FakeLayoutPipelineWithPageNumber:
+    def predict(self, path):
+        return [
+            {
+                "boxes": [
+                    {"label": "text", "coordinate": (0, 0, 100, 80)},
+                    {"label": "number", "coordinate": (0, 90, 100, 100)},
+                ]
+            }
+        ]
+
+
+class _FakeOCRPipelineWithPageNumber:
+    def predict(self, path):
+        return [
+            {
+                "rec_texts": ["正文内容", "12"],
+                "rec_scores": [0.99, 0.95],
+                "rec_boxes": [(10, 10, 60, 20), (10, 92, 30, 98)],
+            }
+        ]
+
+
+def test_ocr_run_structure_extracts_doc_page_from_number_label(monkeypatch):
+    from PIL import Image
+
+    from core.parser import ocr_pdf as parser
+
+    monkeypatch.setattr(parser, "_get_layout_pipeline", lambda: _FakeLayoutPipelineWithPageNumber())
+    monkeypatch.setattr(parser, "_get_ocr_pipeline", lambda: _FakeOCRPipelineWithPageNumber())
+
+    img = Image.new("RGB", (100, 100), color="white")
+    blocks, _, doc_page = parser._run_structure(img)
+
+    assert doc_page == "12"
+    # "number"标签区域仍要被丢弃，不进最终block列表（不是待校对正文）
+    assert len(blocks) == 1
+    assert blocks[0]["text"] == "正文内容"
+
+
+def test_ocr_run_structure_no_number_label_returns_none_doc_page(monkeypatch):
+    from PIL import Image
+
+    from core.parser import ocr_pdf as parser
+
+    monkeypatch.setattr(parser, "_get_layout_pipeline", lambda: _FakeLayoutPipeline())
+    monkeypatch.setattr(parser, "_get_ocr_pipeline", lambda: _FakeOCRPipeline())
+
+    img = Image.new("RGB", (100, 100), color="white")
+    _, _, doc_page = parser._run_structure(img)
+
+    assert doc_page is None
+
+
+# ---------------------------------------------------------------------------
+# _source_location：双栏页优先显示提取到的期刊页码，没提取到退回PDF页码；
+# 单栏页完全不受影响
+# ---------------------------------------------------------------------------
+
+def test_source_location_double_column_uses_doc_page_when_present():
+    from core.parser._common import _source_location
+
+    assert _source_location(5, "double", "left", "12") == "文档第12页左栏"
+    assert _source_location(5, "double", "right", "12") == "文档第12页右栏"
+
+
+def test_source_location_double_column_falls_back_to_pdf_page_without_doc_page():
+    from core.parser._common import _source_location
+
+    assert _source_location(5, "double", "left", None) == "PDF第5页左栏"
+
+
+def test_source_location_single_column_unaffected_by_doc_page():
+    from core.parser._common import _source_location
+
+    assert _source_location(5, "single", None, "12") == "第5页"
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +347,7 @@ def test_table_region_keeps_flat_joined_text(monkeypatch):
     monkeypatch.setattr(parser, "_get_ocr_pipeline", lambda: _FakeOCRPipelineTable())
 
     img = Image.new("RGB", (200, 200), color="white")
-    blocks, _ = parser._run_structure(img)
+    blocks, _, _ = parser._run_structure(img)
 
     assert len(blocks) == 1
     assert blocks[0]["block_type"] == "table"

@@ -114,7 +114,7 @@ def _parse_pdf(path: Path, force_layout: str, spread_order: str, ocr: str) -> Pa
                 for sub_img in sub_images:
                     logical_page_no += 1
                     # OCR识别 + 版面分析 + 阅读顺序还原（含分栏判断），一步做完
-                    raw_blocks, page_conf, mode = _ocr_and_order(sub_img, force_layout)
+                    raw_blocks, page_conf, mode, doc_page = _ocr_and_order(sub_img, force_layout)
                     if page_conf is not None and page_conf < config.OCR_PAGE_LOW_CONFIDENCE_THRESHOLD:
                         warnings.append(f"第{logical_page_no}页整体OCR识别置信度偏低({page_conf:.2f})")
                     # 统一转换成和A类相同的中间字典结构，方便后面合并处理
@@ -122,8 +122,9 @@ def _parse_pdf(path: Path, force_layout: str, spread_order: str, ocr: str) -> Pa
                         {
                             "text": b["text"],
                             "block_type": b["block_type"],
-                            "source_location": _source_location(logical_page_no, mode, b.get("column")),
+                            "source_location": _source_location(logical_page_no, mode, b.get("column"), doc_page),
                             "confidence": b["confidence"],
+                            "doc_page": doc_page,
                         }
                         for b in raw_blocks
                     ]
@@ -134,9 +135,9 @@ def _parse_pdf(path: Path, force_layout: str, spread_order: str, ocr: str) -> Pa
     # 所有物理页扫完之后，统一处理原生页的页眉页脚剔除+分栏+阅读顺序还原
     # （必须放在循环外，因为页眉页脚判定要看"多页重复出现的同位置文本"这个跨页信息）
     if native_pending:
-        stripped_list = _strip_headers_footers([rb for _, rb, _ in native_pending])
-        for (placeholder, _, width), stripped in zip(native_pending, stripped_list):
-            finalized, mode = _finalize_native_page(stripped, width, placeholder["page_no"], force_layout)
+        stripped_list, doc_pages = _strip_headers_footers([rb for _, rb, _ in native_pending])
+        for (placeholder, _, width), stripped, doc_page in zip(native_pending, stripped_list, doc_pages):
+            finalized, mode = _finalize_native_page(stripped, width, placeholder["page_no"], force_layout, doc_page)
             # 回填之前占位时留空的 mode 和 blocks
             placeholder["mode"] = mode
             placeholder["blocks"] = finalized
@@ -158,6 +159,7 @@ def _parse_pdf(path: Path, force_layout: str, spread_order: str, ocr: str) -> Pa
                     block_type=b["block_type"],
                     source_location=b["source_location"],
                     ocr_confidence=b["confidence"],
+                    doc_page=b.get("doc_page"),
                 )
             )
             idx += 1

@@ -14,6 +14,14 @@ def locate_block(parsed: ParsedDocument, block_index: int) -> str:
     raise ValueError(f"未找到 block_index={block_index}")
 
 
+def locate_doc_page(parsed: ParsedDocument, block_index: int) -> str | None:
+    """返回该block所在页提取到的期刊页码（ParsedBlock.doc_page），未提取到为None。"""
+    for b in parsed.blocks:
+        if b.block_index == block_index:
+            return b.doc_page
+    raise ValueError(f"未找到 block_index={block_index}")
+
+
 def chunk_for_block(chunked: ChunkedDocument, block_index: int) -> int:
     """返回某 block 所属（正文归属，非重叠区）的 chunk_index"""
     for chunk in chunked.chunks:

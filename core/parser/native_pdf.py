@@ -39,6 +39,13 @@ def _lines_share_same_row(bbox_a: tuple[float, float, float, float], bbox_b: tup
     上不同行的line之间y轴不会有这种重叠。用y轴重叠长度占较小line自身高度的比例判断，
     真实数据验证过：误拆的同一行重叠比例是100%，真正不同行是0，阈值
     config.NATIVE_SAME_ROW_OVERLAP_MIN_RATIO 取值留了充分余量。
+
+    纵向重叠是必要条件但不充分：跨页对开版面（一个物理页印着两个页码的左右两页）里，
+    左页和右页同一水平线上的两块**毫不相干**的文字，纵向同样可以100%重叠，PyMuPDF照样
+    把它们聚成一个block。所以再加一道横向闸门——两个line的水平间隙不能超过较小那个line
+    自身高度的 config.NATIVE_SAME_ROW_MAX_GAP_HEIGHT_RATIO 倍（行高≈字号≈一个汉字宽度，
+    这个倍数约等于"最多隔几个字"）。用行高当尺子而不是绝对pt值，是为了对不同字号/不同
+    渲染尺度的文档自适应。间隙为负（两个line横向有交叠）时自然通过，不需要另外判断。
     """
     y0_a, y1_a = bbox_a[1], bbox_a[3]
     y0_b, y1_b = bbox_b[1], bbox_b[3]
@@ -48,7 +55,10 @@ def _lines_share_same_row(bbox_a: tuple[float, float, float, float], bbox_b: tup
     smaller_height = min(y1_a - y0_a, y1_b - y0_b)
     if smaller_height <= 0:
         return False
-    return overlap / smaller_height >= config.NATIVE_SAME_ROW_OVERLAP_MIN_RATIO
+    if overlap / smaller_height < config.NATIVE_SAME_ROW_OVERLAP_MIN_RATIO:
+        return False
+    gap = max(bbox_a[0], bbox_b[0]) - min(bbox_a[2], bbox_b[2])
+    return gap <= smaller_height * config.NATIVE_SAME_ROW_MAX_GAP_HEIGHT_RATIO
 
 
 def _is_wrapped_continuation(text: str, bbox: tuple[float, float, float, float], right_edge: float, font_size: float) -> bool:
@@ -117,11 +127,17 @@ def _extract_native_page_raw(page: "fitz.Page") -> tuple[list[dict], float]:
 #   外层list：多个页面，每个元素是"一页"
 #   内层list：这一页里的所有文本块
 #   dict：每个文本块本身，即 {"text":, "bbox":, "avg_size":, "zone":}
-def _strip_headers_footers(pages_raw: list[list[dict]]) -> list[list[dict]]:
+def _strip_headers_footers(pages_raw: list[list[dict]]) -> tuple[list[list[dict]], list[str | None]]:
     """跨页剔除重复出现的页眉/页脚文本，以及页码类文本。
 
     传入的是多页的原始块列表（每页一个list），因为判断"是否是页眉页脚"
     必须对比多页——单看一页无法区分"页眉"和"恰好在页面顶部的正文标题"。
+
+    返回 (剔除后的块列表, 每页提取到的期刊页码)——后者供双栏页 _source_location
+    显示"文档第X页"用（详见 core/parser/CLAUDE.md）：命中 _NUMERIC_ZONE_RE 的
+    页眉/页脚文本本来就要被剔除，顺手记下来，不是重复文本（属于跨页重复的运
+    行页眉/刊名不算页码，只有"命中数字/罗马数字形状"这一支才算）。一页内若
+    有多处命中，取第一个——多个候选极少见，不做优先级判断。
     """
     # 第一遍：统计每一段"位于顶部/底部区域"的文本，在多少个不同页面里出现过
     zone_text_counter: Counter[str] = Counter()
@@ -134,16 +150,25 @@ def _strip_headers_footers(pages_raw: list[list[dict]]) -> list[list[dict]]:
     # 在2页或以上的顶/底部区域重复出现的文本，判定为页眉页脚
     repeated = {t for t, c in zone_text_counter.items() if c >= 2}
 
-    # 第二遍：逐页过滤，剔除"重复文本"和"纯页码/罗马数字页码"（_NUMERIC_ZONE_RE）
+    # 第二遍：逐页过滤，剔除"重复文本"和"纯页码/罗马数字页码"（_NUMERIC_ZONE_RE），
+    # 后者顺带记作这一页的期刊页码候选
     result = []
+    doc_pages: list[str | None] = []
     for page_raw in pages_raw:
-        kept = [
-            blk
-            for blk in page_raw
-            if not (blk["zone"] in ("top", "bottom") and (blk["text"] in repeated or _NUMERIC_ZONE_RE.match(blk["text"])))
-        ]
+        kept = []
+        doc_page: str | None = None
+        for blk in page_raw:
+            in_zone = blk["zone"] in ("top", "bottom")
+            if in_zone and blk["text"] in repeated:
+                continue  # 跨页重复的页眉/页脚正文（刊名/栏目名等），不是页码
+            if in_zone and _NUMERIC_ZONE_RE.match(blk["text"]):
+                if doc_page is None:
+                    doc_page = blk["text"].strip()
+                continue  # 页码类文本
+            kept.append(blk)
         result.append(kept)
-    return result
+        doc_pages.append(doc_page)
+    return result, doc_pages
 
 
 def _classify_native_block_type(avg_size: float, body_size: float, zone: str) -> str:
@@ -227,9 +252,14 @@ def _order_native_page(raw_blocks: list[dict], width: float, force_layout: str) 
     return ordered, mode
 
 
-def _finalize_native_page(raw_blocks: list[dict], width: float, page_no: int, force_layout: str) -> tuple[list[dict], str]:
+def _finalize_native_page(
+    raw_blocks: list[dict], width: float, page_no: int, force_layout: str, doc_page: str | None = None
+) -> tuple[list[dict], str]:
     """把已剔除页眉页脚的原生页原始块，做完"分类block_type + 排出阅读顺序"，
     转换成和 _parse_pdf 最终期望的统一字典格式。
+
+    doc_page 是 _strip_headers_footers 从这一页页眉/页脚提取到的期刊页码（可能为
+    None），原样透传给 _source_location 和输出字典，供双栏页显示"文档第X页"。
     """
     if not raw_blocks:
         return [], "single"  # 这一页剔除页眉页脚后什么都不剩，直接返回空结果
@@ -246,8 +276,9 @@ def _finalize_native_page(raw_blocks: list[dict], width: float, page_no: int, fo
         {
             "text": b["text"],
             "block_type": b["block_type"],
-            "source_location": _source_location(page_no, mode, b.get("column")),
+            "source_location": _source_location(page_no, mode, b.get("column"), doc_page),
             "confidence": None,  # 原生提取的文本没有OCR置信度这一说，固定填None
+            "doc_page": doc_page,
         }
         for b in ordered
     ]

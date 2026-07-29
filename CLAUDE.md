@@ -4,30 +4,12 @@
 
 完整需求/架构见 [项目框架文档_AI校对助手.md](项目框架文档_AI校对助手.md)——设计动机、四层结果分类的原因、各阶段验收标准都在那里，改动涉及分层规则或工作流设计时先看该文档。
 
-## 当前进度
-
-按 [项目框架文档_AI校对助手.md](项目框架文档_AI校对助手.md) 第10章分阶段开发，每阶段提示词见 `prompt/阶段N提示词_*.md`。
-
-| 阶段 | 内容 | 状态 |
-|---|---|---|
-| 1 | 项目骨架（目录、SQLite建表、配置） | ✅ 已实现 |
-| 2 | 文档解析（PDF双栏/OCR、Word） | ✅ 已实现（`core/parser/`） |
-| 3 | 长文档分块 | ✅ 已实现（`core/chunker/`） |
-| 4 | LLM调用封装 + 校对提示词 | ✅ 已实现（`core/llm_client.py` + `core/proofreader/`） |
-| 5 | 结果分层（引文保护、事实置信度降级） | ✅ 已实现（`core/classifier/`） |
-| 6 | Streamlit对话界面（标准校对流） | ✅ 已实现（`core/workflow/` + `app.py`） |
-| 8 | Excel导出 | ✅ 已实现（`core/exporter.py`） |
-| 7 | 对话式追问处理 | ✅ 已实现（`core/followup.py`） |
-| 9 | 原稿比对工作流 | ✅ 已实现（`core/comparer.py` + `core/workflow/`） |
-| 10 | 收尾（异常处理、历史轮次查看页） | 🟡 历史记录详情页已实现（`app.py`）；异常处理已随 `core/llm_client.py`/`app.py` 分散实现（LLM重试、解析/校对异常兜底），未单独验收 |
-
-**未实现的模块目前只有函数签名和 docstring，函数体是 `raise NotImplementedError`——这是有意为之的阶段占位，不是 bug。** 除非明确要开发对应阶段，不要动这些函数体。
 
 ## 目录结构
 
 ```
-app.py              Streamlit 入口（标准校对流+Excel导出+追问+历史记录详情页+反馈学习管理+原稿比对）——UI设计决策见文件顶部 docstring
-config.py           全局配置：路径、分层/优先级常量、LLM配置、结果分层阈值、追问上下文配置、反馈学习阈值、OCR相关参数
+app.py              Streamlit 入口（任务选择闸门+标准校对流+Excel导出+追问+历史记录详情页+反馈学习管理+原稿比对）——UI设计决策见文件顶部 docstring
+config.py           全局配置：路径、任务状态常量、分层/优先级常量、LLM配置、结果分层阈值、追问上下文配置、反馈学习阈值、OCR相关参数
 core/
   parser/           文档解析（已实现）——PDF/Word 统一解析，子目录拆成 native_pdf.py(A类)/ocr_pdf.py(B类)/docx_parser.py(C类)/_common.py/_types.py，详见 core/parser/CLAUDE.md
   chunker/          长文档分块（已实现）——子目录拆成 _types.py/fill_units.py/greedy_fill.py/locate.py，详见 core/chunker/CLAUDE.md
@@ -41,9 +23,10 @@ core/
   feedback_rules.py 反馈语义总结（已实现，单文件）——把历史拒绝记录交给LLM总结成规则注入校对提示词，替换早期字符串相似度自动降级，设计决策见文件顶部 docstring
   comparer.py       原稿比对（已实现，单文件）——归一化+段落对齐+句子级diff，设计决策见文件顶部 docstring
 db/
-  database.py       SQLite连接与建表（records、issues、feedback、feedback_rules 四张表）
+  database.py       SQLite连接与建表（tasks、records、issues、feedback、feedback_rules 五张表）+ 旧库列迁移
   models.py         数据访问函数（CRUD，支持传入 db_path 便于测试用临时库）
-tests/              按 core/ 模块命名的测试文件（test_parser.py、test_chunker.py、test_classifier.py…）
+tests/              按 core/ 模块命名的测试文件（test_parser.py、test_chunker.py、test_classifier.py…）；
+                    test_app_tasks.py 单独覆盖任务闸门（其余 AppTest 冒烟统一预置 session_state["task_id"] 跳过闸门）
 tools/preview_parse.py    手动预览 core/parser/ 解析结果的调试脚本
 tools/preview_chunks.py   手动预览 core/chunker/ 分块结果的调试脚本
 tools/run_proofread.py    串起 解析→分块→校对 全链路，跑LLM调用的调试脚本（耗API额度，支持 --save-json 保存RawIssue供离线调分层规则）
@@ -60,6 +43,24 @@ pytest.ini          注册 integration marker，默认 `pytest`/`pytest tests/` 
 - 拆成目录的模块（`core/parser/`、`core/chunker/`、`core/proofreader/`、`core/classifier/`、`core/workflow/`）——读该目录下的 `CLAUDE.md`。
 - 仍是单文件的模块（`core/llm_client.py`、`core/exporter.py`、`core/followup.py`、`core/feedback.py`、`core/feedback_rules.py`、`core/comparer.py`）——读文件顶部的 docstring。
 - `app.py` 的 UI 设计决策（session_state 生命周期、按钮key惯例、历史记录页两处状态同步的坑等）——读文件顶部的 docstring。
+
+## 数据层级：任务 → 校对轮次 → 问题
+
+一件持续的校对工作（比如某本期刊）是一个 **task**，它下面的每一次校对/比对是一条
+**record**，每条 record 下是若干 **issue**。使用流程是线性的：进页面先选任务或建任务，
+选定之后才出现功能入口，四个页面都在当前任务的范围内工作（"历史记录"= 这个任务的历史）。
+任务有 激活/已解决/已关闭 三个状态（`config.TASK_STATUS_*`），只影响任务列表的默认筛选，
+不自动推进。
+
+**署名不是账号**：`records.author` 记的是"这轮校对是谁做的"，不决定数据存放位置——所有
+任务和记录都在同一个 `config.DB_PATH` 里，谁都看得到。同一轮校对必然由同一个人跑完并审完，
+所以 issues 表不另存处置人。候选署名从 `records.author ∪ tasks.created_by` 现取
+（`get_authors()`），不单建人员表。
+
+引入任务之前的历史记录由 `db/database.py::_migrate_backfill_legacy_task` 整批归入
+"历史归档"任务（`config.LEGACY_TASK_NAME`），不按文档名猜归属；之后在历史记录页逐条
+"改归属任务"拆到真实任务里。因此 `records.task_id` 不会再出现 NULL，`create_record` 把
+它设为必传参数即可保证这条约束（表结构上仍可空的原因见建表语句上方注释）。
 
 ## 设计铁律（改动分层/校对逻辑前必读）
 
