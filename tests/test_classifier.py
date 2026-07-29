@@ -368,7 +368,9 @@ def test_rule_f_normal_medium_confidence_no_rewording():
 # ---------------------------------------------------------------------------
 
 def test_rule_g_downgrades_recency_doubt_within_grace_window():
-    year = config.LLM_KNOWLEDGE_CUTOFF_YEAR + 3
+    # 取容忍窗口的上界（闭区间），跟着配置走而不是写死年数——写死的话
+    # KNOWLEDGE_CUTOFF_GRACE_YEARS 一调小，这几条用例就会因为年份跑到窗口外而失真
+    year = config.LLM_KNOWLEDGE_CUTOFF_YEAR + config.KNOWLEDGE_CUTOFF_GRACE_YEARS
     raw = _raw_issue(
         issue_type="常识与事实性错误", category="factual", confidence="high",
         original_text=f"{year}年公司完成了新一轮融资",
@@ -397,7 +399,9 @@ def test_rule_g_does_not_downgrade_when_year_far_beyond_grace_window():
 
 def test_rule_g_does_not_trigger_without_recency_wording():
     """只是普通事实性怀疑（不涉及"太新/知识范围"这类措辞），不应被规则G误伤。"""
-    year = config.LLM_KNOWLEDGE_CUTOFF_YEAR + 3
+    # 取容忍窗口的上界（闭区间），跟着配置走而不是写死年数——写死的话
+    # KNOWLEDGE_CUTOFF_GRACE_YEARS 一调小，这几条用例就会因为年份跑到窗口外而失真
+    year = config.LLM_KNOWLEDGE_CUTOFF_YEAR + config.KNOWLEDGE_CUTOFF_GRACE_YEARS
     raw = _raw_issue(
         issue_type="常识与事实性错误", category="factual", confidence="low",
         original_text=f"{year}年公司完成了新一轮融资",
@@ -411,7 +415,9 @@ def test_rule_g_does_not_trigger_without_recency_wording():
 
 def test_rule_g_does_not_trigger_for_non_factual_issue_type():
     """即使措辞命中关键词，issue_type/category都不是事实类时不应触发。"""
-    year = config.LLM_KNOWLEDGE_CUTOFF_YEAR + 3
+    # 取容忍窗口的上界（闭区间），跟着配置走而不是写死年数——写死的话
+    # KNOWLEDGE_CUTOFF_GRACE_YEARS 一调小，这几条用例就会因为年份跑到窗口外而失真
+    year = config.LLM_KNOWLEDGE_CUTOFF_YEAR + config.KNOWLEDGE_CUTOFF_GRACE_YEARS
     raw = _raw_issue(
         issue_type="标点符号问题", category="normal", confidence="high",
         original_text=f"{year}年，公司,完成了新一轮融资",
@@ -622,13 +628,88 @@ def test_no_op_filter_does_not_trigger_for_doubtful_suggestion_quoting_original(
 
 def test_no_op_filter_drops_radical_lookalike_without_nfkc_decomposition():
     """真实案例（data/app.db 35号记录）："⻔"（CJK部首补充区，无NFKC兼容分解）代替
-    标准汉字"门"混入正文，NFKC规范化本身处理不了，必须走 _RADICAL_LOOKALIKE_OVERRIDES
-    人工映射表才能识别为零改动。"""
+    标准汉字"门"混入正文，NFKC规范化本身处理不了，靠码位区间判定识别为零改动。"""
     parsed = _parsed([_block(block_index=0)])
     raw = _raw_issue(block_index=0, original_text="厦⻔", suggestion='应改为"厦门"')
     result = classify_issues(ProofreadResult(issues=[raw], chunk_warnings=[]), parsed)
 
     assert result.issues == []
+
+
+def test_no_op_filter_drops_variant_char_outside_any_lookup_table():
+    """曾经靠人工映射表识别这类字符，表只有13个字，换一份文档就被表外的"⻣"(骨)、
+    "⻰"(龙)破防、一次放出38条假错别字。现在按码位区间判定，不依赖表——这两个字
+    当年都不在表里，必须同样被丢弃，否则等于退回老方案。"""
+    parsed = _parsed([_block(block_index=0)])
+    for original, suggestion in (("⻣干", '应改为"骨干"'), ("江苏⻰城", '应改为"江苏龙城"')):
+        raw = _raw_issue(block_index=0, original_text=original, suggestion=suggestion)
+        result = classify_issues(ProofreadResult(issues=[raw], chunk_warnings=[]), parsed)
+        assert result.issues == [], f"{original} 未被识别为字形变体"
+
+
+def test_no_op_filter_drops_kangxi_radical_folding_to_traditional_form():
+    """康熙部首区是**传统**部首，NFKC分解结果一律繁体字形："⼾"(U+2F3E)分解成"戶"，
+    与简体正文里建议的"户"对不上。靠 _KANGXI_TRADITIONAL_FOLDINGS 折回简体才能识别。"""
+    parsed = _parsed([_block(block_index=0)])
+    raw = _raw_issue(block_index=0, original_text="客⼾销售", suggestion='应改为"客户销售"')
+    result = classify_issues(ProofreadResult(issues=[raw], chunk_warnings=[]), parsed)
+
+    assert result.issues == []
+
+
+def test_no_op_filter_drops_fragment_only_suggestion_quoting_whole_line():
+    """真实案例中最常见的形态：LLM引用一整行原文当original_text，却只在建议里写出要
+    改的那个词。既不符合"『旧』应改为『新』"的片段格式，整段比对长度又对不上，靠
+    _fragment_is_only_cjk_variants 在原文里找等长窗口才能识别。"""
+    parsed = _parsed([_block(block_index=0)])
+    raw = _raw_issue(
+        block_index=0,
+        original_text="能⼒，直接决定了企业的市场竞争⼒。尤其是从事⼤",
+        suggestion='应改为"能力"',
+    )
+    result = classify_issues(ProofreadResult(issues=[raw], chunk_warnings=[]), parsed)
+
+    assert result.issues == []
+
+
+def test_no_op_filter_does_not_drop_variant_char_used_as_wrong_word():
+    """**误伤防线**：`数⼦化`→`数字化` 里 "⼦"(康熙部首"子") 被误用成了"字"，这是真
+    错别字。只看"旧侧字符落在变体区"就放行会把它一起丢掉，必须校验变体字符的规范
+    形式确实等于建议里的字（子≠字，因此保留）。"""
+    parsed = _parsed([_block(block_index=0)])
+    raw = _raw_issue(block_index=0, original_text="数⼦化升级", suggestion='应改为"数字化升级"')
+    result = classify_issues(ProofreadResult(issues=[raw], chunk_warnings=[]), parsed)
+
+    assert len(result.issues) == 1
+
+
+def test_no_op_filter_does_not_drop_real_typo_next_to_variant_chars():
+    """**误伤防线**：整句里既有字形变体又有真错别字（"⾯对们"的"们"应为"面"）时，
+    存在非变体差异就必须整条放行，不能因为大部分差异是变体就丢掉。"""
+    parsed = _parsed([_block(block_index=0)])
+    raw = _raw_issue(
+        block_index=0,
+        original_text="与企业⾼管⾯对们交流。",
+        suggestion='应改为"与企业高管面对面交流。"',
+    )
+    result = classify_issues(ProofreadResult(issues=[raw], chunk_warnings=[]), parsed)
+
+    assert len(result.issues) == 1
+
+
+def test_no_op_filter_does_not_drop_deletion_suggestion_worded_as_ying_wei():
+    """**误伤防线**：'应为『X』，『何』字多余' 的真实意图是删字，引号外的补充说明才是
+    重点。"应为"因此只加进片段式正则、不加进整段式——整段式套用会把删字建议误判成
+    零改动丢掉（原文去掉"如何"的"何"后，恰好只与建议差一个字形变体字符）。"""
+    parsed = _parsed([_block(block_index=0)])
+    raw = _raw_issue(
+        block_index=0,
+        original_text="探讨如何进⾏智能制造整体规划以及推进落地的理论",
+        suggestion="应为'进行智能制造整体规划以及推进落地'，'何'字多余",
+    )
+    result = classify_issues(ProofreadResult(issues=[raw], chunk_warnings=[]), parsed)
+
+    assert len(result.issues) == 1
 
 
 def test_no_op_filter_drops_fragment_style_suggestion_within_longer_original_text():
