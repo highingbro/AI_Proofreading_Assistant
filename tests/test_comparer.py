@@ -10,7 +10,7 @@ from core.comparer import align_paragraphs, compare_documents, normalize, senten
 from core.parser import ParsedBlock, ParsedDocument
 from core.workflow import persist_comparison_result, run_document_comparison
 from db import database
-from db.models import add_issue, create_record, get_issues, get_records
+from db.models import add_issue, create_record, create_task, get_issues, get_records, get_tasks
 
 
 @pytest.fixture
@@ -18,6 +18,22 @@ def db_path(tmp_path):
     path = tmp_path / "test_comparer.db"
     database.init_db(path)
     return path
+
+
+def _enter_task(db_path) -> int:
+    """预置一个当前任务，跳过 app.py 的任务闸门。
+
+    app.py 是"先选任务再选功能"的线性流程——没有当前任务时只渲染任务选择界面、
+    连"功能入口"radio 都不存在。这些UI冒烟测试要测的是任务之内的各个页面，所以直接
+    预置 session_state["task_id"]；闸门本身由 tests/test_app_tasks.py 单独覆盖。
+    """
+    tasks = get_tasks(db_path=db_path)
+    return tasks[0]["task_id"] if tasks else create_task("测试任务", db_path=db_path)
+
+
+def _task(db_path) -> int:
+    """建一个任务——records.task_id 是必填的，任何 create_record 之前都要先有任务。"""
+    return create_task("测试任务", db_path=db_path)
 
 
 def _block(text, block_index, block_type="paragraph", page=1):
@@ -219,7 +235,7 @@ def test_persist_comparison_result_writes_record_and_issues(db_path):
     ]
 
     record_id, issue_ids = persist_comparison_result(
-        diffs, doc_name="原稿.docx / 排版稿.pdf", db_path=db_path
+        diffs, task_id=_task(db_path), doc_name="原稿.docx / 排版稿.pdf", db_path=db_path
     )
 
     assert len(issue_ids) == 2
@@ -252,7 +268,7 @@ def test_persist_comparison_result_computes_context_snippet_when_formatted_given
     ]
 
     record_id, _ = persist_comparison_result(
-        diffs, doc_name="doc", formatted=formatted, db_path=db_path
+        diffs, task_id=_task(db_path), doc_name="doc", formatted=formatted, db_path=db_path
     )
 
     issue = get_issues(record_id, db_path=db_path)[0]
@@ -267,6 +283,7 @@ def test_persist_comparison_result_computes_context_snippet_when_formatted_given
 
 def _seed_comparison_record(db_path):
     record_id = create_record(
+        task_id=_task(db_path),
         doc_name="原稿.docx / 排版稿.pdf",
         doc_version="",
         task_type="原稿比对",
@@ -286,10 +303,13 @@ def _seed_comparison_record(db_path):
     return record_id, issue_id
 
 
-def test_app_comparison_page_initial_render_no_exception():
+def test_app_comparison_page_initial_render_no_exception(monkeypatch, db_path):
+    monkeypatch.setattr(config, "DB_PATH", db_path)
     from streamlit.testing.v1 import AppTest
 
     at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+
+    at.session_state["task_id"] = _enter_task(db_path)
     at.run()
 
     nav = next(r for r in at.radio if r.label == "功能入口")
@@ -315,6 +335,7 @@ def test_app_comparison_flow_with_mocked_workflow(db_path, tmp_path, monkeypatch
         "core.workflow.persist_comparison_result", return_value=(record_id, [issue_id])
     ) as mock_persist:
         at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+        at.session_state["task_id"] = _enter_task(db_path)
         at.run()
 
         nav = next(r for r in at.radio if r.label == "功能入口")

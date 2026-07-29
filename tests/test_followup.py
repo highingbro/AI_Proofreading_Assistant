@@ -20,7 +20,7 @@ from core.followup import answer_followup, get_followup_history
 from core.parser import ParsedBlock, ParsedDocument
 from core.workflow import persist_result
 from db import database
-from db.models import add_issue, create_record, get_issues, update_issue_followup
+from db.models import add_issue, create_record, create_task, get_issues, get_tasks, update_issue_followup
 
 
 @pytest.fixture
@@ -30,9 +30,25 @@ def db_path(tmp_path):
     return path
 
 
+def _enter_task(db_path) -> int:
+    """预置一个当前任务，跳过 app.py 的任务闸门。
+
+    app.py 是"先选任务再选功能"的线性流程——没有当前任务时只渲染任务选择界面、
+    连"功能入口"radio 都不存在。这些UI冒烟测试要测的是任务之内的各个页面，所以直接
+    预置 session_state["task_id"]；闸门本身由 tests/test_app_tasks.py 单独覆盖。
+    """
+    tasks = get_tasks(db_path=db_path)
+    return tasks[0]["task_id"] if tasks else create_task("测试任务", db_path=db_path)
+
+
+def _task(db_path) -> int:
+    """建一个任务——records.task_id 是必填的，任何 create_record 之前都要先有任务。"""
+    return create_task("测试任务", db_path=db_path)
+
+
 def _make_issue(db_path, **overrides) -> tuple[int, int]:
     """建一条record+一条issue，返回 (record_id, issue_id)。"""
-    record_id = create_record(doc_name="测试文档.pdf", doc_version="", task_type="标准校对", db_path=db_path)
+    record_id = create_record(task_id=_task(db_path), doc_name="测试文档.pdf", doc_version="", task_type="标准校对", db_path=db_path)
     fields = dict(
         record_id=record_id,
         page_location="第1页",
@@ -204,7 +220,7 @@ def test_persist_result_computes_context_snippet_when_parsed_given(db_path):
         },
     )
 
-    record_id, issue_ids = persist_result(result, doc_name="测试.docx", parsed=parsed, db_path=db_path)
+    record_id, issue_ids = persist_result(result, task_id=_task(db_path), doc_name="测试.docx", parsed=parsed, db_path=db_path)
 
     issues = {row["issue_id"]: row for row in get_issues(record_id, db_path=db_path)}
     located_row = issues[issue_ids[0]]
@@ -218,7 +234,8 @@ def test_persist_result_computes_context_snippet_when_parsed_given(db_path):
 # app.py UI冒烟（streamlit.testing.v1.AppTest）
 # ---------------------------------------------------------------------------
 
-def test_app_followup_expander_calls_answer_followup(tmp_path, monkeypatch):
+def test_app_followup_expander_calls_answer_followup(tmp_path, monkeypatch, db_path):
+    monkeypatch.setattr(config, "DB_PATH", db_path)
     from streamlit.testing.v1 import AppTest
 
     fake_result = ClassifiedResult(
@@ -244,6 +261,7 @@ def test_app_followup_expander_calls_answer_followup(tmp_path, monkeypatch):
          patch("core.followup.get_followup_history", return_value=[]), \
          patch("core.followup.answer_followup", return_value="这是追问回答") as mock_answer:
         at = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"))
+        at.session_state["task_id"] = _enter_task(db_path)
         at.run()
 
         at.file_uploader[0].upload("test.pdf", b"dummy pdf bytes", "application/pdf").run()
@@ -258,4 +276,4 @@ def test_app_followup_expander_calls_answer_followup(tmp_path, monkeypatch):
         submit_button.click().run()
 
         assert not at.exception
-        mock_answer.assert_called_once_with(101, "为什么建议这么改？", db_path=None)
+        mock_answer.assert_called_once_with(101, "为什么建议这么改？")
