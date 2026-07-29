@@ -20,7 +20,7 @@ from core.parser import ParsedDocument
 from db import database
 from db.models import add_issue, create_record, get_records
 
-_HEADER = ("页码/位置", "原文", "问题类型", "优先级", "分层标注", "修改建议", "处理状态", "批注")
+_HEADER = ("页码/位置", "文档页码", "原文", "问题类型", "优先级", "分层标注", "修改建议", "处理状态", "批注")
 
 
 @pytest.fixture
@@ -140,7 +140,7 @@ def test_export_creates_workbook_with_header_and_ordered_rows(db_path, tmp_path,
     data_rows = list(ws.iter_rows(min_row=2, values_only=True))
     assert len(data_rows) == len(issue_specs)
     for row, spec in zip(data_rows, issue_specs):
-        assert row[1] == spec["original_text"]  # 顺序须与 issue_id(插入顺序)一致
+        assert row[2] == spec["original_text"]  # 顺序须与 issue_id(插入顺序)一致
 
 
 def test_export_page_location_none_shows_unlocated(db_path, tmp_path, monkeypatch):
@@ -152,9 +152,39 @@ def test_export_page_location_none_shows_unlocated(db_path, tmp_path, monkeypatc
 
     row = next(
         r for r in ws.iter_rows(min_row=2, values_only=True)
-        if r[1] == "引文且高优先级问题原文"
+        if r[2] == "引文且高优先级问题原文"
     )
     assert row[0] == "未定位"
+
+
+def test_export_doc_page_column_blank_when_not_extracted(db_path, tmp_path, monkeypatch):
+    """_build_record_with_issues 构造的记录全部没传 doc_page，导出应留空——
+    不该用PDF页码顶替（PDF页码信息已经在"页码/位置"列里）。"""
+    monkeypatch.setattr(config, "EXPORTS_DIR", tmp_path)
+    record_id, issue_specs, _ = _build_record_with_issues(db_path)
+
+    path = export_issues_to_excel(record_id, db_path=db_path)
+    ws = load_workbook(path).active
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        assert row[1] is None or row[1] == ""
+
+
+def test_export_doc_page_column_shows_value_when_extracted(db_path, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "EXPORTS_DIR", tmp_path)
+    record_id = create_record(doc_name="期刊.pdf", doc_version="", task_type="标准校对", db_path=db_path)
+    add_issue(
+        record_id=record_id, page_location="文档第12页左栏", doc_page="12", original_text="期刊正文",
+        issue_type="错别字与拼写", priority=config.PRIORITY_MEDIUM, layer=config.LAYER_CONFIRMED,
+        suggestion="改为正确写法", status="已采纳", db_path=db_path,
+    )
+
+    path = export_issues_to_excel(record_id, db_path=db_path)
+    ws = load_workbook(path).active
+
+    row = next(r for r in ws.iter_rows(min_row=2, values_only=True) if r[2] == "期刊正文")
+    assert row[0] == "文档第12页左栏"
+    assert row[1] == "12"
 
 
 def test_export_note_column_shows_value_and_status_is_plain(db_path, tmp_path, monkeypatch):
@@ -167,17 +197,17 @@ def test_export_note_column_shows_value_and_status_is_plain(db_path, tmp_path, m
 
     noted_row = next(
         r for r in ws.iter_rows(min_row=2, values_only=True)
-        if r[1] == "高优先级确定性问题原文"
+        if r[2] == "高优先级确定性问题原文"
     )
-    assert noted_row[6] == "已采纳"  # 处理状态不再拼接批注内容
-    assert noted_row[7] == "已核实，确实需要修改"
+    assert noted_row[7] == "已采纳"  # 处理状态不再拼接批注内容
+    assert noted_row[8] == "已核实，确实需要修改"
 
     plain_row = next(
         r for r in ws.iter_rows(min_row=2, values_only=True)
-        if r[1] == "存疑问题原文"
+        if r[2] == "存疑问题原文"
     )
-    assert plain_row[6] == "已采纳"
-    assert not plain_row[7]  # 未写批注，写入的是空字符串；openpyxl读回后为None，语义上等同"留空"
+    assert plain_row[7] == "已采纳"
+    assert not plain_row[8]  # 未写批注，写入的是空字符串；openpyxl读回后为None，语义上等同"留空"
 
 
 def test_export_only_includes_accepted_issues(db_path, tmp_path, monkeypatch):
@@ -205,7 +235,7 @@ def test_export_only_includes_accepted_issues(db_path, tmp_path, monkeypatch):
 
     data_rows = list(ws.iter_rows(min_row=2, values_only=True))
     assert len(data_rows) == 1
-    assert data_rows[0][1] == "已采纳问题"
+    assert data_rows[0][2] == "已采纳问题"
 
 
 def test_export_record_with_no_accepted_issues_generates_header_only_file(db_path, tmp_path, monkeypatch):
@@ -233,7 +263,7 @@ def test_export_high_priority_rows_are_red(db_path, tmp_path, monkeypatch):
 
     def _row_by_text(text):
         for r in ws.iter_rows(min_row=2):
-            if r[1].value == text:
+            if r[2].value == text:
                 return r
         raise AssertionError(f"未找到原文: {text}")
 
@@ -251,7 +281,7 @@ def test_export_quotation_only_rows_are_yellow(db_path, tmp_path, monkeypatch):
 
     def _row_by_text(text):
         for r in ws.iter_rows(min_row=2):
-            if r[1].value == text:
+            if r[2].value == text:
                 return r
         raise AssertionError(f"未找到原文: {text}")
 
@@ -270,7 +300,7 @@ def test_export_quotation_and_high_priority_conflict_resolves_to_red(db_path, tm
 
     def _row_by_text(text):
         for r in ws.iter_rows(min_row=2):
-            if r[1].value == text:
+            if r[2].value == text:
                 return r
         raise AssertionError(f"未找到原文: {text}")
 
@@ -288,7 +318,7 @@ def test_export_normal_rows_have_no_fill(db_path, tmp_path, monkeypatch):
 
     def _row_by_text(text):
         for r in ws.iter_rows(min_row=2):
-            if r[1].value == text:
+            if r[2].value == text:
                 return r
         raise AssertionError(f"未找到原文: {text}")
 

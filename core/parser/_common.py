@@ -68,16 +68,32 @@ def _find_extent_gap(
     return lo + (best[0] + best[1]) / 2 * bin_width  # 返回空白带中点作为分栏线的x坐标
 
 
-def _content_extent(blocks: list[dict]) -> tuple[float, float] | None:
-    """这批块横向上实际覆盖到的范围 (最左x0, 最右x1)。
+def _content_extent(blocks: list[dict], region_width: float) -> tuple[float, float] | None:
+    """这批块横向上实际覆盖到的范围 (最左x0, 最右x1)，通栏块不计入。
 
     给子栏检测用：半区的边界是上一层算出来的分栏线，直接拿它当区域宽度会把
     页边距/半区两侧的空余一起算进去，band(中部40%~60%)的落点和空白带宽度占比
     都会跟着偏；按实际内容范围算才对得上"这半区自己的中间在哪"。
+
+    **必须和 _split_region 用同一把尺子排除通栏块**（同一个
+    config.COLUMN_SPANNING_BLOCK_WIDTH_RATIO），否则两者对"这个区域有多宽"的
+    理解会打架：_split_region 剔除通栏块之后才画覆盖图，而这里若把通栏块算进
+    范围，算出的区域宽度是按通栏块撑开的，band 会落到区域外围去。真实案例
+    （跨页对开的活动手册）：PyMuPDF 把左页和右页同一水平线上的文字聚成一个
+    横跨整幅的 block，它的中心点落进左半区后，把左半区的"内容范围"从 [44,466]
+    撑成 [44,953]（整页宽），band 随之落到栏2和栏3之间的主分栏线附近而不是栏1
+    栏2之间的真实间隙上，子栏检测必然失败、四栏版面被判成两栏。
+
+    区域内全是通栏块时返回 None（没有可供判定栏结构的正文内容），由调用方
+    按"这个区域不再细分"处理。
     """
     if not blocks:
         return None
-    return min(b["bbox"][0] for b in blocks), max(b["bbox"][2] for b in blocks)
+    max_block_width = region_width * config.COLUMN_SPANNING_BLOCK_WIDTH_RATIO
+    in_column = [b for b in blocks if (b["bbox"][2] - b["bbox"][0]) <= max_block_width]
+    if not in_column:
+        return None
+    return min(b["bbox"][0] for b in in_column), max(b["bbox"][2] for b in in_column)
 
 
 def _split_region(blocks: list[dict], lo: float, hi: float, min_gap_ratio: float) -> float | None:
@@ -146,7 +162,7 @@ def _detect_column_boundaries(blocks: list[dict], width: float) -> list[float]:
     sub_splits = []
     for lo, hi in ((0.0, top), (top, width)):
         half = [b for b in blocks if lo <= (b["bbox"][0] + b["bbox"][2]) / 2 < hi]
-        extent = _content_extent(half)
+        extent = _content_extent(half, hi - lo)
         if extent is None:
             break
         sub = _split_region(half, extent[0], extent[1], config.COLUMN_SUB_GAP_MIN_WIDTH_RATIO)
@@ -158,18 +174,26 @@ def _detect_column_boundaries(blocks: list[dict], width: float) -> list[float]:
     return sorted([top, *sub_splits])
 
 
-def _source_location(page_no: int, mode: str, column: str | None) -> str:
+def _source_location(page_no: int, mode: str, column: str | None, doc_page: str | None = None) -> str:
     """拼出人类可读的位置描述，写进 ParsedBlock.source_location。
 
     column 取 'left'/'right'（两栏版面）、'col1'..'colN'（三栏以上，此时不用
     左/右描述，直接报第几栏）、'span'（跨栏）或 None（单栏）。
+
+    双栏页面（期刊/活动手册常见排版）通常自带印刷页码，跟PDF物理页码往往对不上——
+    校对结果要给编辑核对回纸质刊物用，PDF页码没有意义。doc_page 是从该页页眉/页脚
+    提取到的期刊自身页码文本（如"12"），提取到就用"文档第X页"，没提取到（比如目录、
+    封面这类本身没有页码的页）就退回"PDF第N页"，用"PDF"前缀跟正常提取到的期刊页码
+    区分开，不让编辑误以为PDF页码就是期刊页码。单栏页面（如普通Word转的报告）不受
+    影响，沿用"第N页"——这类文档PDF页码本来就等于文档页码，不存在需要提取的问题。
     """
     if mode != "double" or column is None:
         return f"第{page_no}页"  # 单栏，或没有栏位信息，只报页码
+    page_part = f"文档第{doc_page}页" if doc_page else f"PDF第{page_no}页"
     if column == "left":
-        return f"第{page_no}页左栏"
+        return f"{page_part}左栏"
     if column == "right":
-        return f"第{page_no}页右栏"
+        return f"{page_part}右栏"
     if column.startswith("col") and column[3:].isdigit():
-        return f"第{page_no}页第{column[3:]}栏"
-    return f"第{page_no}页通栏"  # 分栏页面里跨越多栏的内容（如通栏标题/表格）
+        return f"{page_part}第{column[3:]}栏"
+    return f"{page_part}通栏"  # 分栏页面里跨越多栏的内容（如通栏标题/表格）

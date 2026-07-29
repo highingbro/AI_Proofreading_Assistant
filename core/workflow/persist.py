@@ -27,14 +27,19 @@ def build_context_snippet(parsed: ParsedDocument, block_index: int) -> str:
 
 def persist_result(
     result: ClassifiedResult,
+    task_id: int,
     doc_name: str,
     doc_version: str = "",
     task_type: str = "标准校对",
     parsed: ParsedDocument | None = None,
     mode: str = config.PROOFREAD_MODE_DEEP,
+    author: str | None = None,
     db_path=None,
 ) -> tuple[int, list[int]]:
     """把分层结果落库：先建 record（分层统计取自 result.stats），再逐条 add_issue。
+
+    task_id 必传——每条记录都归属于某个任务，见 db/models.py::create_record。
+    author 是本轮校对的署名（谁做的），选填。
 
     parsed 非空时，为每条已定位（block_index非None）的issue计算 context_snippet
     （原文前后文窗口，供追问使用）；不传 parsed 或issue未定位时 context_snippet 留空。
@@ -44,6 +49,8 @@ def persist_result(
     返回 (record_id, issue_ids)，issue_ids 与 result.issues 顺序一一对应。
     """
     record_id = create_record(
+        task_id=task_id,
+        author=author,
         doc_name=doc_name,
         doc_version=doc_version,
         task_type=task_type,
@@ -71,6 +78,7 @@ def persist_result(
             layer=issue.layer,
             suggestion=issue.suggestion,
             context_snippet=context_snippet,
+            doc_page=issue.doc_page,
             db_path=db_path,
         )
         issue_ids.append(issue_id)
@@ -80,9 +88,11 @@ def persist_result(
 
 def persist_comparison_result(
     diffs: list[dict],
+    task_id: int,
     doc_name: str,
     doc_version: str = "",
     formatted: ParsedDocument | None = None,
+    author: str | None = None,
     db_path=None,
 ) -> tuple[int, list[int]]:
     """把原稿比对（core.comparer.compare_documents）产出的差异条目落库。
@@ -101,6 +111,8 @@ def persist_comparison_result(
     返回 (record_id, issue_ids)，issue_ids 与 diffs 顺序一一对应。
     """
     record_id = create_record(
+        task_id=task_id,
+        author=author,
         doc_name=doc_name,
         doc_version=doc_version,
         task_type="原稿比对",
@@ -122,6 +134,7 @@ def persist_comparison_result(
             layer=diff["layer"],
             suggestion=diff["suggestion"],
             context_snippet=context_snippet,
+            doc_page=diff.get("doc_page"),
             db_path=db_path,
         )
         issue_ids.append(issue_id)

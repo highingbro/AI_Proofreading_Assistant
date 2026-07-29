@@ -7,13 +7,132 @@
 import json
 from datetime import datetime
 
+import config
 from db.database import get_connection
 
 
+def create_task(
+    name: str,
+    description: str | None = None,
+    created_by: str | None = None,
+    db_path=None,
+) -> int:
+    """新建一个任务（校对记录的顶层容器），返回 task_id。状态固定从"激活"起步。"""
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO tasks (name, description, status, created_at, created_by)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                description,
+                config.TASK_STATUS_ACTIVE,
+                datetime.now().isoformat(),
+                created_by,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def get_tasks(status: str | None = None, db_path=None) -> list[dict]:
+    """按创建时间倒序列出任务，可选只列某个状态的（任务选择页默认只列"激活"）。"""
+    conn = get_connection(db_path)
+    try:
+        if status is None:
+            rows = conn.execute("SELECT * FROM tasks ORDER BY created_at DESC").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC", (status,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_task(task_id: int, db_path=None) -> dict | None:
+    """按 task_id 查询单个任务，不存在返回 None。
+
+    app.py 每次 rerun 都用它校验 session_state 里记着的当前任务是否还在（库被换掉/
+    任务被删掉时不能继续拿着一个悬空的 task_id 往下跑）。
+    """
+    conn = get_connection(db_path)
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        return dict(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def update_task_status(task_id: int, status: str, db_path=None) -> None:
+    """更新任务状态（激活/已解决/已关闭，取值见 config.TASK_STATUSES）。"""
+    conn = get_connection(db_path)
+    try:
+        conn.execute("UPDATE tasks SET status = ? WHERE task_id = ?", (status, task_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def count_records_by_task(db_path=None) -> dict[int, int]:
+    """返回 {task_id: 该任务下的记录数}，供任务列表一次查询算出全部计数。"""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT task_id, COUNT(*) AS n FROM records GROUP BY task_id"
+        ).fetchall()
+        return {row["task_id"]: row["n"] for row in rows}
+    finally:
+        conn.close()
+
+
+def update_record_task(record_id: int, task_id: int, db_path=None) -> None:
+    """把一条记录改归属到另一个任务。
+
+    迁移进来的历史记录全都堆在"历史归档"这一个任务下，这个函数是把它们逐条拆到真实
+    任务里的唯一手段（历史记录页每条记录旁的"改归属任务"）。
+    """
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "UPDATE records SET task_id = ? WHERE record_id = ?", (task_id, record_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_authors(db_path=None) -> list[str]:
+    """列出库里出现过的所有署名（records.author ∪ tasks.created_by），按字典序。
+
+    不单建一张人员表：署名的唯一用途是标注"这轮是谁做的"，从已有数据里现取就够，
+    免得维护一份和实际数据脱节的名册。
+    """
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT author AS name FROM records WHERE author IS NOT NULL AND author != ''
+            UNION
+            SELECT created_by AS name FROM tasks WHERE created_by IS NOT NULL AND created_by != ''
+            ORDER BY name
+            """
+        ).fetchall()
+        return [row["name"] for row in rows]
+    finally:
+        conn.close()
+
+
 def create_record(
+    task_id: int,
     doc_name: str,
     doc_version: str,
     task_type: str,
+    author: str | None = None,
     total_issues: int = 0,
     count_confirmed: int = 0,
     count_doubtful: int = 0,
@@ -26,18 +145,26 @@ def create_record(
     mode: str | None = None,
     db_path=None,
 ) -> int:
-    """插入一条流程记录，返回 record_id。"""
+    """插入一条流程记录，返回 record_id。
+
+    task_id 是必传的第一个参数——每条记录必须归属于某个任务，这条约束由本函数的签名
+    保证（表结构里 task_id 可空的原因见 db/database.py 建表语句上方注释）。author 是
+    "谁跑的这轮校对"，选填；同一轮校对必然由同一个人跑完并审完，所以处置人不在
+    issues 表另存一份，从 record 关联即可。
+    """
     conn = get_connection(db_path)
     try:
         cursor = conn.execute(
             """
             INSERT INTO records (
-                created_at, doc_name, doc_version, task_type, total_issues,
+                task_id, author, created_at, doc_name, doc_version, task_type, total_issues,
                 count_confirmed, count_doubtful, count_quotation, count_optional,
                 high_priority_count, accepted_count, rejected_count, result_path, mode
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                task_id,
+                author,
                 datetime.now().isoformat(),
                 doc_name,
                 doc_version,
@@ -109,6 +236,7 @@ def add_issue(
     note: str | None = None,
     context_snippet: str | None = None,
     followup_history: str | None = None,
+    doc_page: str | None = None,
     db_path=None,
 ) -> int:
     """插入一条问题，返回 issue_id。"""
@@ -117,14 +245,15 @@ def add_issue(
         cursor = conn.execute(
             """
             INSERT INTO issues (
-                record_id, page_location, original_text, issue_type, priority,
+                record_id, page_location, doc_page, original_text, issue_type, priority,
                 layer, suggestion, status, note, context_snippet,
                 followup_history
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record_id,
                 page_location,
+                doc_page,
                 original_text,
                 issue_type,
                 priority,
@@ -212,13 +341,23 @@ def get_issues(record_id: int, layer: str | None = None, db_path=None) -> list[d
         conn.close()
 
 
-def get_records(db_path=None) -> list[dict]:
-    """按时间倒序列出历史记录。"""
+def get_records(task_id: int | None = None, db_path=None) -> list[dict]:
+    """按时间倒序列出历史记录，传 task_id 时只列该任务下的。
+
+    app.py 的历史记录页永远传当前任务——"历史记录"在任务模型下就是"这个任务的历史"；
+    不传（全库）的形态保留给导出/统计类的调用方和测试。
+    """
     conn = get_connection(db_path)
     try:
-        rows = conn.execute(
-            "SELECT * FROM records ORDER BY created_at DESC"
-        ).fetchall()
+        if task_id is None:
+            rows = conn.execute(
+                "SELECT * FROM records ORDER BY created_at DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM records WHERE task_id = ? ORDER BY created_at DESC",
+                (task_id,),
+            ).fetchall()
         return [dict(row) for row in rows]
     finally:
         conn.close()

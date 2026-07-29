@@ -4,8 +4,8 @@
 
 全局主题（`.streamlit/config.toml`）把品牌色从Streamlit默认红换成冷色调墨蓝，让红色
 在界面里只保留"确定性错误"这一种语义。侧边栏顶部放品牌标识（`_inject_sidebar_brand`），
-取代之前主区那个和页面标题重复的巨型 `st.title`；侧边栏顺序为 品牌→功能入口→当前用户
-（用户名输入放最底部，不再是打开就撞脸的第一个控件）。
+取代之前主区那个和页面标题重复的巨型 `st.title`；侧边栏顺序为
+品牌→当前署名→当前任务→功能入口（署名在选任务之前就要能填，创建任务时要记 created_by）。
 
 四层分类（`config.LAYER_*`）配了一套语义色 `_LAYER_COLOR`，贯穿指标区数字、问题卡片
 的左侧色条与标题。指标区六个数字用一整行HTML flex渲染（不用 `st.metric` 混排），保证
@@ -33,36 +33,69 @@ diff只会得到乱码。因此各带一个小灰标签、正文都用黑字，�
 调用同一个 `workflow.set_issue_status` 把状态改回"待处理"，不新增函数；撤销"已拒绝"
 不会撤销已经写进 `feedback` 表的反馈学习记录，两者是独立的历史留痕。
 
+问题卡片列表按 `_render_issue_cards` 两条一行摆放（`st.columns(2)`），和任务选择页
+的任务卡是同一个网格模式；标准校对结果、历史记录详情页、原稿比对结果三处都调这一个
+函数，不各写一套摆放逻辑。只有**建议**内容预留固定两行高度（`min-height`+`line-height`，
+短文本也占满这份高度）——原文是被标记的原句，长度本来就稳定不需要预留；建议是自由
+文本说明，长短差异大，才是同一行两张卡参差不齐的来源。**这个两行预留是硬要求，压
+卡片高度不能从这里扣**，建议文字字号略调小只是减少超出两行的概率。压高度改从别处
+拿，且不做省略号截断（建议文字是校对结论，截断会丢内容）：`_inject_card_styles` 把
+卡片 padding 从 Streamlit 默认的 1rem 收紧到 0.5rem/0.8rem，容器用 `gap="xxsmall"`
+收紧内部元素间距，批注输入框挤进采纳/拒绝（或撤销）按钮那一行的剩余空间、不再单独占
+一整行（`label_visibility="collapsed"` 省掉的标签文字用 placeholder 补上）。
+
 页面不使用emoji：优先级用文字表达，层级差异靠色条+标题色表达。
 
-## 用户名隔离（简单版）要点
+## 任务闸门与署名要点
 
-场景：几个互相信任、不会存心查看对方数据的人共用同一份本地部署，各自的校对记录/
-上传文档不要混在一起看到。**不做密码鉴权**——没有登录校验、没有token，任何人在
-侧边栏"当前用户"框里填对方的名字都能直接看到对方的数据；这是有意的范围取舍，
-不是遗漏（真正需要防"存心查看"是完全不同的登录鉴权功能，本次不做）。
+**流程是线性的：先选任务，再选功能。** `st.session_state["task_id"]` 没有指向一个
+仍然存在的任务时（`get_task` 返回 None 即视为没有），只渲染 `_render_task_selection()`
+那一屏并 `st.stop()`——侧边栏的功能入口 radio 根本不会被创建，四个页面一个都进不去。
+因此除历史数据外，库里不可能再出现 `task_id` 为 NULL 的 record，`db/models.py::
+create_record` 把 `task_id` 设成必传参数即可保证这条约束（表结构上它仍可空，原因见
+`db/database.py` 建表语句上方注释）。
 
-`username == "default"`（不填或清空输入框）时，`db_path` 取 `None`、
-`user_uploads_dir` 取 `config.UPLOADS_DIR`，跟引入这个功能之前的行为完全一致——
-这保证了升级前已经积累的 data/app.db 数据不用任何迁移就能继续看到（相当于
-"default"这个人一直都是当前使用者），也保证了所有既有测试里
-`monkeypatch.setattr(config, "DB_PATH"/"UPLOADS_DIR", ...)` 的写法不用改一行。
-只有显式填了别的用户名，才会派生出 `config.DATA_DIR / f"app_{username}.db"`
-这个新sqlite文件和 `config.UPLOADS_DIR / username` 这个新上传子目录。
+这个空状态实际上只在全新空库首次运行时出现一次：迁移会把既有记录归入"历史归档"
+任务（`config.LEGACY_TASK_NAME`），`task_id` 又常驻 session_state，所以正常使用中
+一进来就已经在某个任务里。
 
-`db_path`/`user_uploads_dir` 是模块级变量，本文件后面所有 `_render_*`/
-`_execute_proofread`/`_try_persist_pending` 等函数直接引用它们（不通过参数传递）——
-和这些函数一直以来直接引用 `config.UPLOADS_DIR` 是同一种写法，Python按调用时
-（不是按定义时）查找模块全局变量，所以合法。
+任务状态（`config.TASK_STATUSES`）就地在任务列表每行的 selectbox 上改，不另开管理
+页；列表默认只列"激活"的，勾选"显示已解决的任务"才会看到已解决的。状态不自动推进
+（"导出即完成"这类推断在一个任务多轮校对的场景下一定会误判）。
 
-切换用户名会清空 `st.session_state` 里除 `username_input`（输入框自身状态）外的
-所有key，随即 `st.rerun()`——这是有意为之的"相当于换了一个人在用这个网页"语义：
-上一位用户的校对结果、页面导航选中项等展示状态都应该消失，不能在切换用户名后
-残留展示成"看起来是这个新用户的数据"；数据本身不会丢，填回原用户名能重新看到。
+**"已关闭"在前端任何地方都不展示**：selectbox 里仍然可以把任务选成"已关闭"（这是
+唯一能写入这个状态的入口），但一旦写入，该任务下一次 rerun 起就从任务选择页、
+历史记录页"改归属任务"下拉里彻底消失——不受"显示已解决"复选框影响，UI上没有任何
+开关能让它重新出现。想再看到或改回激活/已解决，只能直接改数据库；这是一个刻意的
+读写不对称设计，"已关闭"因此更接近"归档"而不是"设置一个可逆状态"。
 
-`config.EXPORTS_DIR`（Excel导出）不做隔离：导出文件是一次性下载产物，通过
-`st.download_button` 直接把字节交给发起下载的浏览器会话，不会在任何页面被其他
-用户浏览到，跟"看得到对方校验的文档"这个诉求无关。
+任务一多时列表本身在 `st.container(height=420)` 里滚动，不撑开整个页面（新建任务
+表单固定在列表下方，不会被顶出屏幕）；卡片按 `st.columns(2)` 两个一行摆放（各占半宽，
+`_render_task_card` 渲染单张），同样的高度能容纳的任务数因此翻倍，需要滚动的场景更少。
+
+**任务名不做唯一性校验**：`task_id` 才是真正的标识，重名不影响任何功能，卡片上的
+创建日期/记录数已经够分辨。但输入的名字和现有任务撞了大概率是手滑，"新建任务"表单
+在填完名字那一刻就现查现比对弹一条黄色提示；比对范围是"前端看得到的任务"（排除
+已关闭的——那些本来就不展示，撞上了用户也看不出哪来的重复）。
+
+撞名时点"创建并进入"**不会一次点击就创建**：第一次点击只把当前名字记进
+`st.session_state["task_dup_ack_name"]`，不建任务——这是因为"算出警告"和"创建成功
+后rerun跳进新任务"如果落在同一次脚本执行里，警告刚画出来页面就已经跳走，用户
+几乎看不到（真实反馈过的问题）。名字不变时再点一次才真正创建；名字改了（不再撞名，
+或撞了另一个名字）这个标记自动失效，按新状态重新走一遍。不撞名的正常情况仍是一次
+点击直接创建+跳转，不受影响。
+
+侧边栏"切换任务"按钮走 `_switch_task()`：清空 `st.session_state` 里除
+`_KEEP_ON_TASK_SWITCH`（署名及其widget状态）以外的所有key。换任务=换工作上下文，
+上一个任务的校对结果/待保存结果不该残留；但署名是"我是谁"，跟在哪个任务里无关，
+不该因为换任务就要求重选一次。
+
+**署名不是账号**：全部数据都在同一个 `config.DB_PATH` 里，任何人都看得到全部任务与
+记录，署名只回答"这条记录是谁做的"，写进 `records.author`。同一轮校对必然由同一个人
+跑完并审完，所以 issues 表不另存一份处置人。候选来源是库里出现过的署名
+（`get_authors()`，records.author ∪ tasks.created_by），用下拉而非自由文本框——
+多人共用时手输必然出现"张三"和"张 三"这种同人不同名。没填署名不阻断校对，只在侧边栏
+给一句提示，`author` 落库为 NULL。
 
 ## 标准校对分支要点
 
@@ -72,8 +105,7 @@ classified_result/record_id/issue_ids/issue_status）管住生命周期：换文
 缓存、不重跑 workflow.run_standard_proofread。没有用 st.cache_*——校对流程
 有副作用（写库、耗真实API额度），语义上不适合按输入哈希缓存的机制。
 
-上传的文件先落盘到 user_uploads_dir（时间戳前缀避免覆盖，见"用户名隔离"一节，
-"default"用户下就是 config.UPLOADS_DIR）再交给
+上传的文件先落盘到 config.UPLOADS_DIR（时间戳前缀避免覆盖）再交给
 parse_document（该函数吃路径不吃文件对象）。落盘后即用即弃，不进 records 表、
 后续也不会再被读取，每次写入后 _prune_uploads_dir 只保留最近
 config.UPLOADS_RETENTION_COUNT 个文件，避免上传目录无限堆积。问题卡按钮 key 用
@@ -103,7 +135,7 @@ session_state，和导出模块"数据一律从库读"是同一个原则。
 
 ## 导出Excel按钮要点
 
-点击调 core.exporter.export_issues_to_excel(record_id, db_path=db_path)，异常
+点击调 core.exporter.export_issues_to_excel(record_id)，异常
 用 st.error 兜住；成功后 st.success 提示路径 + st.download_button 提供下载
 （mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"）。
 
@@ -166,7 +198,7 @@ _render_stats 接受 (stats: dict, warnings: list) 两个原始值，不是 Clas
 
 同一类被人工判定"判错了"的问题（点击"拒绝"）会在后续校对里反复出现，靠
 `_render_issue_card` 的拒绝分支解决：记 `feedback.record_rejection(issue,
-issue_id, record_id, db_path=db_path)` 把这条issue存进 `feedback` 表——
+issue_id, record_id)` 把这条issue存进 `feedback` 表——
 `_render_issue_card` 是实时校对流程和历史记录页共用的同一份逻辑，这一行改动
 自动覆盖两个入口。历史反馈整批交给LLM做语义总结，产出的规则直接注入校对LLM
 的系统提示词，让它在生成建议这一步就主动规避，不由分类器事后改判，详见
@@ -247,7 +279,6 @@ try/except+日志，没有做同样的 pending 状态机，是有意的范围取
 import hashlib
 import html
 import logging
-import re
 import types
 from datetime import datetime
 from pathlib import Path
@@ -260,7 +291,19 @@ from core.llm_client import LLMCallError
 from core.parser import NoTextLayerError, UnsupportedFormatError
 from core.proofreader import LLMResponseError
 from db.database import init_db
-from db.models import get_feedback, get_feedback_rules, get_issues, get_records
+from db.models import (
+    count_records_by_task,
+    create_task,
+    get_authors,
+    get_feedback,
+    get_feedback_rules,
+    get_issues,
+    get_records,
+    get_task,
+    get_tasks,
+    update_record_task,
+    update_task_status,
+)
 
 logging.basicConfig(
     filename=str(config.LOG_PATH),
@@ -280,13 +323,13 @@ _LAYER_SLUG = {
 }
 # 四层语义色，贯穿指标区数字、问题卡片的层级色条与标题——同一层级在哪都用同一个色。
 _LAYER_COLOR = {
-    config.LAYER_CONFIRMED: "#D64545",
-    config.LAYER_DOUBTFUL: "#C8891F",
+    config.LAYER_CONFIRMED: "#D66E45",
+    config.LAYER_DOUBTFUL: "#C5C81F",
     config.LAYER_QUOTATION: "#3B7DD8",
-    config.LAYER_OPTIONAL: "#7A7288",
+    config.LAYER_OPTIONAL: "#7A7288FF",
 }
 # 采纳=绿、拒绝=红，只用在卡片左侧色条与状态标签上（不给整卡上底色）。
-_STATUS_COLOR = {"已采纳": "#2E8B57", "已拒绝": "#D64545"}
+_STATUS_COLOR = {"已采纳": "#2E8B57", "已拒绝": "#D64570"}
 # 原稿比对产出的issue的 layer 字段取值是 config.DIFF_LAYER_SUBSTANTIVE/
 # DIFF_LAYER_FORMATTING（独立于四层分类的另一个轴），不在 _LAYER_SLUG/_LAYER_COLOR
 # 里——用这个中性灰兜底，避免 KeyError。
@@ -306,7 +349,10 @@ def _inject_card_styles() -> None:
     该层级/状态的所有卡片，不需要为每张卡片单独出样式。终态 key 用固定前缀（不含层级
     slug），因此"层级×终态"不必各写一条规则。
     """
-    bar = "border-left: 4px solid {color}; border-radius: 2px;"
+    # padding 从 Streamlit 默认的 1rem 收紧到 0.5rem/0.8rem，是压缩卡片高度的一部分
+    # （另一部分是 _render_issue_card 内部的 min-height/gap 收紧），只用于问题卡，
+    # 不影响页面其他 st.container(border=True)（选择器限定在 st-key-issue_card_ 前缀）。
+    bar = "border-left: 4px solid {color}; border-radius: 2px; padding: 0.5rem 0.8rem;"
     rules = "\n".join(
         f'div[class*="st-key-issue_card_{slug}_"] {{ {bar.format(color=color)} }}'
         for slug, color in (
@@ -345,60 +391,202 @@ def _inject_sidebar_brand() -> None:
 _inject_sidebar_brand()
 _inject_card_styles()
 
-_USERNAME_UNSAFE_CHARS_RE = re.compile(r"[^\w\-]")
+init_db()
+
+_NEW_AUTHOR_OPTION = "＋新增署名…"
+# 切换任务时保留的 session_state key：署名是"我是谁"，跟"现在在哪个任务里"是两个
+# 独立维度，换任务不该要求重选一次署名（另两个是署名选择器自身的widget状态，一并留下
+# 才能让下拉/输入框在rerun后仍显示同一个人）。
+_KEEP_ON_TASK_SWITCH = {"author", "author_select", "new_author_input"}
 
 
-def _sanitize_username(raw: str) -> str:
-    """只保留字母/数字/下划线/连字符/中文，避免手滑输入的斜杠/冒号等字符污染文件路径。
+def _render_author_picker() -> None:
+    """侧边栏的"当前署名"选择器：从库里出现过的署名里选，或新增一个。
 
-    Python 3 的 \\w 本身就是 Unicode 感知的，中文字符已经包含在内，不需要额外
-    拼接 unicode 范围。不是安全校验（场景一：互相信任、不需要防手滑填别人名字），
-    只是防止用户名直接拼进文件名/目录名时因为非法字符导致路径异常。
+    署名的语义是"这条校对记录是谁做的"，不是登录账号，也不再决定数据存放位置——
+    全部数据都在同一个库里，任何人都看得到全部任务与记录。用下拉而不是自由文本框，
+    是因为多人共用时手输必然出现"张三"和"张 三"这种同人不同名。
+
+    位置在任务之上（而不是像早先的"当前用户"那样压在侧边栏最底部）：创建任务要记
+    created_by，所以选任务那一屏就得能填署名，而那一屏之后的代码全被 st.stop() 挡住了。
     """
-    cleaned = _USERNAME_UNSAFE_CHARS_RE.sub("", raw.strip())
-    return cleaned or "default"
+    options = get_authors() + [_NEW_AUTHOR_OPTION]
+    current = st.session_state.get("author")
+    index = options.index(current) if current in options else len(options) - 1
+    choice = st.sidebar.selectbox("当前署名", options, index=index, key="author_select")
+
+    if choice == _NEW_AUTHOR_OPTION:
+        typed = st.sidebar.text_input(
+            "新署名", key="new_author_input", placeholder="填写后即生效"
+        ).strip()
+        st.session_state["author"] = typed or None
+    else:
+        st.session_state["author"] = choice
+
+    if not st.session_state.get("author"):
+        st.sidebar.caption("未填写署名，本次校对记录不会标注完成人。")
 
 
-if "username" not in st.session_state:
-    st.session_state["username"] = "default"
+def _switch_task() -> None:
+    """回到任务选择界面，并清空当前任务范围内的工作状态。
 
-# 侧边栏顺序：品牌（顶部）→ 功能入口 → 分隔 → 当前用户（底部），对应目标设计里
-# 用户账户条放在最下方、导航更靠上的布局。功能入口不依赖用户名，可以先创建；用户名
-# 决定 db_path，但 db_path 只在文件末尾页面分发时才被用到，所以放在导航之后计算也来得及。
-page = st.sidebar.radio("功能入口", ("标准校对", "原稿比对", "历史记录", "反馈学习"))
-
-st.sidebar.divider()
-_username_field = st.sidebar.text_input(
-    "当前用户",
-    value=st.session_state["username"],
-    key="username_input",
-    placeholder="default",
-    help="按用户名分开保存各自的校对记录/文档，不做密码校验。切换用户名会清空"
-    "当前页面上的展示状态（数据本身不会丢，填回原用户名可以看到）。",
-)
-username = _sanitize_username(_username_field)
-
-if username != st.session_state["username"]:
+    换任务等于换了一个工作上下文，上一个任务的校对结果/待保存结果/选中记录都不该
+    残留下来显示成新任务的东西（数据本身在库里，回到原任务能重新看到）；署名相关的
+    key 例外，见 _KEEP_ON_TASK_SWITCH。
+    """
     for _key in list(st.session_state.keys()):
-        if _key != "username_input":
+        if _key not in _KEEP_ON_TASK_SWITCH:
             del st.session_state[_key]
-    st.session_state["username"] = username
     st.rerun()
 
-# "default" 是升级前既有数据（data/app.db、data/uploads/）的落脚点，刻意维持 db_path=None
-# （即 db.database.get_connection 兜底用 config.DB_PATH）/ config.UPLOADS_DIR 不变——
-# 保证不填用户名时行为和引入这个功能之前完全一致，无需迁移，也不破坏现有测试里
-# monkeypatch config.DB_PATH/UPLOADS_DIR 的既有写法。只有显式填了别的用户名才会
-# 派生出新的 db 文件/上传子目录。
-if username == "default":
-    db_path = None
-    user_uploads_dir = config.UPLOADS_DIR
-else:
-    db_path = config.DATA_DIR / f"app_{username}.db"
-    user_uploads_dir = config.UPLOADS_DIR / username
-    user_uploads_dir.mkdir(parents=True, exist_ok=True)
 
-init_db(db_path=db_path)
+def _render_task_card(task: dict, counts: dict[int, int]) -> None:
+    """渲染任务选择页里的一张任务卡片（半宽双列布局下的一格）。
+
+    卡片变窄后不再用"信息+状态+进入"三栏并排（会挤成一团），改成信息独占一行、
+    状态下拉与进入按钮共占下一行——两级布局比硬塞进三个窄栏更适合半宽卡片。
+    """
+    with st.container(border=True):
+        st.markdown(
+            f"**{html.escape(task['name'])}**　"
+            f"<span style='color:#999;font-size:0.85rem'>"
+            f"{counts.get(task['task_id'], 0)} 条记录 · 创建于 {task['created_at'][:10]}"
+            f"{' · ' + html.escape(task['created_by']) if task['created_by'] else ''}"
+            f"</span>",
+            unsafe_allow_html=True,
+        )
+        # 固定单行高度：st.caption是普通文本会自然换行，备注长短不一时换行行数
+        # 跟着不一样，卡片就会高矮不齐（试过用空格占位只解决"有没有"，解决不了
+        # "长短"）。改用自己拼HTML，nowrap+ellipsis强制卡进一行、超出截断，
+        # 没有备注时占位一个空格——这样不管有没有备注、备注多长，这一行的高度都恒定。
+        desc_text = html.escape(task["description"]) if task["description"] else " "
+        st.markdown(
+            f"<div style='color:#808495;font-size:0.8rem;white-space:nowrap;"
+            f"overflow:hidden;text-overflow:ellipsis;margin:2px 0 6px' "
+            f"title='{desc_text}'>{desc_text}</div>",
+            unsafe_allow_html=True,
+        )
+
+        # 状态就地改，不必进任务详情——这是任务列表上唯一需要的管理动作。选"已关闭"
+        # 提交后，下次rerun这个任务就不再出现在tasks里（见调用方的过滤），它对应的
+        # 这套widget自然跟着消失，不需要额外处理。
+        col_status, col_enter = st.columns([3, 2])
+        status_index = (
+            config.TASK_STATUSES.index(task["status"])
+            if task["status"] in config.TASK_STATUSES
+            else 0
+        )
+        new_status = col_status.selectbox(
+            "状态",
+            config.TASK_STATUSES,
+            index=status_index,
+            key=f"task_status_{task['task_id']}",
+            label_visibility="collapsed",
+        )
+        if new_status != task["status"]:
+            update_task_status(task["task_id"], new_status)
+            st.rerun()
+
+        if col_enter.button("进入", key=f"enter_task_{task['task_id']}", use_container_width=True):
+            st.session_state["task_id"] = task["task_id"]
+            st.rerun()
+
+
+def _render_task_selection() -> None:
+    """任务选择/创建界面——没有当前任务时，整个应用只显示这一屏。
+
+    流程是线性的：先选任务（或建任务），才出现功能入口。调用方在这之后立刻 st.stop()，
+    所以侧边栏导航和四个功能页的代码根本不会执行。
+    """
+    st.header("选择任务")
+    st.caption("每一次校对都归属于一个任务（比如某本期刊）。先选择要进入的任务，再选择功能。")
+
+    show_all = st.checkbox("显示已解决的任务", value=False)
+    tasks = get_tasks(status=None if show_all else config.TASK_STATUS_ACTIVE)
+    # "已关闭"在前端任何地方都不展示——下拉框里选它能把任务关闭，但关闭后这个任务立刻
+    # 从这里以及"改归属任务"下拉（_render_move_record_to_task）里消失，不受上面这个
+    # 复选框影响；想再看到/改回来，只能直接改数据库（config.TASK_STATUS_CLOSED 因此是
+    # 前端唯一能写入、但读不出来的状态值）。
+    tasks = [t for t in tasks if t["status"] != config.TASK_STATUS_CLOSED]
+    counts = count_records_by_task()
+
+    if not tasks:
+        st.info("还没有任务，请在下方新建一个。")
+    else:
+        # 固定高度、内部滚动——任务一多不能让整页跟着往下拉，把"新建任务"表单挤出屏幕。
+        # 每行两张卡片（各占半宽），同样的高度能容纳的行数因此减半，滚动更少。
+        with st.container(height=420):
+            for i in range(0, len(tasks), 2):
+                cols = st.columns(2)
+                # get_tasks() 按创建时间倒序返回（最新在前），每行右边放更新的一条、
+                # 左边放更旧的一条——cols[::-1] 反转列顺序去配对，奇数条数的最后一行
+                # 只剩一条时也会落在右边，不会出现"左边比右边新"的情况。
+                for col, task in zip(cols[::-1], tasks[i : i + 2]):
+                    with col:
+                        _render_task_card(task, counts)
+
+    st.divider()
+    st.subheader("新建任务")
+    new_name = st.text_input("任务名称", key="new_task_name")
+    new_desc = st.text_area("备注（选填）", key="new_task_desc")
+
+    # 任务名不做唯一性校验——task_id才是真正的标识，卡片上创建日期/记录数已经够分辨。
+    # 但输入的名字和现有任务（已关闭的除外，那些前端本来就看不到）撞了，说明大概率是
+    # 手滑，提醒一下、不永久阻止创建。
+    typed_name = new_name.strip()
+    is_duplicate = False
+    if typed_name:
+        existing_names = {
+            t["name"] for t in get_tasks() if t["status"] != config.TASK_STATUS_CLOSED
+        }
+        is_duplicate = typed_name in existing_names
+
+    # 撞名时不能让"警告"和"创建成功后立刻rerun跳进新任务"落在同一次脚本执行里——
+    # 那样警告刚算出来、页面已经跳走，浏览器根本没机会把它画出来（几乎不可见，
+    # 真实反馈过的问题）。所以撞名的第一次点击只记一个"已提醒过这个名字"的标记、
+    # 不创建，让警告单独停留一次刷新；名字不变的情况下再点一次才真正创建，
+    # 名字改了（不再撞名，或撞了另一个名字）则这个标记自动失效，按新状态重新走一遍。
+    if is_duplicate:
+        st.warning(
+            f"已有同名任务「{typed_name}」，请检查是否失误。"
+            "确认新建请再点击一次「创建并进入」。"
+        )
+
+    if st.button("创建并进入"):
+        if not typed_name:
+            st.error("任务名称不能为空。")
+        elif is_duplicate and st.session_state.get("task_dup_ack_name") != typed_name:
+            st.session_state["task_dup_ack_name"] = typed_name
+        else:
+            task_id = create_task(
+                typed_name,
+                description=new_desc.strip() or None,
+                created_by=st.session_state.get("author"),
+            )
+            st.session_state.pop("task_dup_ack_name", None)
+            st.session_state["task_id"] = task_id
+            st.rerun()
+
+
+_render_author_picker()
+
+# 任务闸门：session_state 里没有一个仍然存在的当前任务时，只渲染任务选择界面。
+# get_task 的 None 兜底覆盖"库被换掉/任务被删掉"导致 task_id 悬空的情况。
+current_task = (
+    get_task(st.session_state["task_id"]) if st.session_state.get("task_id") else None
+)
+if current_task is None:
+    st.session_state.pop("task_id", None)
+    _render_task_selection()
+    st.stop()
+
+st.sidebar.markdown(f"**当前任务**　{current_task['name']}")
+st.sidebar.caption(f"状态：{current_task['status']}")
+if st.sidebar.button("切换任务"):
+    _switch_task()
+
+st.sidebar.divider()
+page = st.sidebar.radio("功能入口", ("标准校对", "原稿比对", "历史记录", "反馈学习"))
 
 
 def _file_id(uploaded_file) -> str:
@@ -452,7 +640,7 @@ def _regenerate_rules_after_export() -> None:
     """
     try:
         with st.spinner("正在根据本轮反馈更新规避规则…"):
-            feedback_rules.regenerate_rejection_rules(db_path=db_path)
+            feedback_rules.regenerate_rejection_rules()
     except Exception:
         logger.exception("反馈规则重新生成失败")
 
@@ -544,16 +732,26 @@ def _render_issue_card(issue, issue_id, record_id):
             f"<span style='color:{_STATUS_COLOR[status]};font-weight:600'> · {status}</span>"
         )
 
-    with st.container(border=True, key=card_key):
+    with st.container(border=True, key=card_key, gap="xxsmall"):
         st.markdown(header, unsafe_allow_html=True)
         # 干净地分两块展示原文和建议（不做字符级diff：suggestion 是自由文本说明，不是
         # 平行的"改后文本"，硬做diff只会得到乱码）。用小灰标签区分两块，正文都用黑字，
-        # 一眼能看清哪句是原文、哪句是建议。
+        # 一眼能看清哪句是原文、哪句是建议。原文本身是被标记的一小段原句，长度稳定，
+        # 不预留高度；建议是自由文本说明，长短差异大，才是同一行两张卡参差不齐的来源，
+        # 只在建议上预留两行高度（min-height+line-height，短文本也占满这份高度）——
+        # 这个预留不参与"压卡片高度"，压缩改从别处拿（卡片padding、容器gap、批注行合并
+        # 到按钮行，见下方与 _inject_card_styles）；建议字号略调小，减少超出两行的概率。
+        # 容器整体用 gap="xxsmall" 压缩，但那个间距对"建议"这段正文和下一个元素
+        # （归层依据expander，或没有该expander时的采纳/拒绝按钮行）来说太挤、看着像
+        # 糊在一起，所以在建议块自己身上单独补一个 margin-bottom，不改动其他地方的
+        # 间距（不拉高header-content、按钮行-追问expander之间已经压紧的空隙）。
         st.markdown(
-            f"<div style='margin-top:2px'><span style='color:#999;font-size:0.78rem'>原文</span>"
+            f"<div style='margin-top:1px'><span style='color:#999;font-size:0.78rem'>原文</span>"
             f"<div style='color:#1A1A1A'>{html.escape(issue.original_text)}</div></div>"
-            f"<div style='margin-top:6px'><span style='color:#999;font-size:0.78rem'>建议</span>"
-            f"<div style='color:#1A1A1A'>{html.escape(issue.suggestion)}</div></div>",
+            f"<div style='margin-top:3px;margin-bottom:10px'>"
+            f"<span style='color:#999;font-size:0.78rem'>建议</span>"
+            f"<div style='color:#1A1A1A;font-size:0.9rem;line-height:1.4;min-height:2.8em'>"
+            f"{html.escape(issue.suggestion)}</div></div>",
             unsafe_allow_html=True,
         )
 
@@ -563,16 +761,23 @@ def _render_issue_card(issue, issue_id, record_id):
             with st.expander("归层依据"):
                 st.caption("；".join(issue.layer_notes))
 
+        def _save_note():
+            workflow.set_issue_note(issue_id, st.session_state.get(f"note_{issue_id}", ""))
+
+        # 批注输入框跟采纳/拒绝（或撤销）按钮挤在同一行的剩余空间里，不再单独占一整行——
+        # 是压缩卡片高度的一部分，其余是上面 min-height 收紧和 _inject_card_styles 里的
+        # padding 收紧。label_visibility="collapsed" 省掉的"批注"文字标签行用占位符补上，
+        # 紧挨着按钮不影响辨识。
         if status == "待处理":
-            col_accept, col_reject, _spacer = st.columns([1, 1, 6])
+            col_accept, col_reject, col_note = st.columns([1, 1, 4])
             if col_accept.button("采纳", key=f"accept_{issue_id}"):
-                workflow.set_issue_status(issue_id, "已采纳", record_id=record_id, db_path=db_path)
+                workflow.set_issue_status(issue_id, "已采纳", record_id=record_id)
                 status_info["status"] = "已采纳"
                 st.rerun()
 
             if col_reject.button("拒绝", key=f"reject_{issue_id}"):
-                workflow.set_issue_status(issue_id, "已拒绝", record_id=record_id, db_path=db_path)
-                feedback.record_rejection(issue, issue_id, record_id, db_path=db_path)
+                workflow.set_issue_status(issue_id, "已拒绝", record_id=record_id)
+                feedback.record_rejection(issue, issue_id, record_id)
                 # 只快速记录这条拒绝，不在这里同步跑规则总结——那是一次几秒的LLM调用，
                 # 连续拒绝会次次触发、又慢又费额度。规则重算改到"导出Excel成功后"
                 # （_regenerate_rules_after_export，一轮审校的收尾动作）和反馈页手动按钮触发。
@@ -582,19 +787,22 @@ def _render_issue_card(issue, issue_id, record_id):
             # 卡片底色已经表达了"已采纳"/"已拒绝"这个终态，不再需要"— 待处理"这类文字；
             # 撤销直接把状态改回待处理，复用通用的 set_issue_status，不新增函数。撤销
             # "已拒绝"不撤销已写入的 feedback 表记录——反馈学习是独立的历史留痕。
-            col_undo, _spacer = st.columns([1, 7])
+            col_undo, col_note = st.columns([1, 5])
             if col_undo.button("撤销", key=f"undo_{issue_id}"):
-                workflow.set_issue_status(issue_id, "待处理", record_id=record_id, db_path=db_path)
+                workflow.set_issue_status(issue_id, "待处理", record_id=record_id)
                 status_info["status"] = "待处理"
                 st.rerun()
 
-        def _save_note():
-            workflow.set_issue_note(issue_id, st.session_state.get(f"note_{issue_id}", ""), db_path=db_path)
-
-        st.text_input("批注", key=f"note_{issue_id}", on_change=_save_note)
+        col_note.text_input(
+            "批注",
+            key=f"note_{issue_id}",
+            on_change=_save_note,
+            placeholder="批注（可选）",
+            label_visibility="collapsed",
+        )
 
         with st.expander("追问"):
-            for turn in followup.get_followup_history(issue_id, db_path=db_path):
+            for turn in followup.get_followup_history(issue_id):
                 with st.chat_message("user"):
                     st.write(turn["question"])
                 with st.chat_message("assistant"):
@@ -607,12 +815,25 @@ def _render_issue_card(issue, issue_id, record_id):
                 if question.strip():
                     try:
                         with st.spinner("正在思考…"):
-                            followup.answer_followup(issue_id, question, db_path=db_path)
+                            followup.answer_followup(issue_id, question)
                     except LLMCallError as exc:
                         logger.error("追问失败: %s", exc)
                         st.error(f"追问失败：{exc}")
                     else:
                         st.rerun()
+
+
+def _render_issue_cards(items, record_id, n_cols: int = 2) -> None:
+    """两条一行的网格布局渲染问题卡列表，压缩列表纵向长度（原先一条卡打满整行，问题
+    一多列表就很长）。items 是 (issue, issue_id) 二元组列表；和任务选择页任务卡的两列
+    网格是同一个模式（见本文件顶部 docstring）。试过三列，但单卡变窄后原文/建议更容易
+    换行，同一行内卡片高度参差不齐反而更明显，改回两列。
+    """
+    for i in range(0, len(items), n_cols):
+        cols = st.columns(n_cols)
+        for col, (issue, issue_id) in zip(cols, items[i : i + n_cols]):
+            with col:
+                _render_issue_card(issue, issue_id, record_id)
 
 
 def _execute_proofread(uploaded_file, mode: str) -> bool:
@@ -628,9 +849,9 @@ def _execute_proofread(uploaded_file, mode: str) -> bool:
     单独交给 _try_persist_pending 处理——即使落库失败，这份结果也不会跟着丢。
     """
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    save_path = user_uploads_dir / f"{timestamp}_{uploaded_file.name}"
+    save_path = config.UPLOADS_DIR / f"{timestamp}_{uploaded_file.name}"
     save_path.write_bytes(uploaded_file.getvalue())
-    _prune_uploads_dir(user_uploads_dir)
+    _prune_uploads_dir(config.UPLOADS_DIR)
 
     progress_bar = st.progress(0.0)
     status_text = st.empty()
@@ -642,7 +863,7 @@ def _execute_proofread(uploaded_file, mode: str) -> bool:
     try:
         with st.spinner("正在校对，请稍候…"):
             result, parsed = workflow.run_standard_proofread(
-                str(save_path), progress_callback=_on_progress, mode=mode, db_path=db_path
+                str(save_path), progress_callback=_on_progress, mode=mode
             )
     except (UnsupportedFormatError, NoTextLayerError) as exc:
         logger.warning("文档解析失败: %s", exc)
@@ -682,7 +903,12 @@ def _try_persist_pending() -> bool:
 
     try:
         record_id, issue_ids = workflow.persist_result(
-            result, doc_name=doc_name, parsed=parsed, mode=mode, db_path=db_path
+            result,
+            task_id=st.session_state["task_id"],
+            doc_name=doc_name,
+            parsed=parsed,
+            mode=mode,
+            author=st.session_state.get("author"),
         )
     except Exception as exc:  # noqa: BLE001 兜底：写库失败不能让已算出的结果跟着丢
         logger.exception("校对结果落库失败")
@@ -783,13 +1009,12 @@ def _render_standard_proofread():
         with st.expander(f"{layer}（{len(layer_issues)}条）", expanded=bool(layer_issues)):
             if not layer_issues:
                 st.caption("无")
-            for issue, issue_id in layer_issues:
-                _render_issue_card(issue, issue_id, record_id)
+            _render_issue_cards(layer_issues, record_id)
 
     st.divider()
     if st.button("导出Excel"):
         try:
-            export_path = exporter.export_issues_to_excel(record_id, db_path=db_path)
+            export_path = exporter.export_issues_to_excel(record_id)
         except Exception as exc:  # noqa: BLE001 兜底，避免导出异常打崩页面
             logger.exception("Excel导出失败")
             st.error(f"导出失败：{exc}")
@@ -829,7 +1054,7 @@ def _render_history_detail(record_id: int):
     """展示某条历史流程记录的完整问题卡列表，复用 _render_issue_card——
     与刚校对完时同样可以采纳/拒绝/写批注/追问，所有操作直接写库，与实时流程完全一致。
     """
-    issues = get_issues(record_id, db_path=db_path)
+    issues = get_issues(record_id)
 
     st.session_state.setdefault("issue_status", {})
     for row in issues:
@@ -846,13 +1071,14 @@ def _render_history_detail(record_id: int):
         with st.expander(f"{layer}（{len(layer_rows)}条）", expanded=bool(layer_rows)):
             if not layer_rows:
                 st.caption("无")
-            for row in layer_rows:
-                _render_issue_card(_row_to_issue_view(row), row["issue_id"], record_id)
+            _render_issue_cards(
+                [(_row_to_issue_view(row), row["issue_id"]) for row in layer_rows], record_id
+            )
 
     st.divider()
     if st.button("导出Excel", key=f"history_export_{record_id}"):
         try:
-            export_path = exporter.export_issues_to_excel(record_id, db_path=db_path)
+            export_path = exporter.export_issues_to_excel(record_id)
         except Exception as exc:  # noqa: BLE001 兜底，避免导出异常打崩页面
             logger.exception("Excel导出失败")
             st.error(f"导出失败：{exc}")
@@ -898,11 +1124,11 @@ def _render_document_comparison():
             return
         if st.button("开始比对"):
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            original_path = user_uploads_dir / f"{timestamp}_原稿_{original_file.name}"
-            formatted_path = user_uploads_dir / f"{timestamp}_排版稿_{formatted_file.name}"
+            original_path = config.UPLOADS_DIR / f"{timestamp}_原稿_{original_file.name}"
+            formatted_path = config.UPLOADS_DIR / f"{timestamp}_排版稿_{formatted_file.name}"
             original_path.write_bytes(original_file.getvalue())
             formatted_path.write_bytes(formatted_file.getvalue())
-            _prune_uploads_dir(user_uploads_dir)
+            _prune_uploads_dir(config.UPLOADS_DIR)
 
             try:
                 with st.spinner("正在比对，请稍候…"):
@@ -924,9 +1150,10 @@ def _render_document_comparison():
             try:
                 record_id, _ = workflow.persist_comparison_result(
                     diffs,
+                    task_id=st.session_state["task_id"],
                     doc_name=f"{original_file.name} / {formatted_file.name}",
                     formatted=formatted_parsed,
-                    db_path=db_path,
+                    author=st.session_state.get("author"),
                 )
             except Exception as exc:  # noqa: BLE001 兜底：写库失败不能崩页面
                 logger.exception("原稿比对结果落库失败")
@@ -938,7 +1165,7 @@ def _render_document_comparison():
         return
 
     record_id = st.session_state["compare_record_id"]
-    rows = get_issues(record_id, db_path=db_path)
+    rows = get_issues(record_id)
 
     st.caption(f"共发现 {len(rows)} 处实质性内容改动（排版调整不计入，已自动过滤）。")
 
@@ -953,13 +1180,12 @@ def _render_document_comparison():
 
     if not rows:
         st.success("未发现排版稿与原稿之间的实质性内容改动。")
-    for row in rows:
-        _render_issue_card(_row_to_issue_view(row), row["issue_id"], record_id)
+    _render_issue_cards([(_row_to_issue_view(row), row["issue_id"]) for row in rows], record_id)
 
     st.divider()
     if st.button("导出Excel", key=f"compare_export_{record_id}"):
         try:
-            export_path = exporter.export_issues_to_excel(record_id, db_path=db_path)
+            export_path = exporter.export_issues_to_excel(record_id)
         except Exception as exc:  # noqa: BLE001 兜底，避免导出异常打崩页面
             logger.exception("Excel导出失败")
             st.error(f"导出失败：{exc}")
@@ -977,9 +1203,10 @@ def _render_document_comparison():
 
 def _render_history():
     st.header("历史记录")
-    records = get_records(db_path=db_path)
+    st.caption(f"只显示当前任务「{current_task['name']}」下的校对记录。")
+    records = get_records(task_id=st.session_state["task_id"])
     if not records:
-        st.info("暂无历史校对记录。")
+        st.info("当前任务下还没有校对记录。")
         return
 
     # record_id 不放进 column_order 即等同隐藏——下面 selectbox 是自己从 records 里
@@ -989,12 +1216,13 @@ def _render_history():
         records,
         hide_index=True,
         column_order=[
-            "created_at", "doc_name", "task_type", "mode", "total_issues",
+            "created_at", "doc_name", "author", "task_type", "mode", "total_issues",
             "count_confirmed", "count_doubtful", "count_quotation", "count_optional",
         ],
         column_config={
             "created_at": st.column_config.DatetimeColumn("时间", format="MM-DD HH:mm"),
             "doc_name": st.column_config.TextColumn("文档名", width="large"),
+            "author": st.column_config.TextColumn("完成人"),
             "task_type": st.column_config.TextColumn("类型"),
             "mode": st.column_config.TextColumn("模式"),
             "total_issues": st.column_config.NumberColumn("总数"),
@@ -1013,9 +1241,36 @@ def _render_history():
     record = next(r for r in records if r["record_id"] == selected_record_id)
 
     _render_doc_subtitle(record.get("doc_name"), record.get("mode"))
+    if record.get("author"):
+        st.caption(f"完成人：{record['author']}")
+    _render_move_record_to_task(record)
     _render_stats(record, [])
     st.divider()
     _render_history_detail(selected_record_id)
+
+
+def _render_move_record_to_task(record: dict) -> None:
+    """把当前选中的这条记录改归属到别的任务。
+
+    迁移进来的历史记录全都堆在"历史归档"这一个任务下（迁移不按文档名猜任务归属），
+    这里是把它们拆到真实任务里的唯一手段。改完这条记录就不再属于当前任务了，所以
+    直接 rerun 让它从本页列表里消失，不做额外提示。
+
+    已关闭的任务不出现在"移动到"选项里——已关闭在前端任何地方都不展示，不能把记录挪进
+    一个前端根本看不到、也进不去的任务（见 _render_task_selection 顶部注释）。
+    """
+    others = [
+        t for t in get_tasks()
+        if t["task_id"] != record["task_id"] and t["status"] != config.TASK_STATUS_CLOSED
+    ]
+    if not others:
+        return
+    with st.expander("改归属任务"):
+        labels = {f"{t['name']}（{t['status']}）": t["task_id"] for t in others}
+        chosen = st.selectbox("移动到", list(labels.keys()), key=f"move_target_{record['record_id']}")
+        if st.button("确认移动", key=f"move_record_{record['record_id']}"):
+            update_record_task(record["record_id"], labels[chosen])
+            st.rerun()
 
 
 def _render_feedback_management():
@@ -1023,7 +1278,7 @@ def _render_feedback_management():
 
     st.subheader("当前生效的反馈规则")
     st.caption("以下规则由历史拒绝记录经LLM语义总结得出，已注入校对提示词，AI校对时会主动规避这些模式。")
-    rules = get_feedback_rules(db_path=db_path)
+    rules = get_feedback_rules()
     if not rules:
         st.info("暂无总结出的规则。")
     else:
@@ -1031,7 +1286,7 @@ def _render_feedback_management():
             st.write(f"- {r['rule_text']}")
     if st.button("重新生成规则"):
         try:
-            feedback_rules.regenerate_rejection_rules(db_path=db_path)
+            feedback_rules.regenerate_rejection_rules()
         except Exception:
             logger.exception("反馈规则重新生成失败")
             st.error("规则重新生成失败，详见日志。")
@@ -1039,7 +1294,7 @@ def _render_feedback_management():
 
     st.divider()
     st.subheader("原始反馈记录")
-    rows = get_feedback(db_path=db_path)
+    rows = get_feedback()
     if not rows:
         st.info("暂无反馈学习记录。")
         return
@@ -1050,7 +1305,7 @@ def _render_feedback_management():
             st.write(f"建议：{entry['suggestion']}")
             st.caption(f"AI说明：{entry['reason'] or '（无）'} · 记录时间：{entry['created_at']}")
             if st.button("撤销此条反馈", key=f"forget_feedback_{entry['feedback_id']}"):
-                feedback.forget_feedback(entry["feedback_id"], db_path=db_path)
+                feedback.forget_feedback(entry["feedback_id"])
                 st.rerun()
 
 
