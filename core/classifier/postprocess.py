@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import logging
 import re
 import unicodedata
@@ -18,24 +19,42 @@ logger = logging.getLogger(__name__)
 # 规则会把这类正常的存疑issue误伤成"零改动"，见 core/classifier/CLAUDE.md。
 _REPLACEMENT_SUGGESTION_RE = re.compile(r'(?:应改为|改为)[“"\']([^”"\']+)[”"\']')
 
+# 整段替换建议里，被替换的整段本身可能含引号（LLM转述原文时会把原文自带的引号一起带上，
+# 如 应改为“走进…深入“全员自主改善”的现场…”）。此时上面那条非贪婪规则会在第一个内嵌
+# 引号处截断，抽出残缺的新文本，长度对不上原文，零改动判定随即失效——真实案例是一批
+# 部首类假错误因此漏过过滤。这条改用贪婪匹配把整段取全，并要求引号收在建议末尾（允许尾随
+# 句号），避免在"改为『X』，因为『Y』"这类后面还有引用的措辞里抽过头。
+_REPLACEMENT_TO_END_RE = re.compile(r'(?:应改为|改为)[“"\'](.+)[”"\']\s*[。．.]?\s*$', re.S)
+
 # "『旧片段』应改为『新片段』"这种只描述original_text里某个具体片段替换的措辞（常见于
 # suggestion只想指出一个字/词有问题，而不是整个original_text都要换掉）——
 # _REPLACEMENT_SUGGESTION_RE 那种"整段替换"比较方式在这种措辞下会因为新旧片段长度和
 # original_text整体长度不一致而误判成"不是零改动"，需要单独识别这一对片段直接比较，
 # 见 core/classifier/CLAUDE.md。
-_FRAGMENT_REPLACEMENT_RE = re.compile(r'[“"\']([^”"\']+)[”"\'](?:应改为|改为)[“"\']([^”"\']+)[”"\']')
+_FRAGMENT_REPLACEMENT_RE = re.compile(r'[“"\']([^”"\']+)[”"\'](?:应改为|应为|改为)[“"\']([^”"\']+)[”"\']')
 
-# PDF/OCR字体替代产生的部首/异体字形混入正文的真实案例（完整出处清单见
-# core/classifier/CLAUDE.md）：CJK Radicals Supplement（U+2E80~2EFF）区块的字符
-# 多数没有Unicode兼容分解，NFKC规范化处理不了；Kangxi Radicals（U+2F00~2FDF）区块
-# 里的"⼾"虽然有兼容分解，但指向繁体"戶"，与简体正文实际需要的"户"不符。这里只收录
-# 亲自核实过对应关系的字符，不做未验证的猜测性扩充——错误的映射表会静默篡改比对
-# 结果，比漏判更危险。
-_RADICAL_LOOKALIKE_OVERRIDES = {
-    "⻔": "门", "⻩": "黄", "⻘": "青", "⻓": "长",
-    "⻆": "角", "⻉": "贝", "⺟": "母", "⺠": "民",
-    "⻋": "车", "⻨": "麦", "⻛": "风", "⻢": "马",
-    "⼾": "户",
+# 字形变体码位区间：这些区块里的字符肉眼与规范汉字无异，码位却不是CJK统一汉字。
+# PDF字体的ToUnicode CMap有缺陷时会把正文汉字映射到这些码位——真实文档实测（一份19页
+# 刊物）有2122个，LLM会把它们整段当错别字报出来（一次71条问题里50条因此而来），且落进
+# 置信度最高的"错误类"。
+_CJK_VARIANT_RANGES = (
+    (0x2E80, 0x2EF3),    # CJK部首补充：整个区块都没有NFKC兼容分解，只能靠码位区间识别
+    (0x2F00, 0x2FD5),    # 康熙部首：有兼容分解，但分解结果可能是繁体，不能只靠NFKC比对
+    (0xF900, 0xFAFF),    # CJK兼容汉字
+    (0x2F800, 0x2FA1D),  # CJK兼容汉字补充
+)
+
+# 康熙部首是**传统**部首，NFKC分解结果一律是繁体字形，而简体正文里这些字符代表的是
+# 简体字（`⼾`U+2F3E分解成`戶`，正文里其实是`户`）。这张表把分解结果折回简体，供
+# _variant_char_matches 判定"变体字符与建议里的规范字是否同一个字"。
+# **它和"部首→汉字"那种映射表不是一回事，边界是封闭的**：康熙部首区固定214个字符，
+# 其中分解结果简繁有别的就这么些，一次收全即可，不存在"下一份文档又冒出新字符"的问题；
+# 而且漏收只会让个别建议少丢一条（保守方向），不会造成误删。
+_KANGXI_TRADITIONAL_FOLDINGS = {
+    "戶": "户", "門": "门", "馬": "马", "車": "车", "頁": "页", "見": "见",
+    "貝": "贝", "風": "风", "長": "长", "齒": "齿", "龜": "龟", "黽": "黾",
+    "麥": "麦", "黃": "黄", "韋": "韦", "飛": "飞", "魚": "鱼", "鳥": "鸟",
+    "龍": "龙", "齊": "齐", "鹵": "卤", "語": "语", "貞": "贞", "隸": "隶",
 }
 
 _CONSERVATISM_RANK = {
@@ -62,11 +81,83 @@ def _strip_whitespace(text: str) -> str:
 
 
 def _normalize_lookalike(text: str) -> str:
-    """先替换已知的部首/异体字形替代字符（_RADICAL_LOOKALIKE_OVERRIDES），再做NFKC
-    兼容规范化——两步合起来才能覆盖"有NFKC分解的部首"和"NFKC处理不了/分解到繁体
-    的部首"两类真实出现过的字体替代场景。"""
-    substituted = "".join(_RADICAL_LOOKALIKE_OVERRIDES.get(ch, ch) for ch in text)
-    return unicodedata.normalize("NFKC", substituted)
+    """NFKC兼容规范化，识别全角/半角、兼容字形这类"视觉等价但码位不同"的零改动建议。
+
+    字形变体（部首区/兼容汉字区）不在这里处理，交给 _diff_is_only_cjk_variants——
+    NFKC对CJK部首补充区整个区块都无效，且对康熙部首的分解结果可能是繁体，靠它比对
+    会漏判。
+    """
+    return unicodedata.normalize("NFKC", text)
+
+
+def _is_cjk_variant_char(ch: str) -> bool:
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _CJK_VARIANT_RANGES)
+
+
+def _variant_char_matches(old_ch: str, new_ch: str) -> bool:
+    """old_ch 是字形变体字符，且它与 new_ch 确实是同一个字。
+
+    必须校验"old_ch 的规范形式是否就是 new_ch"，不能只看 old_ch 落在变体区就放行——
+    真实反例：`数⼦化`→`数字化` 里 `⼦`(康熙部首"子") 被误用成了`字`，这是**真错别字**，
+    不校验就会被当成字形变体丢掉。
+
+    三种放行情形：
+    1. 没有NFKC兼容分解（CJK部首补充区整块如此）——无从校验，按"该区字符本就是某个
+       汉字的部首形式"放行。这是不维护映射表的代价，换来对任意没见过的字符都生效。
+    2. 分解结果就是 new_ch——最常见的情形。
+    3. 分解结果是 new_ch 的繁体（_KANGXI_TRADITIONAL_FOLDINGS）——康熙部首区是**传统**
+       部首，分解结果一律繁体字形，而简体正文里它代表简体字。
+    """
+    if not _is_cjk_variant_char(old_ch):
+        return False
+    folded = unicodedata.normalize("NFKC", old_ch)
+    if folded == old_ch:
+        return True
+    return folded == new_ch or _KANGXI_TRADITIONAL_FOLDINGS.get(folded) == new_ch
+
+
+def _diff_is_only_cjk_variants(old: str, new: str) -> bool:
+    """old→new 的全部差异是否都只是"字形变体字符换成规范汉字"。
+
+    **不依赖任何字符映射表**：只判断差异位置上 old 侧的字符码位是否落在变体区，不关心
+    它具体对应哪个汉字。这一点是关键——早先的做法是手工维护一张"部首→汉字"映射表，
+    只能覆盖已收录的字符，每换一份新文档就可能撞上表外的新字符：真实教训是那张13字表
+    被 `⻣`(骨)、`⻰`(龙) 破防，一次放出38条假错别字，且这类字符散布在整句里，LLM会
+    引用整段来报，原文长度和噪声量都成倍上升。按码位区间判断则对任意文档、任意没见过
+    的变体字符都成立，不需要维护表，也不会因为映射写错而静默篡改比对结果。
+
+    只认等长替换：出现增删说明改的是内容本身，不是单纯的字形替换，必须放行给人工判断
+    （如 `面对们`→`面对面` 是真错别字，`⸺`→`——` 是真的破折号字符不对，两者都不该丢）。
+    """
+    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag != "replace" or (i2 - i1) != (j2 - j1):
+            return False
+        if not all(_variant_char_matches(a, b) for a, b in zip(old[i1:i2], new[j1:j2])):
+            return False
+    return True
+
+
+def _fragment_is_only_cjk_variants(original: str, proposed: str) -> bool:
+    """suggestion 只给出原文里某个词的规范写法时，在原文里找与它等长、且只差字形变体
+    的窗口。
+
+    LLM 常常引用一整行原文当 original_text，却只在建议里写出要改的那个词（如原文
+    "能⼒，直接决定了企业的市场竞争⼒。尤其是从事⼤"、建议"应改为『能力』"）。这种
+    措辞既不符合 _FRAGMENT_REPLACEMENT_RE 的"『旧』应改为『新』"格式，整段比对时长度
+    又对不上，两条既有规则都接不住，而它恰恰是字形变体假错误最常见的形态。
+    """
+    n = len(proposed)
+    if not 0 < n < len(original):
+        return False
+    for i in range(len(original) - n + 1):
+        window = original[i:i + n]
+        if window != proposed and _diff_is_only_cjk_variants(window, proposed):
+            return True
+    return False
 
 
 def _extract_replacement_pair(raw: RawIssue) -> tuple[str, str] | None:
@@ -89,11 +180,14 @@ def _extract_replacement_pair(raw: RawIssue) -> tuple[str, str] | None:
         if old and new and old in original:
             return old, new
 
-    whole_match = _REPLACEMENT_SUGGESTION_RE.search(suggestion)
-    if whole_match:
-        proposed = whole_match.group(1).strip()
-        if proposed:
-            return original, proposed
+    # 先试"引号收在建议末尾"的贪婪匹配，能把含内嵌引号的整段完整取出；取不到再退回
+    # 非贪婪版本（措辞不规范、引号没收在末尾时仍能抽到一个候选）
+    for pattern in (_REPLACEMENT_TO_END_RE, _REPLACEMENT_SUGGESTION_RE):
+        whole_match = pattern.search(suggestion)
+        if whole_match:
+            proposed = whole_match.group(1).strip()
+            if proposed:
+                return original, proposed
 
     return None
 
@@ -153,11 +247,17 @@ def _compute_stats(issues: list[ClassifiedIssue]) -> dict:
 
 
 def _is_visually_no_op_suggestion(raw: RawIssue) -> bool:
-    """抽取出的"旧→新"文本（见 _extract_replacement_pair）经部首/异体字形替代修正+NFKC
-    规范化后完全相同——说明这条建议实际上零改动：要么字面完全一样（LLM把"存疑"错报
-    成了确定性建议却没给出真实改动），要么视觉相同但用了不同的Unicode码点/部首替代
-    字形（如PDF解析产生的康熙部首"⽉"代替标准汉字"月"，或CJK部首补充区的"⻔"代替
-    标准汉字"门"，肉眼看不出区别）。真实案例清单见 core/classifier/CLAUDE.md。
+    """抽取出的"旧→新"文本（见 _extract_replacement_pair）实际上零改动，两条判据取或：
+
+    1. NFKC规范化后完全相同（_normalize_lookalike）——要么字面就一样（LLM把"存疑"错报
+       成确定性建议却没给出真实改动），要么只差全角/半角这类兼容字形。
+    2. 差异全部落在字形变体字符上（_diff_is_only_cjk_variants）——如PDF解析产生的康熙
+       部首"⽉"代替标准汉字"月"、CJK部首补充区的"⻔"代替"门"，肉眼看不出区别。
+    3. suggestion只给出原文里某个词的规范写法时，原文里存在只差字形变体的等长窗口
+       （_fragment_is_only_cjk_variants）——LLM引用整行原文却只写要改的那个词，是这类
+       假错误最常见的形态，前两条都接不住。
+
+    真实案例清单见 core/classifier/CLAUDE.md。
     """
     pair = _extract_replacement_pair(raw)
     if pair is None:
@@ -165,7 +265,11 @@ def _is_visually_no_op_suggestion(raw: RawIssue) -> bool:
     old, new = pair
     if not old or not new:
         return False
-    return _normalize_lookalike(old) == _normalize_lookalike(new)
+    if _normalize_lookalike(old) == _normalize_lookalike(new):
+        return True
+    if _diff_is_only_cjk_variants(old, new):
+        return True
+    return _fragment_is_only_cjk_variants(old, new)
 
 
 def _has_stray_control_chars(text: str) -> bool:
