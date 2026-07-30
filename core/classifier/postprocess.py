@@ -33,6 +33,12 @@ _REPLACEMENT_TO_END_RE = re.compile(r'(?:应改为|改为)[“"\'](.+)[”"\']\s
 # 见 core/classifier/CLAUDE.md。
 _FRAGMENT_REPLACEMENT_RE = re.compile(r'[“"\']([^”"\']+)[”"\'](?:应改为|应为|改为)[“"\']([^”"\']+)[”"\']')
 
+# 剔除引文类issue的"疑点供参考"文本（见 _strip_visually_no_op_fragments）时，连同片段
+# 前面的连接词一起去掉，避免剔除后留下"……，且"这种悬空的残句。
+_FRAGMENT_WITH_LEADING_CONNECTOR_RE = re.compile(
+    r"(?:[，,、]\s*(?:且|并且|同时)\s*)?" + _FRAGMENT_REPLACEMENT_RE.pattern
+)
+
 # 字形变体码位区间：这些区块里的字符肉眼与规范汉字无异，码位却不是CJK统一汉字。
 # PDF字体的ToUnicode CMap有缺陷时会把正文汉字映射到这些码位——真实文档实测（一份19页
 # 刊物）有2122个，LLM会把它们整段当错别字报出来（一次71条问题里50条因此而来），且落进
@@ -189,7 +195,45 @@ def _extract_replacement_pair(raw: RawIssue) -> tuple[str, str] | None:
             if proposed:
                 return original, proposed
 
+    # 兜底：以上三种措辞模式都没抽到时，把suggestion整体当成"裸"替换文本本身——真实
+    # 案例：LLM有时不套"应改为『X』"这层话术，suggestion字段就是修正后的文本本身
+    # （如 original_text="AI 助力PMC实战进阶"，suggestion="AI助力PMC实战进阶"，没有
+    # 任何引号/动词包裹）。这种测不到的新措辞每出现一种就要新增一条正则去抽，是在
+    # 追着LLM的措辞打地鼠；改成"抽不到任何已知模式就直接拿suggestion本身当候选"，
+    # 后续判据（NFKC归一化/CJK变体diff/去空格比较）本身要求候选与original高度一致
+    # 才会命中，真正的描述性建议（如"建议删除'的'字，或调整语序"）内容和original相差
+    # 悬殊，不会被这几条判据误判，不需要再额外识别"这是不是裸替换文本"。
+    proposed = suggestion.strip()
+    if proposed:
+        return original, proposed
+
     return None
+
+
+def _strip_visually_no_op_fragments(text: str) -> str:
+    """从自由文本（引文类issue展示给用户的"疑点供参考"原文，即 raw.reason）里剔除
+    "『旧』应为/应改为『新』"这类片段式表述中，新旧文本只是CJK变体字形/兼容字形差异的
+    那一部分。
+
+    真实案例：书名号命中规则A引文保护、"原文照录不建议改动"，但LLM把两个疑点写在同一句
+    reason里——"编号与标题之间的标点格式不统一，应为'4.'"是真疑点，"'⼊表'应为'入表'"
+    纯粹是这份PDF的部首编码伪影（⼊是"入"的康熙部首变体，肉眼无异），却被原样展示成
+    "疑点供参考"，误导核实方向。`_filter_visually_no_op` 只检查 `raw.suggestion` 整条是否
+    零改动、命中就整条丢弃——但规则A展示给用户的是 `raw.reason`，且这里两个疑点混在同一
+    句话里，不能整条丢弃（会连真疑点一起丢），只能剔除其中零改动的那一小段，判据与
+    `_is_visually_no_op_suggestion` 共用（`_normalize_lookalike`/`_diff_is_only_cjk_variants`），
+    保持两处判断标准一致。
+    """
+    def _replace(match: re.Match) -> str:
+        old, new = match.group(1).strip(), match.group(2).strip()
+        if old and new and (
+            _normalize_lookalike(old) == _normalize_lookalike(new)
+            or _diff_is_only_cjk_variants(old, new)
+        ):
+            return ""
+        return match.group(0)
+
+    return _FRAGMENT_WITH_LEADING_CONNECTOR_RE.sub(_replace, text).strip()
 
 
 def _dedup(issues: list[ClassifiedIssue]) -> tuple[list[ClassifiedIssue], int]:
