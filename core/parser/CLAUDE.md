@@ -6,7 +6,7 @@
 - **B类：无文字层扫描PDF**（`ocr_pdf.py`）—— 渲染为图片后用 PaddleOCR（版面检测 + 文本识别独立模型组合）+ paddlex 的 XY-Cut 算法还原阅读顺序。
 - **C类：Word**（`docx_parser.py`）—— python-docx 按段落顺序读取。先 try `docx.Document(path)`，撞上 `KeyError` 才退化到 `_repair_dangling_relationships` 修复后重试，详见下方"docx断链关系记录"一节。
 
-`_common.py` 存放 A/B 两条通道共用的坐标/分栏判定工具（`_find_extent_gap`/`_detect_column_split`/`_source_location`）；`_types.py` 存放公共数据结构（`ParsedBlock`/`ParsedDocument`）与异常，避免子模块互相反向依赖 `__init__.py` 造成循环导入；`__init__.py` 是唯一对外入口 `parse_document`，内部做 A/B 两类逐页结果的合并编排（`_parse_pdf`/`_majority_layout_mode`）。
+`_common.py` 存放 A/B 两条通道共用的坐标/分栏判定工具（`_find_extent_gap`/`_detect_column_split`/`_source_location`）；`_cjk_variants.py` 存放A类通道专用的字形变体字符（康熙部首等）源头归一化逻辑，详见下方"字形变体字符在源头归一化"一节；`_types.py` 存放公共数据结构（`ParsedBlock`/`ParsedDocument`）与异常，避免子模块互相反向依赖 `__init__.py` 造成循环导入；`__init__.py` 是唯一对外入口 `parse_document`，内部做 A/B 两类逐页结果的合并编排（`_parse_pdf`/`_majority_layout_mode`）。
 
 测试里 monkeypatch `_get_layout_pipeline`/`_run_structure` 等私有函数时要 `from core.parser import ocr_pdf as parser`——这些函数定义在 `ocr_pdf.py` 里，不是包顶层（见 `tests/test_parser.py`）。
 
@@ -180,6 +180,49 @@ B类OCR通道），概念上把对开页拆成两个逻辑页最干净（`doc_pa
 2. 更根本的问题是即使识别成功也解决不了病灶：真实校对诊断发现，"确定性错误"层里77%的问题定位在 `block_type=="table"` 的区域，而这些区域绝大多数根本不是需要校对的正文，是文档里插入的**说明性UI截图**（如菜单结构对比图）——截图里的内容压根不该被当作作者撰写的文字去校对，无论表格结构识别得多准都治标不治本。
 
 **这不是说table类区域里不可能有真实文档正文**（比如真正的数据表格、财务报表等）——如果以后真的遇到需要校对的表格化正文，"整体跳过"的规则会连带漏掉它，这是有意识接受的取舍（宁可漏判不复杂化）。真要支持，需要先能区分"表格化的正文"和"截图/示意图"两种情况，目前没有可靠信号能做这个区分（LayoutDetection只输出"table"这一个标签，不区分语义），留给以后真的遇到这种文档时再解决。测试见 `tests/test_parser.py::test_table_region_keeps_flat_joined_text`（确认table区域产出flat-join文本，不触发结构识别）和 `tests/test_chunker.py`（table类block不进入任何chunk的回归用例）。
+
+## 字形变体字符在源头归一化（`_cjk_variants.py`）
+
+真实文档诊断（`预览版 8-9月 电子版-2026e-works活动计划`）发现：这份PDF的字体ToUnicode
+CMap有缺陷，PyMuPDF按坐标提取出的正文汉字有2122处（19页刊物里）落在Unicode"康熙部首"
+（U+2F00~2FD5）/"CJK部首补充"（U+2E80~2EF3）等区块的码位上——肉眼和标准汉字毫无区别，
+但码位不同，LLM看到会产生各种困惑（把变体字符本身当错别字报出来只是最直接的一种，
+更隐蔽的是把原文本来重复出现的短语误判成"排版错乱要去重"、或对着满屏陌生码位的段落
+瞎猜续写）。在改这里之前，`core/classifier/postprocess.py` 已经有一套**反应式**防线
+（判断"LLM给出的改写建议和原文相比是不是只差这类变体"，命中就丢弃/降级/剔除reason里
+的无实质片段），但那套逻辑只能拦住"表现成具体某种措辞"的困惑，每冒出一种新的表现
+形式（如上面"误判成排版错乱"）就要再堵一个洞，属于治标不治本。
+
+**改为在解析阶段（A类原生PDF通道）直接归一化，LLM和后续所有环节压根不会再看到这些
+变体字符**：`native_pdf.py::_extract_native_page_raw` 拼出block文本后立即调用
+`_cjk_variants.py::normalize_cjk_variants`。真实文档回归验证：2122次出现，2021次
+（95.2%）被直接消除，剩余101次是故意不处理的"CJK部首补充"区块里没有安全归一化目标
+的纯偏旁部首字符（如"人字旁⺅"，从未独立成字），交给分类器那层的反应式防线继续兜底。
+
+**只做"目标字符可确定"的安全归一化，不做整个"CJK部首补充"区块的归一化**：康熙部首/
+CJK兼容汉字两个区块有Unicode官方NFKC分解数据，程序化算出映射表（比人工誊写更不容易
+出错，`_build_nfkc_variant_map` 直接查 `unicodedata`）；但CJK部首补充区块完全没有
+NFKC分解（这个区块定义上是"字典部首索引用的纯部首形式"，不是"规范汉字的兼容变体"），
+没有官方数据能程序化推导目标字符，贸然指定一个目标字符替换属于臆测，有把内容改错的
+风险——这正是 `postprocess.py` 里"部首→汉字"映射表被弃用的同一个教训，不重蹈覆辙。
+`_RADICAL_SUPPLEMENT_FOLD` 因此只收录了真实文档验证过的14个字符，且每一个都是靠
+Unicode官方字符名明确写出"C-SIMPLIFIED/J-SIMPLIFIED <某个独立汉字>"（如`⻔`=
+`CJK RADICAL C-SIMPLIFIED GATE`→`门`）才收录，不是凭字形目测——这个边界依据是权威
+数据，不是经验判断，未来遇到新字符可以用同样的方法（查 `unicodedata.name()`）安全
+扩表，不像早期那张视觉目测的表"用得越久越可能出错"。
+
+**这套归一化表和 `core/classifier/postprocess.py::_KANGXI_TRADITIONAL_FOLDINGS` 记录
+的是同一份Unicode事实（康熙部首NFKC分解结果是繁体字形，需折回简体），但两处独立维护，
+不是疏忽**：本模块是"源头主动归一化"，分类器那套是"反应式兜底"，覆盖本模块之外的
+场景（本模块没收录的CJK部首补充字符、理论上未来其他解析通道产生的类似伪影）——
+职责不同，不应该为了共享24行数据让两个关注点不同的模块产生强耦合。
+
+只影响A类原生PDF通道：B类OCR通道的文字来自PaddleOCR识别模型输出，不经过PDF字体
+ToUnicode映射，不存在这类伪影；C类Word通道同理。
+
+测试见 `tests/test_parser.py`"CJK变体字符源头归一化"一节：康熙部首直接NFKC、康熙部首
+繁体折回、CJK部首补充已知安全条目、CJK部首补充未收录字符原样保留、普通文本不受影响、
+`_extract_native_page_raw` 实际调用链路五/六条用例。
 
 ## 尝试：OCR文字识别模型换档（真实A/B测试后否决，未采用）
 

@@ -43,6 +43,8 @@
 
 **suggestion的措辞方式还会影响能不能抽出"新旧文本对"来比较**：常见的是"应改为『整段新文本』"（`_REPLACEMENT_SUGGESTION_RE`，和 `original_text` 整体比较），但真实数据里还出现了"『旧片段』应改为『新片段』"这种只描述 `original_text` 里某一个字/词该换的措辞（如 `original_text="归⺟扣⾮净利润"`，`suggestion='"⺟"应改为"母"。'`）——如果只有整段比较逻辑，会因为『⺟』（1字）和 `original_text`（7字）长度不一致误判成"不是零改动"而漏判。`postprocess.py::_extract_replacement_pair` 因此优先尝试 `_FRAGMENT_REPLACEMENT_RE`（片段式，抽出的『旧』还要求确实在 `original_text` 里出现过，避免措辞不规范时抽到不相关文本），抽不到才退回整段式，两种都抽不到才判定"这条issue无法判定新旧对比，不参与零改动判定"。`_is_visually_no_op_suggestion`/`modifier_rules.py` 里空格差异降级（见下方规则J）共用这同一个抽取函数。
 
+**三种措辞模式都抽不到时，最后兜底把 `suggestion` 整体当候选新文本，不再返回None**：真实案例——`suggestion` 有时不套"应改为『X』"这层话术，字段内容就是修正后的文本本身（`original_text="AI 助力PMC实战进阶"`、`suggestion="AI助力PMC实战进阶"`，没有任何引号/动词包裹）。这种"裸"措辞是LLM输出格式的又一种变体，每冒出一种新变体就要为它专门加一条正则去识别，是在追着LLM的措辞打地鼠——`_extract_replacement_pair` 因此改为"三种已知模式都抽不到就直接拿 `suggestion.strip()` 本身当候选"，把"这算不算零改动/纯空格差异"完全交给后续判据（NFKC归一化相同、CJK变体diff、去空格比较）决定，不再额外识别"这段文本是不是裸替换文本"。这个兜底之所以安全，是因为真正的描述性建议（如"建议删除多余的'的'字"）内容和 `original_text` 本来就相差悬殊，天然通不过这几条判据，不会被误判成零改动或纯空格差异。
+
 判定（`postprocess.py::_is_visually_no_op_suggestion`，在 `classify_issues` 里于 `classify_issue` **之前**对 `RawIssue` 列表整体过滤，不是叠加在某条已归层结果上的修饰规则）：`_extract_replacement_pair` 抽出"旧→新"文本对后，三条判据取或——① 都过 `_normalize_lookalike`（纯NFKC）后相同；② `_diff_is_only_cjk_variants` 判定差异全在字形变体上；③ `_fragment_is_only_cjk_variants` 在原文里找到与建议等长、只差字形变体的窗口。`_has_stray_control_chars` 独立检查 `original_text` 是否含 `\t\n\r` 之外的Unicode `Cc`类控制字符，命中即无条件丢弃（不依赖suggestion内容——控制字符本身就证明这段"原文"是解析垃圾）。
 
 **第③条针对的是这类假问题最常见的形态**：LLM引用一整行原文当 `original_text`，却只在建议里写要改的那个词（原文`能⼒，直接决定了企业的市场竞争⼒。尤其是从事⼤`、建议`应改为"能力"`）。这种措辞既不符合 `_FRAGMENT_REPLACEMENT_RE` 的"『旧』应改为『新』"格式，整段比对时长度又对不上，前两条都接不住。
@@ -51,9 +53,11 @@
 
 **处理方式是直接丢弃，不是降级**：与规则C/D/G/H/I/J"降级为存疑待核实、保留可审计性"的一般惯例不同，这是用户明确要求的特例——这类issue已经确认是零改动的假问题/解析垃圾，不存在"人工核实"的价值。`classify_issues` 返回的 `warnings` 里会分别记"丢弃N条视觉无实质改动的建议"/"丢弃N条解析产生乱码字符的问题"，与"跨块去重丢弃N条重复问题"是同一模式，供 `_render_stats` 的"提示信息"面板展示，不是悄无声息地消失。
 
-测试见 `tests/test_classifier.py` "视觉无实质改动的建议过滤" 一节：字面完全相同丢弃、Kangxi Radicals区块Unicode兼容变体（真实用 `unicodedata.normalize` 验证过康熙部首"⽉"确实归一化等于"月"）丢弃、CJK Radicals Supplement区块无NFKC分解的部首替代字（"⻔"→"门"）丢弃、片段式措辞在更长original_text里的零改动丢弃、控制字符乱码丢弃、真实改写不误伤、"存疑"类引用原文不误伤七条用例。
+测试见 `tests/test_classifier.py` "视觉无实质改动的建议过滤" 一节：字面完全相同丢弃、Kangxi Radicals区块Unicode兼容变体（真实用 `unicodedata.normalize` 验证过康熙部首"⽉"确实归一化等于"月"）丢弃、CJK Radicals Supplement区块无NFKC分解的部首替代字（"⻔"→"门"）丢弃、片段式措辞在更长original_text里的零改动丢弃、控制字符乱码丢弃、真实改写不误伤、"存疑"类引用原文不误伤、裸措辞（无"应改为"包裹）零改动丢弃、裸措辞不误伤描述性建议九条用例。
 
 **改动验证方式（真实数据回放）**：把 `data/app.db` 里同一份刊物三次校对记录（record 45/46/47）的全部 issue 重新过一遍过滤器——record 47（改动前漏出的那次）71条丢21条，而**record 45/46 丢弃数为0**，证明新判据只拦到了原先漏网的字形变体假错误，没有误伤历史上已经正常保留的结果。调规则时建议照此回放，比只看单元测试更能暴露误伤。
+
+**这套过滤只检查 `raw.suggestion`，覆盖不到规则A(`_rule_quotation`)展示给用户的 `raw.reason`**——真实案例：书名号命中引文保护、"原文照录不建议改动"，但LLM把两个疑点写进同一句reason里，"编号与标题之间的标点格式不统一，应为'4.'"是真疑点，"'⼊表'应为'入表'"纯粹是部首编码伪影（⼊是"入"的康熙部首变体），`_filter_visually_no_op` 只看 `raw.suggestion` 整条是否零改动，从未检查过 `raw.reason`，这类噪声就原样展示成"疑点供参考"，误导核实方向。`_rule_quotation` 因此单独调用 `_strip_visually_no_op_fragments`（`postprocess.py`）对 `raw.reason` 做片段级剔除，不是整条丢弃——两个疑点混在同一句话里，整条丢会连真疑点一起丢，只能挑出零改动的那一段删掉（连同前面的"，且"/"、且"连接词一起删，避免留下悬空残句）；reason整句都是零改动时会退化成空字符串，此时 fallback 成不带冒号的"原文照录，不建议改动。"，不留"疑点供参考："空尾巴。判据复用 `_normalize_lookalike`/`_diff_is_only_cjk_variants`，与上面的整条丢弃逻辑标准一致。测试见 `tests/test_classifier.py::test_rule_a_strips_cjk_variant_fragment_from_reason_but_keeps_real_doubt`/`test_rule_a_reason_entirely_cjk_variant_falls_back_to_bare_suggestion`。
 
 ## 规则G：知识时效性误判豁免
 
@@ -83,11 +87,13 @@
 
 现象：即使前面的丢弃过滤器（视觉无实质改动/控制字符乱码）已经拦掉了一部分假问题，真实数据（`data/app.db` 35号记录，99条被判"确定性错误"的issue，抽样核实后逐一分类统计）显示仍有残留，且能归成两类稳定的模式：① LLM自己在 `reason`/`suggestion` 里承认"此处排版错乱""跨行错位""乱码"（PDF多栏排版/表格/图注被解析打乱语序、内容拼接错行）——LLM是老实交代了"我也没看懂这段被打乱的版面"，这不是语言本身的确定性错误；② `suggestion` 建议的替换内容和 `original_text` 的唯一差异是空格数量（如 `"2 0 2 5年9⽉1 1⽇"` → `"2025年9月11日"`，数字/日期被拆开插入了空格），空格大概率是PDF跨行拼接、装饰性字间距等排版原因产生的解析伪影，原文本身是否真的多/少这个空格，无法仅凭文本内容判断，达不到"确定性错误"的把握。两种情况共同点：都不是"一眼就能看出"的确定性错误，必须至少降级为存疑，不能留在错误类——但也不能像视觉无实质改动那样直接丢弃，因为不能100%确定原文真的没有这处问题（保留可审计性，让用户自己核实）。
 
-判定条件（`modifier_rules.py::_apply_layout_and_space_artifact_downgrade`，插在规则I之后、规则G之前）：`state.layer == config.LAYER_CONFIRMED`（更宽松的层级不需要再降）**且**（`reason`/`suggestion` 命中 `config.LAYOUT_ARTIFACT_KEYWORDS`（"排版错乱""跨行""错行""错位""乱码""段落顺序""图片位置"，真实数据里LLM原话摘出）**或者** `_extract_replacement_pair`（与视觉无实质改动过滤共用的抽取函数）抽出的"旧→新"文本对里，至少一侧确实含空格，且两者都过 `_strip_whitespace(_normalize_lookalike(...))` 后完全相同）。命中后强制改判"存疑待核实"+最低优先级，`suggestion` 前缀说明原因，`layer_notes` 记录判定依据，与规则C/D/G/H"降级不剔除、保留可审计性"的哲学一致。
+判定条件（`modifier_rules.py::_apply_layout_and_space_artifact_downgrade`，插在规则I之后、规则G之前）：`state.layer` 是"确定性错误"**或**"存疑待核实"（比这两层更宽松的引文类/风格类已经是落定分类，不该被这条通用诊断二次改写）**且**（`reason`/`suggestion` 命中 `config.LAYOUT_ARTIFACT_KEYWORDS`（"排版错乱""跨行""错行""错位""乱码""段落顺序""图片位置"，真实数据里LLM原话摘出）**或者** `_extract_replacement_pair`（与视觉无实质改动过滤共用的抽取函数）抽出的"旧→新"文本对里，至少一侧确实含空格，且两者都过 `_strip_whitespace(_normalize_lookalike(...))` 后完全相同）。命中后强制改判"存疑待核实"+最低优先级（layer已经是存疑待核实时相当于原地不动，只把优先级压到最低、补上更具体的诊断），`suggestion` 前缀说明原因，`layer_notes` 记录判定依据，与规则C/D/G/H"降级不剔除、保留可审计性"的哲学一致。
+
+**为什么要接受"存疑待核实"这一层，而不是只认"确定性错误"**：真实案例——某条issue先被规则D（未定位）从确定性错误封顶降到存疑待核实，此时如果本规则仍然只认 `state.layer == 确定性错误`，会直接跳过，最终结果停在"存疑待核实/中优先级"，用户只看得到"原文未能定位回原稿"这个笼统原因，看不出这其实是纯空格差异、根本不用人工核实——丢失了更有价值的具体诊断。规则C/D自身的实现方式（`_apply_ocr_downgrade`/`_apply_unlocated_cap`）不受这个问题影响：它们无论 `state.layer` 当前是什么，都无条件先追加notes/suggestion前缀，只在决定"要不要真的改layer"这一步才检查`==确定性错误`；而规则I/J是在**入口**就用`state.layer != 确定性错误`整体拦掉，一旦有别的规则抢先降过级，后续更具体的诊断就再也没有机会补充。规则J因此放宽到"确定性错误或存疑待核实都生效"；规则I（`_apply_linewrap_space_artifact_downgrade`）暂未做同样放宽——它依赖 `block` 做子串匹配，"未定位"场景下 `block_index` 本身通常缺失（见 `__init__.py::classify_issue` 的block查找逻辑），guard提前用 `if block is None: return state` 挡住，不会撞上这个交互，暂不需要跟进。
 
 **空格差异比较为什么要先套 `_normalize_lookalike` 再去空格，而不是直接比较原始文本去空格**：真实案例里空格差异经常和部首替代字**同时**出现在同一条issue里（`"2 0 2 5年9⽉1 1⽇"` 里"⽉"既是部首替代字又混着空格差异）——如果只对原始文本去空格再比较，会因为"⽉"≠"月"（字符本身不相等）判定"不匹配"而漏判这条本该降级的issue。两次归一化叠加使用（先部首替代修正，再去空格），才能同时覆盖"纯空格差异"和"空格+部首替代字混合"两种真实出现过的场景。
 
-测试见 `tests/test_classifier.py` "规则J" 一节：版式错乱措辞降级、空格差异+部首替代字混合降级、真实拼写错误（"Linxu"→"Linux"）不误伤三条用例。
+测试见 `tests/test_classifier.py` "规则J" 一节：版式错乱措辞降级、空格差异+部首替代字混合降级、真实拼写错误（"Linxu"→"Linux"）不误伤、已被规则D降级后规则J仍补充诊断、规则J不覆盖引文保护五条用例。
 
 **已知的残留场景（未覆盖，接受漏判）**：同一份真实文档里还观察到两类更难通用识别的假问题，本次没有针对性处理——① 极少数原文段落被拆分/重排后不只是空格差异，而是**字符顺序整体打乱**（如封面标题"岁末盘点"被解析成"岁 末点 盘"，不是简单加/减空格，去空格比较后内容也对不上）；② 某个特定字体把标点符号（句号/逗号）错误映射成了一个生僻汉字"盓"，在这份文档里反复出现（5处），但这是这份文档专属的字体子集化bug特征，不是可以泛化到其他文档的通用模式，没有像部首替代表那样单独处理。这两类目前仍会落在"确定性错误"层，人工核实时需要留意。另外调试时还发现一个和本次改动无关但同批数据暴露出的现有问题：`base_rules.py::_rule_default` 对 `confidence=="high"` 的issue无条件判"确定性错误"，不检查 `suggestion` 是否已经以"存疑"开头（`_rule_factual` 的medium/low分支有这个检查，`_rule_default` 没有）——真实数据里出现过LLM自报高置信度、但suggestion原文写着"存疑，建议人工核实：..."的矛盾案例，这条issue因此被错误分到了错误类；这是 `_rule_default` 自身的既有逻辑缺口，不属于本节任何一条新规则的范围，未在本次改动中处理。
 

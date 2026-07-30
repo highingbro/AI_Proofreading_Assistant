@@ -86,6 +86,35 @@ def test_rule_a_classical_particle_density_heuristic():
     assert issue.layer == config.LAYER_QUOTATION
 
 
+def test_rule_a_strips_cjk_variant_fragment_from_reason_but_keeps_real_doubt():
+    """真实案例：书名号命中引文保护，但LLM把两个疑点写进同一句reason——"编号与标题之间
+    的标点格式不统一，应为'4.'"是真疑点，"'⼊表'应为'入表'"纯粹是这份PDF的部首编码伪影
+    （⼊是"入"的康熙部首变体，肉眼无异）。展示给用户的"疑点供参考"必须剔除后者，保留前者。
+    """
+    raw = _raw_issue(
+        category="normal", issue_type="语法结构问题",
+        original_text="4《 . 企业数据资产管理及⼊表实践》",
+        reason="编号与标题之间的标点格式不统一，应为\"4.\"，且\"⼊表\"应为\"入表\"",
+    )
+    issue = classify_issue(raw, {})
+    assert issue.layer == config.LAYER_QUOTATION
+    assert "应为\"4.\"" in issue.suggestion
+    assert "⼊表" not in issue.suggestion
+    assert "入表" not in issue.suggestion
+
+
+def test_rule_a_reason_entirely_cjk_variant_falls_back_to_bare_suggestion():
+    """reason整句都是零改动的部首编码伪影时，剔除后不留悬空的"疑点供参考："冒号。"""
+    raw = _raw_issue(
+        category="quotation", issue_type="引用与成语准确性",
+        original_text="《客⼾满意度报告》",
+        reason="\"客⼾\"应为\"客户\"",
+    )
+    issue = classify_issue(raw, {})
+    assert issue.layer == config.LAYER_QUOTATION
+    assert issue.suggestion == "原文照录，不建议改动。"
+
+
 # ---------------------------------------------------------------------------
 # 规则B：事实性置信度降级
 # ---------------------------------------------------------------------------
@@ -723,6 +752,36 @@ def test_no_op_filter_drops_fragment_style_suggestion_within_longer_original_tex
     assert result.issues == []
 
 
+def test_no_op_filter_drops_bare_suggestion_with_no_wrapper_wording():
+    """真实案例：LLM有时不套"应改为『X』"这层话术，suggestion字段就是修正后的文本
+    本身（没有任何引号/动词包裹）。三种既有的抽取模式（片段式/整段贪婪/整段非贪婪）
+    全部要求suggestion里出现"应改为/应为/改为"这几个词或引号，这种"裸"措辞会全部
+    抽取失败，导致零改动判定形同虚设——每冒出一种新措辞就要新增一条正则，属于在
+    追着LLM的措辞打地鼠。`_extract_replacement_pair` 因此加了兜底：三种已知模式都
+    抽不到时，把suggestion整体当候选新文本，交给后续判据（本例是NFKC归一化后相同）
+    决定是不是真的零改动。"""
+    parsed = _parsed([_block(block_index=0)])
+    raw = _raw_issue(block_index=0, original_text="⼤数据管理师认证培训班", suggestion="大数据管理师认证培训班")
+    result = classify_issues(ProofreadResult(issues=[raw], chunk_warnings=[]), parsed)
+
+    assert result.issues == []
+
+
+def test_no_op_filter_does_not_drop_bare_descriptive_suggestion():
+    """**误伤防线**：裸文本兜底不能把纯描述性建议（不是"修正后的完整文本"，而是在
+    说明要做什么改动）误判成零改动——这类文本内容和original_text本来就相差悬殊，
+    NFKC/CJK变体/去空格比较都通不过，不需要额外识别"这是不是裸替换文本"。"""
+    parsed = _parsed([_block(block_index=0)])
+    raw = _raw_issue(
+        block_index=0,
+        original_text="他的的确很努力",
+        suggestion="建议删除多余的'的'字",
+    )
+    result = classify_issues(ProofreadResult(issues=[raw], chunk_warnings=[]), parsed)
+
+    assert len(result.issues) == 1
+
+
 def test_no_op_filter_drops_control_char_garbage():
     """真实案例：original_text里混入了PDF字体解析产生的SOH等控制字符（如私有区符号
     被误解析成控制码），这是解析垃圾，没有核实价值，无论suggestion说什么都直接丢弃。"""
@@ -774,6 +833,42 @@ def test_rule_j_does_not_trigger_for_genuine_typo():
     raw = _raw_issue(original_text="而Linxu生态", suggestion='"Linxu"应改为"Linux"。')
     issue = classify_issue(raw, {})
     assert issue.layer == config.LAYER_CONFIRMED
+
+
+def test_rule_j_still_diagnoses_space_diff_after_already_downgraded_by_rule_d():
+    """真实案例：original_text="AI 助力PMC实战进阶"、suggestion（裸文本无包裹措辞）
+    "AI助力PMC实战进阶"，且这条issue因未定位（规则D）已经先把layer从确定性错误降到
+    存疑待核实。旧实现里规则J只认`state.layer==确定性错误`，规则D抢先一步后规则J
+    直接跳过——最终结果停在"存疑待核实/中优先级"，用户只看得到"未定位"这个笼统原因，
+    看不出这其实是纯空格差异、根本不用人工核实。规则J放宽到"确定性错误或存疑待核实
+    都生效"后，即使layer已经不需要再变，仍应该把优先级降到最低、把更具体的"仅空格
+    差异"诊断追加进suggestion/notes。"""
+    raw = _raw_issue(
+        original_text="AI 助力PMC实战进阶",
+        suggestion="AI助力PMC实战进阶",
+        located=False,
+        block_index=None,
+    )
+    issue = classify_issue(raw, {})
+    assert issue.layer == config.LAYER_DOUBTFUL
+    assert issue.priority == config.PRIORITY_LOW
+    assert "空格" in _notes_text(issue)
+    assert issue.suggestion.startswith("该问题与原文的差异只有空格")
+
+
+def test_rule_j_does_not_override_quotation_protection():
+    """规则J放宽后仍不能覆盖到引文类/风格类——这两层是已经落定的分类结果（"原文照录
+    不建议改动"/纯风格问题），不该被"仅空格差异"这条通用诊断二次改写。书名号命中
+    引文保护，即使original_text和suggestion之间恰好只差空格，也必须维持引文类，
+    suggestion维持"原文照录"这套话术。"""
+    raw = _raw_issue(
+        category="normal", issue_type="标点符号问题",
+        original_text="《AI 助力PMC实战进阶》",
+        suggestion="《AI助力PMC实战进阶》",
+    )
+    issue = classify_issue(raw, {})
+    assert issue.layer == config.LAYER_QUOTATION
+    assert issue.suggestion.startswith("原文照录，不建议改动。")
 
 
 # ---------------------------------------------------------------------------

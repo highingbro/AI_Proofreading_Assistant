@@ -152,6 +152,80 @@ def test_native_pdf_barely_overlapping_lines_still_join_with_newline():
     assert raw_blocks[0]["text"] == "第一行文字：\n第二行文字。"
 
 
+# ---------------------------------------------------------------------------
+# CJK变体字符源头归一化（core/parser/_cjk_variants.py）：破损的PDF字体ToUnicode
+# CMap有时把正文汉字映射到"康熙部首"等码位上，肉眼和标准汉字无异但码位不同，
+# 会让LLM产生各种困惑（详见该模块顶部docstring）。在_extract_native_page_raw
+# 拼出block文本后立即归一化，下游全程只看到干净文本。
+# ---------------------------------------------------------------------------
+
+def test_normalize_cjk_variants_kangxi_radical_direct_nfkc():
+    from core.parser._cjk_variants import normalize_cjk_variants
+
+    assert normalize_cjk_variants("⼯业互联⽹") == "工业互联网"
+
+
+def test_normalize_cjk_variants_kangxi_radical_traditional_fold():
+    """康熙部首区NFKC分解结果是繁体字形（⼾→戶），简体正文里代表的其实是简体字，
+    必须靠折回表落回"户"，不能直接采信NFKC分解结果。"""
+    from core.parser._cjk_variants import normalize_cjk_variants
+
+    assert normalize_cjk_variants("客⼾满意度") == "客户满意度"
+
+
+def test_normalize_cjk_variants_radical_supplement_known_safe_entry():
+    """CJK部首补充区块本身没有NFKC分解，靠人工核对过的安全子表（源自Unicode官方
+    字符名，见 _cjk_variants.py）归一化，真实文档验证过的字符（⻔=门）。"""
+    from core.parser._cjk_variants import normalize_cjk_variants
+
+    assert normalize_cjk_variants("⻋⻔已锁") == "车门已锁"
+
+
+def test_normalize_cjk_variants_radical_supplement_unmapped_char_untouched():
+    """CJK部首补充区块里不在安全子表中的字符（如纯偏旁部首"⺅"人字旁，从未独立成字）
+    原样保留，不臆测替换目标——交给分类器那层的反应式防线兜底，不在这里冒险改错内容。"""
+    from core.parser._cjk_variants import normalize_cjk_variants
+
+    assert normalize_cjk_variants("测试⺅字符") == "测试⺅字符"
+
+
+def test_normalize_cjk_variants_ordinary_text_untouched():
+    from core.parser._cjk_variants import normalize_cjk_variants
+
+    text = "普通正文，不含任何变体字符。ABC123"
+    assert normalize_cjk_variants(text) == text
+
+
+class _FakeNativePageCjkVariant:
+    """真实场景复现：破损字体把"工业互联网"里的"工"和"网"映射到康熙部首码位，
+    验证 _extract_native_page_raw 在拼出block文本后确实做了归一化，不只是
+    normalize_cjk_variants 函数本身正确。"""
+
+    def get_text(self, mode):
+        assert mode == "dict"
+        return {
+            "width": 600.0,
+            "height": 800.0,
+            "blocks": [
+                {
+                    "type": 0,
+                    "bbox": (50.0, 100.0, 550.0, 116.0),
+                    "lines": [
+                        {"bbox": (50.0, 100.0, 200.0, 116.0), "spans": [{"text": "⼯业互联⽹平台", "size": 12.0}]},
+                    ],
+                }
+            ],
+        }
+
+
+def test_native_pdf_extract_normalizes_cjk_variants_in_block_text():
+    from core.parser.native_pdf import _extract_native_page_raw
+
+    raw_blocks, _ = _extract_native_page_raw(_FakeNativePageCjkVariant())
+
+    assert raw_blocks[0]["text"] == "工业互联网平台"
+
+
 class _FakeNativePageSpreadMisjoin:
     """补丁回归测试用：跨页对开版面（一个物理页印着左右两个页码）里，左页和右页同一
     水平线上两块**毫不相干**的文字，y轴100%重叠但横向相距半个页面，被PyMuPDF聚成了

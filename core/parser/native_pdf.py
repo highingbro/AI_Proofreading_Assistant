@@ -11,6 +11,7 @@ import statistics
 from collections import Counter
 
 import config
+from core.parser._cjk_variants import normalize_cjk_variants
 from core.parser._common import _detect_column_boundaries, _source_location
 
 _NUMERIC_ZONE_RE = re.compile(r"^[\dIVXLCDMivxlcdm\-\.\s]{1,10}$")      # 匹配纯页码/罗马数字页码/带破折号的页码范围/带逗号，长度不超过10字符
@@ -117,6 +118,11 @@ def _extract_native_page_raw(page: "fitz.Page") -> tuple[list[dict], float]:
             text += sep + lines_text[i]
         if not text:
             continue
+        # 破损的PDF字体ToUnicode CMap有时会把正文汉字映射到"康熙部首"等码位上——
+        # 肉眼和标准汉字无异，但会让LLM困惑（见 core/parser/_cjk_variants.py 顶部
+        # docstring）。在这里、也就是文本刚拼出来的最早时机归一化，后续分块/校对/
+        # 分层全程看到的都是干净文本。
+        text = normalize_cjk_variants(text)
         avg_size = sum(sizes) / len(sizes) if sizes else 0.0  # 这个block的平均字号，供后续判断是否为标题用
         bbox = tuple(b["bbox"])
         out.append({"text": text, "bbox": bbox, "avg_size": avg_size, "zone": _zone_of(bbox, height)})

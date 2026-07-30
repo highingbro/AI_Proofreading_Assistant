@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import config
 from core.classifier.heuristics import _has_factual_feature, _has_quotation_feature
+from core.classifier.postprocess import _strip_visually_no_op_fragments
 from core.proofreader import RawIssue
 
 # LLM自报的confidence原始取值是英文字面量("high"/"medium"/"low")，layer_notes面向
@@ -30,7 +31,11 @@ def _rule_quotation(raw: RawIssue, mode: str):
         notes.append("original_text命中引文文本特征(书名号/长引号/文言虚词)")
     if not notes:
         return None
-    suggestion = f"原文照录，不建议改动。LLM提示的疑点供参考：{raw.reason}"
+    reason = _strip_visually_no_op_fragments(raw.reason or "")
+    if reason:
+        suggestion = f"原文照录，不建议改动。LLM提示的疑点供参考：{reason}"
+    else:
+        suggestion = "原文照录，不建议改动。"
     return config.LAYER_QUOTATION, config.PRIORITY_LOW, suggestion, notes
 
 

@@ -11,7 +11,7 @@
 app.py              Streamlit 入口（任务选择闸门+标准校对流+Excel导出+追问+历史记录详情页+反馈学习管理+原稿比对）——UI设计决策见文件顶部 docstring
 config.py           全局配置：路径、任务状态常量、分层/优先级常量、LLM配置、结果分层阈值、追问上下文配置、反馈学习阈值、OCR相关参数
 core/
-  parser/           文档解析（已实现）——PDF/Word 统一解析，子目录拆成 native_pdf.py(A类)/ocr_pdf.py(B类)/docx_parser.py(C类)/_common.py/_types.py，详见 core/parser/CLAUDE.md
+  parser/           文档解析（已实现）——PDF/Word 统一解析，子目录拆成 native_pdf.py(A类)/ocr_pdf.py(B类)/docx_parser.py(C类)/_common.py/_cjk_variants.py/_types.py，详见 core/parser/CLAUDE.md
   chunker/          长文档分块（已实现）——子目录拆成 _types.py/fill_units.py/greedy_fill.py/locate.py，详见 core/chunker/CLAUDE.md
   llm_client.py     LLM调用封装（已实现，单文件）——设计决策见文件顶部 docstring
   proofreader/      校对提示词组装 + 单块/全文档校对（已实现）——子目录拆成 _types.py/prompt_builder.py/response_parser.py/locator.py，详见 core/proofreader/CLAUDE.md
