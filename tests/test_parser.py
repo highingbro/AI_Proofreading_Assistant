@@ -226,6 +226,76 @@ def test_native_pdf_extract_normalizes_cjk_variants_in_block_text():
     assert raw_blocks[0]["text"] == "工业互联网平台"
 
 
+# ---------------------------------------------------------------------------
+# 字体未提供Unicode映射的占位码位（`\x01`）在源头删除
+# 与上面那节同一类根因（PDF字体ToUnicode CMap有缺陷）但处置相反：那类映到了"看得懂
+# 只是码位不对"的汉字要归一化，这类映不出任何字符、本身也不是文字（设计软件画的项目
+# 符号/小箭头/CTA图标）要整个删掉。详见 native_pdf.py::_strip_unmapped_glyph_chars。
+# ---------------------------------------------------------------------------
+
+def test_strip_unmapped_glyph_chars_removes_control_codes():
+    from core.parser.native_pdf import _strip_unmapped_glyph_chars
+
+    assert _strip_unmapped_glyph_chars("\x01活动\x01\x01日历\x00") == "活动日历"
+
+
+def test_strip_unmapped_glyph_chars_keeps_newline_separator():
+    """`\\n` 是本模块拼接block内多行时自己插入的分隔符（不是PDF里的字符），必须留下——
+    删掉会把本该独立的两行糊成一句病句，正是 core/parser/CLAUDE.md"block内多行拼接必须
+    用换行符"一节讲的那个坑。"""
+    from core.parser.native_pdf import _strip_unmapped_glyph_chars
+
+    assert _strip_unmapped_glyph_chars("目前的局限性：\n\x01下一行内容") == "目前的局限性：\n下一行内容"
+
+
+def test_strip_unmapped_glyph_chars_keeps_private_use_bullets():
+    """私有使用区的符号字体项目符号（Wingdings `U+F0D8` 等）承载"这是一个列表项"的语义，
+    不在删除范围内——它已由 _lines_share_same_row 用空格拼进正文，删掉反而丢信息。
+    ★ 这条是防"顺手把PUA一起删了"。"""
+    from core.parser.native_pdf import _strip_unmapped_glyph_chars
+
+    assert _strip_unmapped_glyph_chars(" 系统管理员享有") == " 系统管理员享有"
+
+
+def test_strip_unmapped_glyph_chars_ordinary_text_untouched():
+    from core.parser.native_pdf import _strip_unmapped_glyph_chars
+
+    text = "普通正文，含英文 APS 与数字 2026。"
+    assert _strip_unmapped_glyph_chars(text) == text
+
+
+class _FakeNativePageUnmappedGlyphs:
+    """真实场景复现：一整行只有装饰图标（`\\x01`），以及正文行里夹着图标占位码位。
+    坐标让两行在y轴上完全不重叠，代表纵向真正独立的两行。"""
+
+    def get_text(self, mode):
+        assert mode == "dict"
+        return {
+            "width": 600.0,
+            "height": 800.0,
+            "blocks": [
+                {
+                    "type": 0,
+                    "bbox": (50.0, 100.0, 550.0, 140.0),
+                    "lines": [
+                        {"bbox": (50.0, 100.0, 60.0, 115.0), "spans": [{"text": "\x01", "size": 12.0}]},
+                        {"bbox": (50.0, 120.0, 300.0, 135.0), "spans": [{"text": "e-works\x01简介", "size": 12.0}]},
+                    ],
+                }
+            ],
+        }
+
+
+def test_native_pdf_extract_strips_unmapped_glyphs_and_drops_icon_only_line():
+    """整行只有装饰图标时该行整体消失（不留一个空行），正文行里的占位码位也被删净。"""
+    from core.parser.native_pdf import _extract_native_page_raw
+
+    raw_blocks, _ = _extract_native_page_raw(_FakeNativePageUnmappedGlyphs())
+
+    assert len(raw_blocks) == 1
+    assert raw_blocks[0]["text"] == "e-works简介"
+
+
 class _FakeNativePageSpreadMisjoin:
     """补丁回归测试用：跨页对开版面（一个物理页印着左右两个页码）里，左页和右页同一
     水平线上两块**毫不相干**的文字，y轴100%重叠但横向相距半个页面，被PyMuPDF聚成了

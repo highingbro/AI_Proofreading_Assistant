@@ -85,6 +85,28 @@ def _lines_vertically_adjacent(bbox_a: tuple[float, float, float, float], bbox_b
     return (bbox_b[1] - bbox_a[3]) <= height_a * config.NATIVE_WRAP_MAX_LINE_GAP_RATIO
 
 
+def _strip_unmapped_glyph_chars(text: str) -> str:
+    """删掉 C0 控制字符（`\\n` 除外）——它们是"字体没给这个字形提供Unicode映射"的占位码位。
+
+    根因和 `_cjk_variants.py` 处理的那类是同一个（PDF字体的ToUnicode CMap有缺陷），但表现
+    和处置相反：康熙部首那类映到了"看得懂、只是码位不对"的汉字，要**归一化成正确的字**；
+    这类映不出任何字符、PyMuPDF只能给个 `U+0001` 占位，而且它们本来就**不是文字**——实测
+    出现位置全是 `\\x01活动日历`、`\\x01\\x01抢占席位`、`e-works\\x01` 这种，是设计软件画的
+    项目符号/小箭头/CTA图标，所以要**整个删掉**而不是替换。三份期刊共1637个，普通
+    Word→PDF（`sample.pdf`）里0个，是"设计软件导出的PDF"特有的。
+
+    **保留 `\\n`**：那是本模块自己拼接block内多行时插入的分隔符，不是PDF里的字符。制表符
+    等其他C0字符实测不出现；即使出现也照删——PDF里的字间距完全由坐标决定，不靠制表符
+    排版，删掉不丢信息。
+
+    **私有使用区（PUA）的字符不在处理范围内，不要顺手加进来**：那是另一回事——Wingdings
+    之类符号字体的项目符号（如 `U+F0D8`，武昌首义手册里88个），它承载"这是一个列表项"的
+    语义，已经由 `_lines_share_same_row` 用空格拼进正文（见 core/parser/CLAUDE.md
+    "PyMuPDF把同一视觉行误拆成两个line时"一节），删掉反而会丢信息。
+    """
+    return "".join(ch for ch in text if ch == "\n" or not (ord(ch) < 0x20 or ord(ch) == 0x7F))
+
+
 def _extract_native_page_raw(page: "fitz.Page") -> tuple[list[dict], float]:
     """从有文字层的PDF页面里，按PyMuPDF给出的坐标提取所有文本块的原始信息。
 
@@ -102,7 +124,10 @@ def _extract_native_page_raw(page: "fitz.Page") -> tuple[list[dict], float]:
         sizes = []
         for line in b["lines"]:
             # 一个block可能包含多行(line)，每行又由多个span组成（比如中途换了字体/字号）
-            t = "".join(s["text"] for s in line["spans"])
+            # 在**拼接之前**逐行删占位码位：整行只有装饰图标时它会变成空串、连同它的bbox
+            # 一起不进 line_bboxes，相邻两行的同行判定就直接对彼此做，不会被一个不含文字的
+            # "行"隔开。放到拼完之后再删就晚了。
+            t = _strip_unmapped_glyph_chars("".join(s["text"] for s in line["spans"]))
             if t.strip():
                 lines_text.append(t.strip())
                 line_bboxes.append(line["bbox"])
