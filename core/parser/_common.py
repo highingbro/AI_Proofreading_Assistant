@@ -1,7 +1,11 @@
-"""A类(原生PDF)与B类(OCR)通道共用的坐标/分栏判定工具。
+"""B类(OCR)通道的分栏判定，以及 A/B 两条通道共用的位置描述拼装。
 
-从 core/parser.py 拆分而来（原逻辑未改动）：两条通道各自的分块坐标结构
-字段一致（都有 "bbox"/"text"），共用同一套"找空白分栏带"算法。
+`_source_location` 是 A/B 共用的；`_find_extent_gap`/`_split_region`/
+`_detect_column_split` 这套"二值覆盖图 + 字符数统计"的分栏判定**只服务 B 类**——A 类
+已改用 `_columns.py` 的占用率剖面算法。两套并存不是疏漏：B 类的分栏结果只影响"左栏/
+右栏"这类位置描述措辞（阅读顺序由 paddlex 的 XY-Cut 独立算出，不看分栏），换算法的收益
+纯属措辞精度；而 B 类一页只有 3~23 个块（A 类 90~110），占用率剖面在这种稀疏度下的表现
+需要逐页目视核对才敢用，收益与风险不对等。详见 `core/parser/_columns.py` 顶部 docstring。
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ def _find_extent_gap(
     min_gap_ratio），说明不是真正的栏间距，判定为没有分栏。
 
     区域用 [lo, hi] 而不是"从0到页宽"表示，是为了让同一套算法既能在整页上找
-    主分栏线，又能在已经分出的半区里找下一层子栏间距（见 _detect_column_boundaries）。
+    主分栏线，又能在已分出的半区里找下一层子栏间距。
     """
     region_width = hi - lo
     if not extents or region_width <= 0:
@@ -66,34 +70,6 @@ def _find_extent_gap(
     if gap_width / region_width < min_gap_ratio:
         return None  # 空白带太窄，可能只是普通字间距，不采信为分栏线
     return lo + (best[0] + best[1]) / 2 * bin_width  # 返回空白带中点作为分栏线的x坐标
-
-
-def _content_extent(blocks: list[dict], region_width: float) -> tuple[float, float] | None:
-    """这批块横向上实际覆盖到的范围 (最左x0, 最右x1)，通栏块不计入。
-
-    给子栏检测用：半区的边界是上一层算出来的分栏线，直接拿它当区域宽度会把
-    页边距/半区两侧的空余一起算进去，band(中部40%~60%)的落点和空白带宽度占比
-    都会跟着偏；按实际内容范围算才对得上"这半区自己的中间在哪"。
-
-    **必须和 _split_region 用同一把尺子排除通栏块**（同一个
-    config.COLUMN_SPANNING_BLOCK_WIDTH_RATIO），否则两者对"这个区域有多宽"的
-    理解会打架：_split_region 剔除通栏块之后才画覆盖图，而这里若把通栏块算进
-    范围，算出的区域宽度是按通栏块撑开的，band 会落到区域外围去。真实案例
-    （跨页对开的活动手册）：PyMuPDF 把左页和右页同一水平线上的文字聚成一个
-    横跨整幅的 block，它的中心点落进左半区后，把左半区的"内容范围"从 [44,466]
-    撑成 [44,953]（整页宽），band 随之落到栏2和栏3之间的主分栏线附近而不是栏1
-    栏2之间的真实间隙上，子栏检测必然失败、四栏版面被判成两栏。
-
-    区域内全是通栏块时返回 None（没有可供判定栏结构的正文内容），由调用方
-    按"这个区域不再细分"处理。
-    """
-    if not blocks:
-        return None
-    max_block_width = region_width * config.COLUMN_SPANNING_BLOCK_WIDTH_RATIO
-    in_column = [b for b in blocks if (b["bbox"][2] - b["bbox"][0]) <= max_block_width]
-    if not in_column:
-        return None
-    return min(b["bbox"][0] for b in in_column), max(b["bbox"][2] for b in in_column)
 
 
 def _split_region(blocks: list[dict], lo: float, hi: float, min_gap_ratio: float) -> float | None:
@@ -137,41 +113,10 @@ def _split_region(blocks: list[dict], lo: float, hi: float, min_gap_ratio: float
 def _detect_column_split(blocks: list[dict], width: float) -> float | None:
     """判断整页是否存在有效分栏，返回主分栏线 x 坐标（无分栏返回 None）。
 
-    A类(PyMuPDF坐标)和B类(OCR版面区域)共用本函数：两边的block字典都带
-    "bbox"/"text"字段，几何判定逻辑完全通用。只关心"分不分栏"的调用方
-    （B类通道）用这个；要拿到全部栏边界的用 _detect_column_boundaries。
+    唯一调用点是 B 类的 `ocr_pdf.py::_ocr_and_order`——它只需要"分不分栏"这一个布尔
+    意义上的答案加一条分界线，不需要全部栏边界（A 类要全部边界，走 `_columns.py`）。
     """
     return _split_region(blocks, 0.0, width, config.COLUMN_MIN_GAP_WIDTH_RATIO)
-
-
-def _detect_column_boundaries(blocks: list[dict], width: float) -> list[float]:
-    """返回从左到右的全部分栏线 x 坐标，空列表表示单栏。
-
-    先找整页主分栏线，再在左右两个半区里各找一次子栏间距，因此结果只可能是
-    0条（单栏）、1条（两栏）或3条（四栏）。四栏是期刊/活动手册常见版面，只按
-    两栏理解会把栏1栏2的内容按y坐标交错输出，把跨栏续写的句子撕成"…建设重点、规"
-    + "与智能决策…"这种断句，LLM据此报出大量并不存在的错别字。
-
-    **要求左右两半都能再分才承认四栏**：单边能分的情况现实中多半不是真四栏，而是
-    半区里恰好排了一张多列表格（表格按列输出反而会把行打散，比原样按y排更糟），
-    对称性要求把这类误判挡在外面。同理不再往下递归第三层——真实版面没见过八栏。
-    """
-    top = _split_region(blocks, 0.0, width, config.COLUMN_MIN_GAP_WIDTH_RATIO)
-    if top is None:
-        return []
-    sub_splits = []
-    for lo, hi in ((0.0, top), (top, width)):
-        half = [b for b in blocks if lo <= (b["bbox"][0] + b["bbox"][2]) / 2 < hi]
-        extent = _content_extent(half, hi - lo)
-        if extent is None:
-            break
-        sub = _split_region(half, extent[0], extent[1], config.COLUMN_SUB_GAP_MIN_WIDTH_RATIO)
-        if sub is None:
-            break
-        sub_splits.append(sub)
-    if len(sub_splits) != 2:
-        return [top]
-    return sorted([top, *sub_splits])
 
 
 def _source_location(page_no: int, mode: str, column: str | None, doc_page: str | None = None) -> str:

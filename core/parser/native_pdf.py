@@ -12,7 +12,8 @@ from collections import Counter
 
 import config
 from core.parser._cjk_variants import normalize_cjk_variants
-from core.parser._common import _detect_column_boundaries, _source_location
+from core.parser._columns import _detect_column_boundaries
+from core.parser._common import _source_location
 
 _NUMERIC_ZONE_RE = re.compile(r"^[\dIVXLCDMivxlcdm\-\.\s]{1,10}$")      # 匹配纯页码/罗马数字页码/带破折号的页码范围/带逗号，长度不超过10字符
 

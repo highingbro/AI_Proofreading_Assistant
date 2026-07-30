@@ -264,11 +264,10 @@ def test_native_pdf_spread_far_apart_lines_join_with_newline():
 
 
 # ---------------------------------------------------------------------------
-# 补丁回归测试：跨页对开版面里横跨整幅的"误聚块"不得污染半区内容范围
-# （真实文档诊断：PyMuPDF把左右两页同一水平线上的文字聚成一个777pt宽的block，
-# 其中心点落进左半区后，把左半区内容范围从[44,466]撑成[44,953]整页宽，band随之
-# 落到主分栏线附近而不是栏1栏2之间的真实间隙，四栏版面被判成两栏，栏1栏2内容
-# 按y坐标交错输出；见 core/parser/CLAUDE.md"跨页对开版面"一节）
+# A类分栏检测（core/parser/_columns.py，分层占用率剖面）
+#
+# 全部纯构造几何、页宽统一 1000，不碰真实PDF。为什么这么算见该模块顶部 docstring；
+# 每条用例都做过反向验证（把对应机制退回旧行为，确认用例真的会红）。
 # ---------------------------------------------------------------------------
 
 def _symmetric_four_column_blocks() -> list[dict]:
@@ -280,43 +279,6 @@ def _symmetric_four_column_blocks() -> list[dict]:
             blocks.append({"text": "正文内容占位文字正文内容占位文字", "bbox": (col_x0, y, col_x1, y + 12.0)})
     return blocks
 
-
-def test_content_extent_excludes_spanning_blocks():
-    """半区内容范围必须和 _split_region 用同一把尺子排除通栏块，否则会被撑到整页宽。"""
-    from core.parser._common import _content_extent
-
-    half = [
-        {"text": "栏1正文", "bbox": (50.0, 150.0, 240.0, 162.0)},
-        {"text": "栏2正文", "bbox": (260.0, 150.0, 450.0, 162.0)},
-        {"text": "跨页误聚块", "bbox": (50.0, 100.0, 830.0, 115.0)},
-    ]
-
-    # 半区名义宽度500：780pt宽的误聚块超过 500*0.7，不该把内容范围撑到830
-    assert _content_extent(half, 500.0) == (50.0, 450.0)
-
-
-def test_detect_column_boundaries_finds_four_columns():
-    from core.parser._common import _detect_column_boundaries
-
-    assert len(_detect_column_boundaries(_symmetric_four_column_blocks(), 1000.0)) == 3
-
-
-def test_spread_merged_block_does_not_break_four_column_detection():
-    """加一个横跨整幅、中心点落在左半区的误聚块，四栏检测仍应成立。"""
-    from core.parser._common import _detect_column_boundaries
-
-    blocks = _symmetric_four_column_blocks()
-    blocks.append({"text": "联系方式\n造运营系统建设思路", "bbox": (50.0, 100.0, 830.0, 115.0)})
-
-    assert len(_detect_column_boundaries(blocks, 1000.0)) == 3
-
-
-# ---------------------------------------------------------------------------
-# A类分栏检测（core/parser/_columns.py，分层占用率剖面）
-#
-# 全部纯构造几何、页宽统一 1000，不碰真实PDF。为什么这么算见该模块顶部 docstring；
-# 每条用例都做过反向验证（把对应机制退回旧行为，确认用例真的会红）。
-# ---------------------------------------------------------------------------
 
 def _dense_four_column_blocks(rows: int = 50, row_pitch: float = 12.0) -> list[dict]:
     """行数可调的对称四栏页：栏1 x50-240、栏2 x260-450、栏3 x550-740、栏4 x760-950。
@@ -348,6 +310,22 @@ def test_columns_spanning_header_does_not_break_gap():
 
     blocks = _symmetric_four_column_blocks()
     blocks.append({"text": "某某期刊 2026年第8期", "bbox": (50.0, 60.0, 950.0, 75.0)})
+
+    assert len(_detect_column_boundaries(blocks, 1000.0)) == 3
+
+
+def test_columns_spread_merged_block_does_not_break_detection():
+    """跨页对开版面里 PyMuPDF 把左右两页同一水平线的文字聚成的"误聚块"不得搅乱分栏。
+
+    真实文档里这个块宽 777pt（页宽 1009）、**中心点落进左半区**，旧算法据此把左半区
+    内容范围从 [44,466] 撑成整页宽 [44,953]，中部搜索带随之落到主分栏线附近而不是
+    栏1|栏2 的真实间隙，四栏被判成两栏。新算法每层都用"剔通栏块之后"剩余块的范围，
+    这个块在任何一层都够宽、必被剔除。
+    """
+    from core.parser._columns import _detect_column_boundaries
+
+    blocks = _symmetric_four_column_blocks()
+    blocks.append({"text": "联系方式\n造运营系统建设思路", "bbox": (50.0, 100.0, 830.0, 115.0)})
 
     assert len(_detect_column_boundaries(blocks, 1000.0)) == 3
 

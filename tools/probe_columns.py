@@ -1,18 +1,20 @@
-"""分栏检测重写：只读探针（实施步骤1）。
+"""分栏检测只读探针：看每一页的占用率分布长什么样，以及栏数对各阈值有多敏感。
 
-在**不改动任何生产代码**的前提下，把"占用率剖面 + 栏宽变异系数"这套新算法内联在
-本脚本里跑一遍真实文档，产出标定 `config.COLUMN_*` 新常量所需的分布数据。新算法
-正式落地在 `core/parser/_columns.py` 之后，本脚本长期保留：新文档出分栏问题时第一步
-是跑它看分布，而不是直接调阈值。
+**新文档分栏出问题，第一步跑它、不要直接调 `config.COLUMN_A_*`**——那些阈值标定自同一家
+排版的 3 份期刊，两侧余量很窄（见 `tools/column_probe_data.md`），拍脑袋放大很容易在别处
+坏掉。算法本身的设计理由在 `core/parser/_columns.py` 顶部 docstring。
 
-新算法要解决的问题、三个根因和设计取舍见计划文档；这里只说探针本身：
-
-- **必须同时探 A/B 两条通道**：A类一个 block 是 PyMuPDF 的一个文本行，B类一个 block
-  是版面检测模型输出的整个区域，块颗粒度差一个数量级，占用率剖面的形状可能完全不同，
-  τ 阈值很可能要 A/B 各定一个。没有实测数据之前不预设结论。
+- **阈值全部走命令行参数**，默认值与 `config.py` 的定稿值一致；`--sweep-tau` 一次调用看
+  多个 τ 下的栏数，不用改代码重跑。生产实现只返回分栏线坐标，拿不到这些中间量，所以本
+  脚本镜像了一份可调参版本——**有漂移风险，改生产算法后要按下方注释里的命令核对一致性**。
+- **`--render` 把新旧分栏线叠加到页面图上目视核对**。不要用 x0 聚类代替目视：实测活动计划
+  第8页左半页正文真的横跨栏1栏2（390pt 宽的项目符号行，占用率约30%不是噪声），x0 聚类会
+  把它错标成四栏，系统性高估栏数。
 - **页号统一 0-indexed 并在输出里标注**：既有诊断数据里 0/1-indexed 混用过，吃过亏。
-- **阈值全部走命令行参数**，默认值是计划里的原型值（**未标定**，步骤3才定稿）。
-  `--sweep-tau` 直接看栏数对 τ 的敏感性，不用反复改代码重跑。
+- **A/B 两条通道都能探**（`--channel`）：A类一个 block 是 PyMuPDF 的一个文本行，B类一个
+  block 是版面检测模型输出的整个区域，块颗粒度差一个数量级。实测结论是 B 类不换算法
+  （原因见 `core/parser/_columns.py` docstring），但探 B 类的能力保留着，将来要重新评估
+  时不用重写。
 
 用法：
 
@@ -43,17 +45,63 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.parser._common import _detect_column_boundaries  # noqa: E402  旧算法，用于并排对比
+import config  # noqa: E402
+from core.parser._common import _split_region  # noqa: E402  切换前那套算法唯一还在的零件
+
+
+def _detect_column_boundaries_legacy(blocks: list[dict], width: float) -> list[float]:
+    """**切换前那套算法的冻结副本**，只用来做并排对比，不是生产代码。
+
+    A 类已改用 `core/parser/_columns.py`；这套"二值覆盖图 + 字符数统计"的四栏递归随之
+    从 `_common.py` 删掉了（只剩 `_split_region` 一族继续服务 B 类）。这里留一份副本，
+    是为了让 `column_probe_data.md` 里记的"收益41/回归0"能一直复算得出来——基线按定义
+    就该是冻结的，不需要跟着生产代码走，所以复制在这里不存在"验证复制品"的问题
+    （`compare_columns.py` 打桩去调真正的 `_order_native_page` 是另一回事，那边比的是
+    排序行为，必须用生产代码）。
+    """
+    top = _split_region(blocks, 0.0, width, config.COLUMN_MIN_GAP_WIDTH_RATIO)
+    if top is None:
+        return []
+    sub_splits = []
+    for lo, hi in ((0.0, top), (top, width)):
+        half = [b for b in blocks if lo <= (b["bbox"][0] + b["bbox"][2]) / 2 < hi]
+        # 半区内容范围也要按同一把尺子剔通栏块，否则跨页误聚的超宽块会把范围撑回整页宽
+        max_w = (hi - lo) * config.COLUMN_SPANNING_BLOCK_WIDTH_RATIO
+        in_column = [b for b in half if (b["bbox"][2] - b["bbox"][0]) <= max_w]
+        if not in_column:
+            break
+        extent = (min(b["bbox"][0] for b in in_column), max(b["bbox"][2] for b in in_column))
+        # 子缝下限 0.03：切换前是 config.COLUMN_SUB_GAP_MIN_WIDTH_RATIO，因为生产侧再没有
+        # 调用者、已从 config.py 删掉，写死在基线里（基线本就该是冻结值，不跟着配置走）
+        sub = _split_region(half, extent[0], extent[1], 0.03)
+        if sub is None:
+            break
+        sub_splits.append(sub)
+    if len(sub_splits) != 2:
+        return [top]
+    return sorted([top, *sub_splits])
 
 # ---------------------------------------------------------------------------
-# 新算法（内联原型；步骤4才落地为 core/parser/_columns.py）
+# 生产算法的**可调参数版镜像**（生产实现在 core/parser/_columns.py）
 #
-# 与旧算法的根本区别：只用几何量（被文字覆盖的y长度占比），完全不看字符数。
-# 旧算法的 COLUMN_BALANCE_MIN_RATIO / COLUMN_NON_SPANNING_MIN_CHAR_RATIO 都是内容
+# 为什么要镜像一份而不是直接调生产函数：生产函数只返回 list[float]，而探针的全部价值
+# 在于中间量——`--dump-profile` 要占用率数组、`--levels` 要每层的范围/候选/栏宽、
+# `--sweep-tau` 要一次调用换一组阈值。这些都得把内部打开才拿得到。
+#
+# ⚠️ **代价是会漂移**：改了 `_columns.py` 的判据却没同步这里，探针的诊断结论就会误导人。
+# 改完两边跑这一行确认仍然逐页一致（应输出 0 页不一致）：
+#
+#   python -X utf8 -c "import sys;sys.path.insert(0,'tools');from pathlib import Path;\
+#   import probe_columns as P;from core.parser._columns import _detect_column_boundaries as N;\
+#   pg=P.load_native_pages(Path('samples/数字化企业期刊82期V6.25.pdf'));\
+#   print(sum(P.detect(b,w,{**P.DEFAULTS,'flat':False})['n_cols']!=len(N(b,w))+1 for b,w in pg),'页不一致')"
+#
+# 与被替换的老算法的根本区别：只用几何量（被文字覆盖的y长度占比），完全不看字符数。
+# 老算法的 COLUMN_BALANCE_MIN_RATIO / COLUMN_NON_SPANNING_MIN_CHAR_RATIO 都是内容
 # 统计量，随页面内容剧烈波动，同样版面的页结果会跳变（实测第8~15页 2/2/4/2/4/2/4/2）。
 # ---------------------------------------------------------------------------
 
-# 步骤3 标定完成的取值。两侧实测余量见 tools/column_probe_data.md 第七节；
+# 与 config.py 的 COLUMN_A_* 定稿值一致。两侧实测余量见 tools/column_probe_data.md 第七节；
 # 工作点 = 134 页 GT 命中 129、收益 41、回归 0，另有 221 页单栏零误判。
 DEFAULTS = {
     "bin_ratio": 0.002,        # 0.001~0.003 同为最优；0.004 起掉点，0.008 崩
@@ -69,7 +117,7 @@ DEFAULTS = {
 
 
 # ---------------------------------------------------------------------------
-# Ground truth（步骤2 目视核定，页号 0-indexed）
+# Ground truth（目视核定，页号 0-indexed）
 #
 # 核定方法：--render 把新旧分栏线叠加到页面图上，直接看每条线是否落在真栏间距里；
 # 四栏页再用"跨栏续写句子是否连贯"交叉验证。**不用 x0 聚类代替目视**——实测活动计划
@@ -127,10 +175,9 @@ def _union_length(intervals: list[tuple[float, float]]) -> float:
 def _content_x_range(blocks: list[dict]) -> tuple[float, float] | None:
     """内容横向范围：全部非空块的 min(x0)/max(x1)，**不剔除通栏块**。
 
-    这跟旧的 `_content_extent` 语义正好相反，是有实测依据的：第16页的栏4 是个只有
-    4 行的联系方式框，按占用率它整体低于 τ，若再从范围里剔掉宽块，末栏宽度会算成
-    负数。而通栏刊头之所以不用剔——实测刊头高 9.4pt / 页内容高 ~660pt = 占用率
-    1.4%，远低于 τ=0.10，高度加权本身就兜住了。
+    第16页的栏4 是个只有 4 行的联系方式框，按占用率它整体低于 τ，若再从范围里剔掉
+    宽块，末栏宽度会算成负数。剔通栏块只发生在"算剖面前过滤参与统计的块"那一步
+    （`_exclude_spanning`），而且必须按当前层的尺度剔。
     """
     xs = [(b["bbox"][0], b["bbox"][2]) for b in blocks if b.get("text", "").strip()]
     if not xs:
@@ -251,7 +298,7 @@ def _select_columns(
 def detect_flat(blocks: list[dict], width: float, cfg: dict) -> dict:
     """扁平变体：整页算一次剖面 + 组合枚举定栏数。
 
-    **步骤2 已证伪，只留作对比基线**：整页一个剖面意味着占用率的分母是全页文字高度，
+    **已被实测证伪，只留作对比基线**：整页一个剖面意味着占用率的分母是全页文字高度，
     而"文章开篇页"（大图+跨栏标题、正文少）分母只有 338~421pt，一个跨栏大标题就占到
     12.6%~13.6%，盖过 τ 把真栏间距堵死；同时 τ 又不能放高，否则整页表格被拆栏。
     两头挤死无解，所以生产实现走 detect_layered。
@@ -434,7 +481,7 @@ def load_ocr_pages(path: Path, wanted: set[int] | None = None) -> list[tuple[lis
 
 def render_overlay(path: Path, page_index: int, probe_width: float, res: dict,
                    old: list[float], out_path: Path, dpi: int = 100) -> None:
-    """把页面渲染成图，并把新旧算法的分栏线叠加上去，供目视核定真实栏数（步骤2）。
+    """把页面渲染成图，并把新旧算法的分栏线叠加上去，供目视核定真实栏数。
 
     **必须目视、不能靠 x0 聚类代替**：实测活动计划第8页左半页的正文是真的横跨栏1栏2
     （多行 390pt 宽的项目符号行，占用率约30%不是噪声），x0 聚类会把它错标成四栏，
@@ -523,7 +570,7 @@ def main() -> None:
                     help="把渲染出的页面图按每行COLS张拼成大图（配合 --render）")
     ap.add_argument("--only-diff", action="store_true", help="只处理新旧不一致的页")
     ap.add_argument("--flat", action="store_true",
-                    help="用步骤2已证伪的扁平变体（整页一次剖面+组合枚举），仅供对比")
+                    help="用已证伪的扁平变体（整页一次剖面+组合枚举），仅供对比")
     ap.add_argument("--levels", action="store_true", help="打印分层结构每一层的中间量")
     ap.add_argument("--probe-tau", type=float, default=0.25,
                     help="仅用于量谷底占用率分布的宽松阈值，与工作τ解耦，避免循环论证。"
@@ -539,7 +586,7 @@ def main() -> None:
 
     print(f"文件: {path.name}")
     print(f"通道: {'A类(原生文字层)' if args.channel == 'a' else 'B类(OCR版面区域)'}")
-    print(f"阈值(原型值，未标定): {cfg}")
+    print(f"阈值: {cfg}")
     print("=" * 100)
 
     if args.channel == "a":
@@ -561,7 +608,7 @@ def main() -> None:
     for i in indices:
         blocks, width = pages[i]
         res = detect(blocks, width, cfg)
-        old = _detect_column_boundaries(blocks, width)
+        old = _detect_column_boundaries_legacy(blocks, width)
         computed.append((i, blocks, width, res, old, len(old) + 1 if blocks else 1))
     if args.only_diff:
         computed = [c for c in computed if c[5] != c[3]["n_cols"]]
