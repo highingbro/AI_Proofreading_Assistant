@@ -237,6 +237,204 @@ def test_spread_merged_block_does_not_break_four_column_detection():
     assert len(_detect_column_boundaries(blocks, 1000.0)) == 3
 
 
+# ---------------------------------------------------------------------------
+# A类分栏检测（core/parser/_columns.py，分层占用率剖面）
+#
+# 全部纯构造几何、页宽统一 1000，不碰真实PDF。为什么这么算见该模块顶部 docstring；
+# 每条用例都做过反向验证（把对应机制退回旧行为，确认用例真的会红）。
+# ---------------------------------------------------------------------------
+
+def _dense_four_column_blocks(rows: int = 50, row_pitch: float = 12.0) -> list[dict]:
+    """行数可调的对称四栏页：栏1 x50-240、栏2 x260-450、栏3 x550-740、栏4 x760-950。
+
+    行数要能调是因为占用率是**比例**：溢出行、跨栏标题这类"堵缝"元素堵不堵死一条缝，
+    取决于它占内容总高度的百分比，而不是它自己有多高。真实期刊一栏五六十行，用
+    `_symmetric_four_column_blocks()` 那 5 行的版本构造不出真实的占比。
+    """
+    blocks = []
+    for col_x0, col_x1 in ((50.0, 240.0), (260.0, 450.0), (550.0, 740.0), (760.0, 950.0)):
+        for i in range(rows):
+            y = 100.0 + i * row_pitch
+            blocks.append({"text": "正文占位", "bbox": (col_x0, y, col_x1, y + row_pitch)})
+    return blocks
+
+
+def test_columns_four_column_symmetric():
+    """分栏线落在三条真栏间距的中点附近（±2pt 是分箱宽度带来的量化误差，不是错误）。"""
+    from core.parser._columns import _detect_column_boundaries
+
+    lines = _detect_column_boundaries(_symmetric_four_column_blocks(), 1000.0)
+
+    assert lines == pytest.approx([250.0, 500.0, 750.0], abs=2.0)
+
+
+def test_columns_spanning_header_does_not_break_gap():
+    """通栏刊头横跨整幅，仍应检出四栏（旧算法的原始误判之一，此前没有回归用例）。"""
+    from core.parser._columns import _detect_column_boundaries
+
+    blocks = _symmetric_four_column_blocks()
+    blocks.append({"text": "某某期刊 2026年第8期", "bbox": (50.0, 60.0, 950.0, 75.0)})
+
+    assert len(_detect_column_boundaries(blocks, 1000.0)) == 3
+
+
+def test_columns_overflow_lines_do_not_close_gap():
+    """两端对齐让少数行溢出到栏间距里，占用率加权下不该把整条缝判死。
+
+    ★ 没有这条，本次重写的核心机制（占用率剖面取代二值覆盖图）就没有回归保护：
+    二值覆盖图里只要一行溢出，整条缝的格子就全被标成"有内容"，四栏必然退回两栏。
+    """
+    from core.parser._columns import _detect_column_boundaries
+
+    blocks = _dense_four_column_blocks(rows=50)
+    # 栏3 有 2 行溢出到栏3|栏4 的缝里（占用率 2/50 = 0.04，低于 τ=0.06）
+    for i in (7, 23):
+        y = 100.0 + i * 12.0
+        blocks.append({"text": "溢出行", "bbox": (550.0, y, 758.0, y + 12.0)})
+
+    assert len(_detect_column_boundaries(blocks, 1000.0)) == 3
+
+
+def test_columns_asymmetric_four_column():
+    """末栏只有4行短文本（联系方式框那类）时仍应检出四栏。
+
+    ★ 旧算法因"分栏线两侧字符数要平衡"必然失败，core/parser/CLAUDE.md 点名为残留未处理。
+    """
+    from core.parser._columns import _detect_column_boundaries
+
+    blocks = [b for b in _dense_four_column_blocks(rows=50) if b["bbox"][0] != 760.0]
+    for i in range(4):
+        y = 100.0 + i * 12.0
+        blocks.append({"text": "联系方式", "bbox": (760.0, y, 950.0, y + 12.0)})
+
+    assert len(_detect_column_boundaries(blocks, 1000.0)) == 3
+
+
+def test_columns_spanning_title_uses_half_region_scale():
+    """跨栏标题的通栏门限必须按半区**内容范围**宽算，不是几何区域宽（含页边距）。
+
+    ★ 标定阶段的核心修复点，复刻真实开篇页：右半几何宽 500（主缝到页边）→ 门限 300，
+    而右半内容范围只有 [550,950] 宽 400 → 门限 240；堵住栏3|栏4 缝的文章大标题宽 270
+    正好卡在两者之间。按几何宽算它留在统计里、把缝占到 0.09 盖过 τ=0.06，四栏退回两栏；
+    按内容范围宽算才认得出它是"这半区里的通栏块"。没这条用例，后人"顺手"改回几何宽
+    只会掉几页四栏、测试全绿。
+    """
+    from core.parser._columns import _detect_column_boundaries
+
+    blocks = _dense_four_column_blocks(rows=50)
+    blocks.append({"text": "文章大标题跨栏排", "bbox": (620.0, 20.0, 890.0, 80.0)})
+
+    assert len(_detect_column_boundaries(blocks, 1000.0)) == 3
+
+
+def test_columns_single_column_not_split():
+    """整幅宽行 + 段末短行 + 列表缩进，不该产生任何分栏线。"""
+    from core.parser._columns import _detect_column_boundaries
+
+    blocks = []
+    for i in range(40):
+        y = 100.0 + i * 15.0
+        x1 = 950.0 if i % 5 else 520.0                  # 每5行一个段末短行
+        x0 = 90.0 if i % 7 == 3 else 50.0               # 偶尔有列表缩进
+        blocks.append({"text": "单栏正文占位文字", "bbox": (x0, y, x1, y + 12.0)})
+
+    assert _detect_column_boundaries(blocks, 1000.0) == []
+
+
+def test_columns_two_column_unequal_widths_accepted():
+    """宽正文 + 窄边栏（2:1）是真实存在的版面，不能因栏宽不均被否决成单栏。
+
+    ★ CV 在分层实现里只用于同层候选之间排序、从不否决，这条用例钉住这一点。
+
+    2:1 已接近这套算法能接受的不均上限：最宽那栏一旦超过内容范围宽的
+    `COLUMN_A_SPANNING_WIDTH_RATIO`(0.6) 就被当成通栏块剔除，两栏随之退回单栏。这不是
+    疏漏而是同一道机制的两面——正是它让 221 页单栏文档零误判（单栏页每行本身就接近整幅
+    宽度，会被整体剔除、剩下的短行凑不出栏间距），且退回单栏属安全方向。
+    """
+    from core.parser._columns import _detect_column_boundaries
+
+    blocks = []
+    for i in range(40):
+        y = 100.0 + i * 15.0
+        blocks.append({"text": "正文", "bbox": (50.0, y, 450.0, y + 12.0)})
+        blocks.append({"text": "边栏", "bbox": (560.0, y, 760.0, y + 12.0)})
+
+    assert _detect_column_boundaries(blocks, 1000.0) == pytest.approx([505.0], abs=2.0)
+
+
+def test_columns_table_column_gaps_rejected():
+    """上部是4列表格、下部是整幅正文：表格列间距不得被当成栏间距。
+
+    ★ 风险 R1（等宽表格被当多栏，最高危：正文被按列切碎比漏检严重得多）的直接验证。
+    这里挡住它的是主缝宽度下限——表格列间距只有 20pt，远低于
+    `COLUMN_A_MAIN_GAP_MIN_WIDTH_RATIO`(页宽5% = 50pt)。反向验证：把该下限放到 0.01，
+    这一页立刻被拆成四栏。
+
+    真实文档里还有另一条防线是 τ（唯一的整页大表格样本在 τ≥0.08 时会被拆栏，故 τ 定
+    0.06），但那一页的占用率分布无法用构造几何如实复刻，**只由步骤5的真实文档对比覆盖，
+    不在本用例范围内**——调 τ 时不要以为这条用例绿了就安全。
+    """
+    from core.parser._columns import _detect_column_boundaries
+
+    blocks = []
+    for row in range(16):
+        y = 100.0 + row * 12.0
+        for x0, x1 in ((50.0, 270.0), (290.0, 510.0), (530.0, 750.0), (770.0, 950.0)):
+            blocks.append({"text": "单元格", "bbox": (x0, y, x1, y + 12.0)})
+    for row in range(24):
+        y = 300.0 + row * 12.0
+        blocks.append({"text": "整幅正文", "bbox": (50.0, y, 950.0, y + 12.0)})
+
+    assert _detect_column_boundaries(blocks, 1000.0) == []
+
+
+def test_columns_narrow_indent_gap_rejected():
+    """8pt 的缩进空白不是栏间距，不得产生分栏线。"""
+    from core.parser._columns import _detect_column_boundaries
+
+    blocks = []
+    for i in range(40):
+        y = 100.0 + i * 15.0
+        blocks.append({"text": "左", "bbox": (50.0, y, 492.0, y + 12.0)})
+        blocks.append({"text": "右", "bbox": (500.0, y, 950.0, y + 12.0)})
+
+    assert _detect_column_boundaries(blocks, 1000.0) == []
+
+
+def test_content_x_range_uses_all_blocks():
+    """内容范围取全体非空块的 min/max，**不剔通栏块**——与旧 `_content_extent` 相反。
+
+    ★ 语义反转，容易被后人"顺手改回去"：某期刊四栏页的末栏是只有4行的联系方式框，
+    整体占用率低于 τ，若再从范围里剔掉宽块，末栏宽度会算成负数。剔通栏块只发生在
+    "算剖面前过滤参与统计的块"那一步。
+    """
+    from core.parser._columns import _content_x_range
+
+    blocks = [
+        {"text": "栏1正文", "bbox": (50.0, 150.0, 240.0, 162.0)},
+        {"text": "栏2正文", "bbox": (260.0, 150.0, 450.0, 162.0)},
+        {"text": "跨页误聚块", "bbox": (50.0, 100.0, 830.0, 115.0)},
+    ]
+
+    assert _content_x_range(blocks) == (50.0, 830.0)
+
+
+def test_content_x_range_ignores_blank_blocks():
+    from core.parser._columns import _content_x_range
+
+    assert _content_x_range([{"text": "  \n ", "bbox": (0.0, 0.0, 900.0, 10.0)}]) is None
+
+
+def test_width_cv_arithmetic():
+    """CV 是给同层候选排序用的工具函数，这里只钉它自己的算术，不宣称它能挡住什么。"""
+    from core.parser._columns import _width_cv
+
+    assert _width_cv([200.0, 200.0, 200.0]) == 0.0
+    assert _width_cv([100.0, 300.0]) == 0.5
+    assert _width_cv([]) == float("inf")
+    assert _width_cv([0.0, 0.0]) == float("inf")      # 除零保护
+
+
 class _FakeLayoutPipeline:
     def predict(self, path):
         return [{"boxes": [{"label": "text", "coordinate": (0, 0, 100, 100)}]}]
