@@ -203,19 +203,23 @@ def test_rule_d_unlocated_quotation_stays_quotation():
 # 规则I：PDF换行符被LLM转写成空格的解析伪影豁免（补丁，真实使用中发现后追加）
 # ---------------------------------------------------------------------------
 
-def test_rule_i_downgrades_linewrap_space_artifact():
-    """真实案例：block里"教务管理\\n教师"的换行符被LLM转写成空格"教务管理教 师"上报，
-    空格插入位置和真实\\n位置相差一个字符，仍应命中（整体去除后子串匹配，不要求精确对位）。
+def test_rule_i_discards_linewrap_space_artifact():
+    """★防线：block里"教务管理\\n教师"的换行符被LLM转写成空格"教务管理教 师"上报。
+
+    空格插入位置和真实 \\n 位置相差一个字符（\\n 在"理"和"教"之间，空格却落在"教"和"师"
+    之间），整体去除后子串匹配仍能命中——要求精确对位会漏判这个真实案例。
     """
     block = _block(block_index=0, text="教务管理\n教师无组织权限。")
     raw = _raw_issue(
         original_text="教务管理教 师", issue_type="错别字与拼写", confidence="high",
         suggestion="应删除空格，改为“教务管理教师”", block_index=0,
     )
-    issue = classify_issue(raw, {0: block})
-    assert issue.layer == config.LAYER_DOUBTFUL
-    assert issue.priority == config.PRIORITY_LOW
-    assert any("换行" in n for n in issue.layer_notes)
+    from core.classifier.modifier_rules import _is_linewrap_space_artifact
+
+    # 直接钉判据本身：端到端跑的话，这条会被更靠前的"纯空格差异"过滤器先接住（两条都丢，
+    # 但断言 warnings 会指向错的那一条），测不到本判据的"整体去除后子串匹配"这个关键点。
+    assert _is_linewrap_space_artifact(raw, block)
+    assert classify_issues(ProofreadResult(issues=[raw], chunk_warnings=[]), _parsed([block])).issues == []
 
 
 def test_rule_i_does_not_trigger_without_matching_block():
@@ -396,7 +400,7 @@ def test_rule_f_normal_medium_confidence_no_rewording():
 # 规则G：知识时效性误判豁免（补丁，真实使用中发现后追加）
 # ---------------------------------------------------------------------------
 
-def test_rule_g_downgrades_recency_doubt_within_grace_window():
+def test_rule_g_discards_recency_doubt_within_grace_window():
     # 取容忍窗口的上界（闭区间），跟着配置走而不是写死年数——写死的话
     # KNOWLEDGE_CUTOFF_GRACE_YEARS 一调小，这几条用例就会因为年份跑到窗口外而失真
     year = config.LLM_KNOWLEDGE_CUTOFF_YEAR + config.KNOWLEDGE_CUTOFF_GRACE_YEARS
@@ -406,11 +410,10 @@ def test_rule_g_downgrades_recency_doubt_within_grace_window():
         reason="这个日期超出了我的训练数据覆盖范围，无法查证是否存在",
         suggestion="建议核实该年份是否正确",
     )
-    issue = classify_issue(raw, {})
-    assert issue.layer == config.LAYER_DOUBTFUL
-    assert issue.priority == config.PRIORITY_LOW
-    assert "知识时效性" in issue.suggestion
-    assert "知识时效性" in _notes_text(issue)
+    result = classify_issues(ProofreadResult(issues=[raw], chunk_warnings=[]), _parsed([_block(block_index=0)]))
+
+    assert result.issues == []
+    assert any("解析/分块/知识边界造成的误判" in w for w in result.warnings)
 
 
 def test_rule_g_does_not_downgrade_when_year_far_beyond_grace_window():
@@ -472,7 +475,7 @@ def _chunked_document(block_indices_per_chunk: list[list[int]], source=None) -> 
     return ChunkedDocument(source=source, chunks=chunks, chunk_size_target=0, overlap_blocks=0, warnings=[])
 
 
-def test_rule_h_downgrades_issue_at_non_final_chunk_tail_block():
+def test_rule_h_discards_issue_at_non_final_chunk_tail_block():
     """核心场景（真实bug复现）：block是所在chunk正文最后一块（非全文档最后一块），
     不以句末标点收尾，被flag原文正是该block结尾片段——判定为疑似分块截断误判。"""
     blocks = [_block(block_index=0, text="正文……分类标签、")]
@@ -483,11 +486,9 @@ def test_rule_h_downgrades_issue_at_non_final_chunk_tail_block():
         original_text="分类标签、", suggestion="删除末尾顿号，或补充完整后续内容",
     )
     result = classify_issues(ProofreadResult(issues=[raw], chunk_warnings=[]), parsed, chunked)
-    issue = result.issues[0]
-    assert issue.layer == config.LAYER_DOUBTFUL
-    assert issue.priority == config.PRIORITY_LOW
-    assert "分块" in issue.suggestion
-    assert any("分块" in n for n in issue.layer_notes)
+
+    assert result.issues == []
+    assert any("解析/分块/知识边界造成的误判" in w for w in result.warnings)
 
 
 def test_rule_h_does_not_trigger_when_block_ends_with_terminal_punct():
@@ -798,77 +799,112 @@ def test_no_op_filter_drops_control_char_garbage():
 
 
 # ---------------------------------------------------------------------------
-# 规则J：版式错乱措辞 / 空格差异兜底降级（真实使用中发现后追加，见 core/classifier/CLAUDE.md）
+# 版式错乱措辞 / 建议与原文只差空格 → 整条丢弃（不是降级）
+#
+# 是丢弃而不是降级，这是用户的明确要求：降级会留下一句"建议对照原文核实后再处理"，那本身
+# 就是噪声——用户看到的仍是一条要处理的问题，而它百分之百不是原文的错。丢弃发生在归层
+# **之前**，所以引文类/风格类也一并丢。
 # ---------------------------------------------------------------------------
 
-def test_rule_j_downgrades_layout_confusion_wording():
-    """真实案例：LLM自己在suggestion里承认"此处排版错乱/跨行错位"，说明这不是语言
-    本身的确定性错误，而是LLM也没看懂被解析打乱的版面——必须降级，不能留在错误类。"""
-    raw = _raw_issue(
+def _classify_one(raw):
+    return classify_issues(ProofreadResult(issues=[raw], chunk_warnings=[]), _parsed([_block(block_index=0)]))
+
+
+def test_artifact_filter_drops_layout_confusion_wording():
+    """真实案例：LLM自己在suggestion里承认"此处排版错乱/跨行错位"，说明这不是语言本身的
+    错误，而是LLM也没看懂被解析打乱的版面——整条丢弃。"""
+    result = _classify_one(_raw_issue(
         original_text="全球市场份额从2023年的51%升⾄2024年，全球机器⼈产业经历了",
         suggestion="此处文字排版错乱，'升至'后应为'54%'，但被另一段话插入，建议核实原文并重新排版",
-    )
-    issue = classify_issue(raw, {})
-    assert issue.layer == config.LAYER_DOUBTFUL
-    assert "版式错乱" in _notes_text(issue)
+    ))
+
+    assert result.issues == []
+    assert any("丢弃1条版式错乱/纯空格差异的解析伪影" in w for w in result.warnings)
 
 
-def test_rule_j_downgrades_pure_whitespace_diff_even_with_radical_lookalike_mixed_in():
-    """真实案例："2 0 2 5年9⽉1 1⽇"→"2025年9月11日"：既有部首替代字（⽉），又有
-    纯空格差异（数字间被拆开）——discard过滤器判定"不是零改动"（因为空格差异是真实
-    的，不该被丢弃，用户要求空格问题只降级不删除），必须走空格差异兜底降级，且比较
-    时要套一遍部首替代修正，否则会因为⽉≠月而漏判。"""
-    raw = _raw_issue(
-        original_text="2 0 2 5年9⽉1 1⽇",
-        suggestion='改为"2025年9月11日"。',
-    )
-    issue = classify_issue(raw, {})
-    assert issue.layer == config.LAYER_DOUBTFUL
-    assert "空格" in _notes_text(issue)
+def test_artifact_filter_drops_pure_whitespace_diff_with_radical_lookalike_mixed_in():
+    """★防线：`"2 0 2 5年9⽉1 1⽇"`→`"2025年9月11日"` 既有部首替代字（⽉）又有纯空格差异。
+
+    比较前必须先套一遍部首替代修正，否则会因为 ⽉≠月 而漏判——真实数据里这两种伪影经常
+    同时出现在同一条issue里。
+    """
+    result = _classify_one(_raw_issue(original_text="2 0 2 5年9⽉1 1⽇", suggestion='改为"2025年9月11日"。'))
+
+    assert result.issues == []
 
 
-def test_rule_j_does_not_trigger_for_genuine_typo():
-    """真实案例："Linxu"应改为"Linux"——真正的拼写错误，不含版式错乱措辞，
-    也不是纯空格差异，必须保持确定性错误，不能被误伤降级。"""
-    raw = _raw_issue(original_text="而Linxu生态", suggestion='"Linxu"应改为"Linux"。')
-    issue = classify_issue(raw, {})
-    assert issue.layer == config.LAYER_CONFIRMED
+def test_artifact_filter_does_not_touch_genuine_typo():
+    """★防线：`"Linxu"应改为"Linux"` 是真拼写错误，既无版式错乱措辞也不是纯空格差异，
+    必须原样保留在确定性错误层。"""
+    result = _classify_one(_raw_issue(original_text="而Linxu生态", suggestion='"Linxu"应改为"Linux"。'))
+
+    assert [i.layer for i in result.issues] == [config.LAYER_CONFIRMED]
 
 
-def test_rule_j_still_diagnoses_space_diff_after_already_downgraded_by_rule_d():
-    """真实案例：original_text="AI 助力PMC实战进阶"、suggestion（裸文本无包裹措辞）
-    "AI助力PMC实战进阶"，且这条issue因未定位（规则D）已经先把layer从确定性错误降到
-    存疑待核实。旧实现里规则J只认`state.layer==确定性错误`，规则D抢先一步后规则J
-    直接跳过——最终结果停在"存疑待核实/中优先级"，用户只看得到"未定位"这个笼统原因，
-    看不出这其实是纯空格差异、根本不用人工核实。规则J放宽到"确定性错误或存疑待核实
-    都生效"后，即使layer已经不需要再变，仍应该把优先级降到最低、把更具体的"仅空格
-    差异"诊断追加进suggestion/notes。"""
-    raw = _raw_issue(
-        original_text="AI 助力PMC实战进阶",
-        suggestion="AI助力PMC实战进阶",
-        located=False,
-        block_index=None,
-    )
-    issue = classify_issue(raw, {})
-    assert issue.layer == config.LAYER_DOUBTFUL
-    assert issue.priority == config.PRIORITY_LOW
-    assert "空格" in _notes_text(issue)
-    assert issue.suggestion.startswith("该问题与原文的差异只有空格")
+def test_artifact_filter_drops_bare_wording_space_diff_even_when_unlocated():
+    """真实案例：original_text="AI 助力PMC实战进阶"、suggestion 是不带任何包裹措辞的裸
+    文本"AI助力PMC实战进阶"，且这条issue未定位。丢弃发生在归层之前，与定位与否无关。"""
+    result = _classify_one(_raw_issue(
+        original_text="AI 助力PMC实战进阶", suggestion="AI助力PMC实战进阶",
+        located=False, block_index=None,
+    ))
+
+    assert result.issues == []
 
 
-def test_rule_j_does_not_override_quotation_protection():
-    """规则J放宽后仍不能覆盖到引文类/风格类——这两层是已经落定的分类结果（"原文照录
-    不建议改动"/纯风格问题），不该被"仅空格差异"这条通用诊断二次改写。书名号命中
-    引文保护，即使original_text和suggestion之间恰好只差空格，也必须维持引文类，
-    suggestion维持"原文照录"这套话术。"""
-    raw = _raw_issue(
+def test_artifact_filter_drops_space_diff_inside_quotation():
+    """★防线：丢弃在归层之前，引文类也照丢。
+
+    不违反引文保护铁律：那条铁律要的是"不对引文提改动建议"，而这里是把一条压根不存在的
+    问题整个删掉，比"原文照录，不建议改动"更保守。
+    """
+    result = _classify_one(_raw_issue(
         category="normal", issue_type="标点符号问题",
-        original_text="《AI 助力PMC实战进阶》",
-        suggestion="《AI助力PMC实战进阶》",
-    )
-    issue = classify_issue(raw, {})
-    assert issue.layer == config.LAYER_QUOTATION
-    assert issue.suggestion.startswith("原文照录，不建议改动。")
+        original_text="《AI 助力PMC实战进阶》", suggestion="《AI助力PMC实战进阶》",
+    ))
+
+    assert result.issues == []
+
+
+# ---------------------------------------------------------------------------
+# LLM自陈"按历史反馈规避规则本来就不该报" → 整条丢弃
+#
+# 提示词"补充规则三"要求命中规避规则的内容根本不要输出，但LLM会照样输出一条issue、把
+# "我为什么不该报它"写进建议正文。这类条目的建议与原文相差悬殊，既有的零改动/纯空格
+# 判据全都接不住，不拦就会落到 _rule_default 判成确定性错误。
+# ---------------------------------------------------------------------------
+
+def test_self_declared_non_issue_is_dropped():
+    """真实案例（截图复现）：suggestion 引用历史反馈规避规则说明这条不该报，却仍被输出。"""
+    result = _classify_one(_raw_issue(
+        original_text="通过课堂培训与实际演练相结 合的体系化学习，",
+        issue_type="错别字与拼写",
+        suggestion='"相结 合"因换行被拆分，根据历史反馈规避规则第三条，此类因换行导致的词语拆分不应报告为问题。',
+    ))
+
+    assert result.issues == []
+    assert any("丢弃1条LLM自陈不该报告的问题" in w for w in result.warnings)
+
+
+def test_self_declared_non_issue_in_reason_is_dropped():
+    """自陈措辞落在 reason 而不是 suggestion 里同样丢弃——两个字段一起看。"""
+    result = _classify_one(_raw_issue(
+        suggestion="建议保持原样",
+        reason="该模式已被编辑多次拒绝，不视为问题。",
+    ))
+
+    assert result.issues == []
+
+
+def test_self_declared_filter_does_not_touch_quotation_boilerplate():
+    """★防线：引文类的固定建议是"原文照录，不建议改动"，措辞上同样是"别改"，但它是一条
+    要展示给编辑看的正常引文issue，不能被这条过滤连坐丢掉。"""
+    result = _classify_one(_raw_issue(
+        category="quotation", original_text="《论语》有云：学而时习之",
+        suggestion="原文照录，不建议改动", reason="引用古籍原文",
+    ))
+
+    assert [i.layer for i in result.issues] == [config.LAYER_QUOTATION]
 
 
 # ---------------------------------------------------------------------------

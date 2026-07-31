@@ -325,21 +325,74 @@ def _has_stray_control_chars(text: str) -> bool:
     return any(unicodedata.category(ch) == "Cc" and ch not in "\t\n\r" for ch in text)
 
 
-def _filter_visually_no_op(raw_issues: list[RawIssue]) -> tuple[list[RawIssue], int, int]:
-    """丢弃两类没有核实价值的假问题，在 classify_issue 之前对 RawIssue 直接过滤、整条
-    丢弃，不进入最终结果——与其余规则C/D/G/H/J"降级为存疑待核实、保留可审计性"的一般
-    惯例不同：这两类已经确认没有人工核实的价值，用户明确要求直接从结果里丢弃，不走
-    归层。
+def _is_layout_or_space_artifact(raw: RawIssue) -> bool:
+    """这条issue是不是"解析伪影"而非原文真错：版式错乱措辞，或建议与原文只差空格。
 
-    1. 视觉/语义零改动（_is_visually_no_op_suggestion）。
-    2. original_text本身含解析产生的控制字符乱码（_has_stray_control_chars）。
+    两种形态都来自真实数据：
 
-    返回 (保留的issues, 零改动丢弃数, 控制字符乱码丢弃数)。
+    1. LLM 自己在 `reason`/`suggestion` 里承认"此处排版错乱""跨行错位""乱码"
+       （`config.LAYOUT_ARTIFACT_KEYWORDS`，关键词是从真实输出里摘的原话）——它是在说
+       "我也没看懂这段被打乱的版面"，不是在报语言错误。
+    2. 建议的替换内容和原文的唯一差异是空格（`"2 0 2 5年9⽉1 1⽇"` → `"2025年9月11日"`），
+       空格来自PDF跨行拼接/装饰性字间距等排版原因。
+
+    先套 `_normalize_lookalike` 再去空格比较，不能直接拿原始文本去空格：真实案例里空格差异
+    经常和部首替代字同时出现在同一条issue里（`⽉` 是部首替代字、其余是空格差异），只看原始
+    文本会因为部首字符不相等而漏判。
+    """
+    combined = f"{raw.reason}{raw.suggestion}"
+    if any(k in combined for k in config.LAYOUT_ARTIFACT_KEYWORDS):
+        return True
+    pair = _extract_replacement_pair(raw)
+    if pair is None:
+        return False
+    old, new = pair
+    has_real_space_diff = _strip_whitespace(old) != old.strip() or _strip_whitespace(new) != new.strip()
+    return has_real_space_diff and _strip_whitespace(_normalize_lookalike(old)) == _strip_whitespace(_normalize_lookalike(new))
+
+
+def _is_self_declared_non_issue(raw: RawIssue) -> bool:
+    """LLM 在 suggestion/reason 里自己说明"这条按规避规则不该报告为问题"。
+
+    提示词"补充规则三：历史反馈规避"要求命中规避规则的内容直接不要输出，但 LLM 常见的
+    失败模式是照样输出一条issue、把"我为什么不该报它"写成建议正文（真实案例：
+    suggestion='"预测 点检"因换行被拆分，根据历史反馈规避规则第三条，此类因换行导致的
+    词语拆分不应报告为问题。'）。这类条目的建议文本与原文相差悬殊，既有的零改动/纯空格
+    判据全都接不住，会一路落到 `_rule_default` 判成确定性错误。关键词见
+    `config.NON_ISSUE_SELF_DECLARATION_KEYWORDS`。
+    """
+    combined = f"{raw.reason or ''}{raw.suggestion or ''}"
+    return any(k in combined for k in config.NON_ISSUE_SELF_DECLARATION_KEYWORDS)
+
+
+def _filter_visually_no_op(raw_issues: list[RawIssue]) -> tuple[list[RawIssue], int, int, int, int]:
+    """丢弃四类没有核实价值的假问题，在 classify_issue 之前对 RawIssue 直接过滤、整条
+    丢弃，不进入最终结果——与规则C/D/G/H/I"降级为存疑待核实、保留可审计性"的一般惯例
+    不同：这几类已经确认没有人工核实的价值，用户明确要求直接从结果里丢弃，不走归层。
+
+    1. 视觉/语义零改动（`_is_visually_no_op_suggestion`）。
+    2. original_text本身含解析产生的控制字符乱码（`_has_stray_control_chars`）。
+    3. 版式错乱措辞 / 建议与原文只差空格（`_is_layout_or_space_artifact`）。
+    4. LLM自陈"按规避规则本来就不该报"（`_is_self_declared_non_issue`）。
+
+    第3类**是丢弃而不是降级，这是用户的明确要求**：降级会留下一句"建议对照原文核实后再
+    处理"，那本身就是噪声——用户看到的仍是一条要处理的问题，而它百分之百不是原文的错。
+    **代价要知道**：版式错乱那一支是关键词匹配，
+    比另外两类宽，真错误若被LLM描述成"跨行/错位"会一并丢掉；丢弃数进 warnings，在界面的
+    "提示信息"面板可见，不是悄无声息地消失。
+
+    返回 (保留的issues, 零改动丢弃数, 控制字符乱码丢弃数, 解析伪影丢弃数, 自陈非问题丢弃数)。
     """
     kept = []
     no_op_dropped = 0
     control_char_dropped = 0
+    artifact_dropped = 0
+    self_declared_dropped = 0
     for raw in raw_issues:
+        if _is_self_declared_non_issue(raw):
+            self_declared_dropped += 1
+            logger.info("丢弃LLM自陈不该报告的问题: 原文=%s 建议=%s", raw.original_text, raw.suggestion)
+            continue
         if _has_stray_control_chars(raw.original_text or ""):
             control_char_dropped += 1
             logger.info("丢弃含解析乱码控制字符的问题: 原文=%r", raw.original_text)
@@ -348,5 +401,9 @@ def _filter_visually_no_op(raw_issues: list[RawIssue]) -> tuple[list[RawIssue], 
             no_op_dropped += 1
             logger.info("丢弃视觉无实质改动的建议: 原文=%s 建议=%s", raw.original_text, raw.suggestion)
             continue
+        if _is_layout_or_space_artifact(raw):
+            artifact_dropped += 1
+            logger.info("丢弃版式错乱/纯空格差异的解析伪影: 原文=%s 建议=%s", raw.original_text, raw.suggestion)
+            continue
         kept.append(raw)
-    return kept, no_op_dropped, control_char_dropped
+    return kept, no_op_dropped, control_char_dropped, artifact_dropped, self_declared_dropped

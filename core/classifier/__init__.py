@@ -15,7 +15,7 @@ import config
 from core.chunker import ChunkedDocument
 from core.classifier._types import ClassifiedIssue, ClassifiedResult, _ClassificationState
 from core.classifier.base_rules import _BASE_RULES
-from core.classifier.modifier_rules import _MODIFIER_RULES, _compute_chunk_tail_blocks
+from core.classifier.modifier_rules import _MODIFIER_RULES, _compute_chunk_tail_blocks, is_artifact_misjudgment
 from core.classifier.postprocess import _compute_stats, _dedup, _filter_visually_no_op, _sort
 from core.parser import ParsedBlock, ParsedDocument
 from core.proofreader import ProofreadResult, RawIssue
@@ -86,16 +86,31 @@ def classify_issues(
     调规则的调试场景）该规则不生效，其余规则不受影响。mode 透传给每条 classify_issue，
     不传时按深度模式（现状）处理。
 
-    _filter_visually_no_op 在归层之前先丢弃两类没有核实价值的假问题：建议改写内容
+    _filter_visually_no_op 在归层之前先丢弃四类没有核实价值的假问题：建议改写内容
     和原文做部首/异体字形替代修正+Unicode规范化后完全相同的issue（零改动的假问题，
-    如PDF解析产生的康熙部首代替标准汉字，肉眼看不出区别却被判成"错别字"），以及
-    original_text本身含解析产生的控制字符乱码的issue，详见 core/classifier/CLAUDE.md。
+    如PDF解析产生的康熙部首代替标准汉字，肉眼看不出区别却被判成"错别字"）、
+    original_text本身含解析产生的控制字符乱码的issue、版式错乱措辞或建议与原文
+    只差空格的解析伪影、以及LLM自陈"按历史反馈规避规则本来就不该报"的issue，
+    详见 core/classifier/CLAUDE.md。
+
+    紧接着 is_artifact_misjudgment 再丢一轮"我们自己造成的误判"——PDF换行符被转写成
+    空格、LLM知识时效性、分块边界截断。这一轮要用 block/tail_blocks 判定，所以单独
+    走一遍而不是并进上面那个过滤器。这几类原先都是降级为存疑待核实并在建议前贴一句
+    "疑似……建议核实后再处理"，用户明确要求改成整条丢弃：问题不在文档里，在我们这条
+    流水线上，留着那句话本身就是噪声。
     """
     block_by_index = {b.block_index: b for b in parsed.blocks}
     tail_blocks = _compute_chunk_tail_blocks(chunked)
 
-    raw_issues, no_op_dropped, control_char_dropped = _filter_visually_no_op(result.issues)
-    classified = [classify_issue(raw, block_by_index, tail_blocks, mode) for raw in raw_issues]
+    (
+        raw_issues, no_op_dropped, control_char_dropped, artifact_dropped, self_declared_dropped,
+    ) = _filter_visually_no_op(result.issues)
+    # 再丢一轮"我们自己造成的误判"：解析伪影/模型知识边界/分块边界。要用 block 和
+    # tail_blocks 判定，所以接在 _filter_visually_no_op 之后单独一遍，而不是并进去。
+    kept = [raw for raw in raw_issues if not is_artifact_misjudgment(raw, block_by_index.get(raw.block_index), tail_blocks)]
+    misjudgment_dropped = len(raw_issues) - len(kept)
+
+    classified = [classify_issue(raw, block_by_index, tail_blocks, mode) for raw in kept]
     deduped, dropped = _dedup(classified)
     ordered = _sort(deduped)
     stats = _compute_stats(ordered)
@@ -105,6 +120,12 @@ def classify_issues(
         warnings.append(f"丢弃{no_op_dropped}条视觉无实质改动的建议")
     if control_char_dropped:
         warnings.append(f"丢弃{control_char_dropped}条解析产生乱码字符的问题")
+    if artifact_dropped:
+        warnings.append(f"丢弃{artifact_dropped}条版式错乱/纯空格差异的解析伪影")
+    if self_declared_dropped:
+        warnings.append(f"丢弃{self_declared_dropped}条LLM自陈不该报告的问题")
+    if misjudgment_dropped:
+        warnings.append(f"丢弃{misjudgment_dropped}条解析/分块/知识边界造成的误判")
     if dropped:
         warnings.append(f"跨块去重丢弃{dropped}条重复问题")
 

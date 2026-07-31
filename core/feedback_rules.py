@@ -5,6 +5,11 @@
 次数的模式，产出规则文本注入校对LLM的系统提示词，让LLM在生成建议这一步就主动规避，
 而不是先生成再事后改判分类结果。
 
+提示词不是唯一防线：LLM会照样输出一条issue、把"我为什么不该报它"写成建议正文
+（"根据历史反馈规避规则第三条……不应报告为问题"），`core/classifier/postprocess.py::
+_is_self_declared_non_issue` 在归层前把这类自陈条目整条丢弃，详见
+[core/classifier/CLAUDE.md](classifier/CLAUDE.md)。
+
 不用字符串相似度（如 `difflib.SequenceMatcher.ratio()`）判断"是否同一类问题"：归一化
 后"应改为『X』或『Y』"这种LLM高频措辞模板本身就会撞车，会让语义完全无关的建议被错误
 归并为"同类"（真实数据验证过这个失败模式）。语义总结的失败模式更安全——判断得不准，

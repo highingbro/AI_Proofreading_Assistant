@@ -22,7 +22,6 @@ import config
 from core.chunker import ChunkedDocument
 from core.classifier._types import _ClassificationState
 from core.classifier.heuristics import _YEAR_RE
-from core.classifier.postprocess import _extract_replacement_pair, _normalize_lookalike, _strip_whitespace
 from core.parser import ParsedBlock
 from core.proofreader import RawIssue
 
@@ -62,106 +61,39 @@ def _apply_unlocated_cap(
     return replace(state, layer=layer, notes=notes)
 
 
-def _apply_linewrap_space_artifact_downgrade(
-    raw: RawIssue,
-    block: ParsedBlock | None,
-    tail_blocks: set[int],
-    state: _ClassificationState,
-) -> _ClassificationState:
-    """规则I：PDF换行符被LLM转写成空格的解析伪影豁免。
+def _is_linewrap_space_artifact(raw: RawIssue, block: ParsedBlock | None) -> bool:
+    """original_text 里那个空格，是不是 PDF 换行符被 LLM 转写出来的、原文根本没有的字符。
 
-    起因：core/parser/native_pdf.py 用换行符(\\n)拼接同一block内的多个PDF行（见
-    core/parser/CLAUDE.md），但PDF按页宽自动换行不认汉字词语边界，经常把一个双字词从
-    中间断开（如"教师"被拆成上一行末尾的"教"、下一行开头的"师"），block.text里就会出现
-    "...教\\n师..."这种词语中间夹着换行符的情况。LLM被要求"original_text必须逐字取自
-    正文"，但真实案例显示它读到这类跨行的词语时会把\\n转写/归一化成一个空格再引用（而
-    不是照原样保留\\n，或者干脆去掉\\n直接拼接），导致original_text里出现一个源文档里
-    其实并不存在的空格，进而被当成"多余空格/错别字"上报——这是转写伪影，不是原文真的
-    有这个空格或缺这个空格。
+    `native_pdf.py` 把 block 内多行用 `
+` 拼接，而 PDF 按页宽换行不认汉字词边界，一个双字词
+    常被从中间断开（"教师"→"教
+师"）。提示词要求 original_text 逐字取自正文，但真实案例显示
+    LLM 读到这类跨行词会把 `
+` 转写成一个空格再引用，于是 original_text 里出现一个源文档里
+    并不存在的空格，被当成"多余空格"上报（真实案例：`original_text="教务管理教 师"`、
+    `suggestion="应删除空格"`，原文那个位置只有一个被拼接掉的换行符）。
 
-    判定条件：state.layer是"确定性错误"（比这更宽松的层级不需要再降）+ original_text
-    含空格 + original_text本身（带空格）不是block.text的子串（证明这个空格不是原文/
-    解析结果真实携带的）+ original_text去掉所有空格后是block.text去掉所有换行符后的
-    子串（证明"去掉这些空格/换行符差异，内容确实原样来自block"）。要求整体去除后再
-    子串匹配，而不是逐个空格找\\n位置一一对应替换——真实案例验证过LLM转写时插入空格的
-    具体位置和block里\\n的真实位置可能相差一个字符（不是精确的\\n→空格单点替换，更像是
-    LLM按语义整体重新组织了一下），要求逐位置精确对应会漏判真实案例。
+    判据：original_text 含空格 **且** 带空格原样不是 `block.text` 的子串（证明这个空格不是原文
+    真实携带的）**且** 去掉所有空格后是 `block.text` 去掉所有换行符后的子串（证明内容确实原样
+    来自这个 block）。
+
+    **整体去除后再子串匹配，不逐个空格去找对应的 `
+` 位置**：真实案例里 LLM 插入空格的位置和
+    `
+` 的真实位置能差一个字符（"教务管理教 师" 的 `
+` 实际在"理"和"教"之间，空格却落在
+    "教"和"师"之间），它不是在做逐字符替换，更像是按对这个词的理解重新组织了一遍再输出。要求
+    逐位置精确对应会漏判真实案例。
+
+    **不要求 issue_type 必须是"错别字与拼写"**：子串匹配本身已经足够精确，用 issue_type 收窄
+    反而会漏掉 LLM 把同一现象归到"标点符号问题"的场景。也不区分深度/精简模式——它修的是
+    "LLM 转写出了原文里根本不存在的内容"这个正确性问题，与校对严格程度无关。
     """
-    if state.layer != config.LAYER_CONFIRMED:
-        return state
     if block is None or " " not in raw.original_text:
-        return state
+        return False
     if raw.original_text in block.text:
-        return state  # 空格是原文/解析结果里真实携带的，不是转写伪影，不豁免
-    despaced = raw.original_text.replace(" ", "")
-    flattened = block.text.replace("\n", "")
-    if despaced not in flattened:
-        return state  # 去除空格/换行后也对不上原文，不是这类伪影，保留原判定
-
-    notes = state.notes + ["original_text中的空格疑似PDF换行符被LLM转写成空格的伪影，原文中并无此空格，降级为存疑待核实"]
-    suggestion = (
-        "该处空格疑似因PDF内部排版换行被误转写产生，原文中并无此空格，建议对照原文核实后再处理：" + state.suggestion
-    )
-    return replace(state, layer=config.LAYER_DOUBTFUL, priority=config.PRIORITY_LOW, suggestion=suggestion, notes=notes)
-
-
-def _apply_layout_and_space_artifact_downgrade(
-    raw: RawIssue,
-    block: ParsedBlock | None,
-    tail_blocks: set[int],
-    state: _ClassificationState,
-) -> _ClassificationState:
-    """规则J：解析伪影兜底降级——版式错乱措辞 / 建议与原文仅空格差异。
-
-    起因：即使 core/classifier/postprocess.py 的丢弃过滤器（_filter_visually_no_op）
-    已经拦掉大部分部首/异体字替代型和控制字符乱码型假问题，真实数据（data/app.db
-    35号记录）显示仍有残留：有的suggestion只描述了original_text里某个片段的替换、
-    但那个片段不足以支撑discard过滤器判定"整条零改动"；有的LLM会自己在reason/
-    suggestion里承认这是"排版错乱""跨行错位""乱码"（PDF多栏/表格/图注版式被解析
-    打乱语序、拼接错行），这不是语言本身的错误，只是LLM也没看懂被打乱的版面；有的
-    建议和原文的唯一差异是空格数量（装饰性字间距、跨行拼接等排版原因导致，原文是否
-    真的多/少这个空格无法仅凭文本判断）。三种情况的共同点——都不是"一眼就能看出"的
-    确定性错误，必须至少降级为存疑，不能留在错误类。
-
-    在"确定性错误"或"存疑待核实"时都生效——不是只认前者。真实案例：某条issue
-    先被规则D（未定位）从确定性错误封顶降到存疑待核实，此时如果本规则仍然只认
-    `state.layer == 确定性错误`，会直接跳过，结果这条issue最终停在"存疑待核实/
-    中优先级"，既没有优先级降到最低，也没留下"这其实是纯空格差异"这条更有价值
-    的具体诊断——用户只看得到"未定位"，看不出这条根本不必核实。已经落在引文类/
-    风格类的issue（各自有自己的处理逻辑）才真正不需要本规则再插手。命中后优先级
-    强制改判最低（哪怕当前已经是存疑，也可能还停在未改判的中优先级），layer方面
-    如果当前已经是存疑待核实则保持不变，不会往回提升。
-
-    空格差异判定要先套一遍 _normalize_lookalike 再比较（而不是直接比较原始文本
-    去空格），是因为真实案例里空格差异经常和部首替代字同时出现在同一条issue里
-    （如"2 0 2 5年9⽉1 1⽇"→"2025年9月11日"，⽉是部首替代字、其余是空格差异），
-    只看原始文本去空格会因为部首字符不相等而漏判。
-    """
-    if state.layer not in (config.LAYER_CONFIRMED, config.LAYER_DOUBTFUL):
-        return state
-
-    combined = f"{raw.reason}{raw.suggestion}"
-    if any(k in combined for k in config.LAYOUT_ARTIFACT_KEYWORDS):
-        notes = state.notes + ["建议措辞疑似描述版式错乱/乱码，降级为存疑待核实"]
-        suggestion = (
-            "该问题疑似由文档排版错乱或解析乱码导致，不是确定性的语言错误，"
-            "建议对照原文核实后再处理：" + state.suggestion
-        )
-        return replace(state, layer=config.LAYER_DOUBTFUL, priority=config.PRIORITY_LOW, suggestion=suggestion, notes=notes)
-
-    pair = _extract_replacement_pair(raw)
-    if pair is not None:
-        old, new = pair
-        has_real_space_diff = _strip_whitespace(old) != old.strip() or _strip_whitespace(new) != new.strip()
-        if has_real_space_diff and _strip_whitespace(_normalize_lookalike(old)) == _strip_whitespace(_normalize_lookalike(new)):
-            notes = state.notes + ["建议与原文仅空格差异，疑似解析产生的空白伪影，降级为存疑待核实"]
-            suggestion = (
-                "该问题与原文的差异只有空格，疑似解析产生的空白伪影而非原文真实错误，"
-                "建议对照原文核实后再处理：" + state.suggestion
-            )
-            return replace(state, layer=config.LAYER_DOUBTFUL, priority=config.PRIORITY_LOW, suggestion=suggestion, notes=notes)
-
-    return state
+        return False  # 空格是原文/解析结果里真实携带的，不是转写伪影
+    return raw.original_text.replace(" ", "") in block.text.replace("\n", "")
 
 
 def _has_recency_doubt_wording(text: str) -> bool:
@@ -172,41 +104,29 @@ def _extract_years(text: str) -> list[int]:
     return [int(m[:4]) for m in _YEAR_RE.findall(text)]
 
 
-def _apply_recency_downgrade(
-    raw: RawIssue,
-    block: ParsedBlock | None,
-    tail_blocks: set[int],
-    state: _ClassificationState,
-) -> _ClassificationState:
-    """规则G：LLM单纯因知识时效性（年份超出训练数据覆盖范围）而怀疑，不是真的事实性错误。
+def _is_recency_misjudgment(raw: RawIssue) -> bool:
+    """LLM 只是因为年份超出它的训练数据覆盖范围而怀疑，不是真的发现了事实性错误。
 
-    只在 issue_type/category 落在"事实类"范围内、reason或suggestion里出现"怀疑年份太新"
-    的措辞、且原文里最大的年份落在[知识截止年份, 知识截止年份+容忍宽限期]区间时才生效——
-    超过宽限期视为真的离谱（如相差几十年），不豁免，保留原判定供人工核实。
+    这种怀疑**只针对"这个时间点本身存不存在"，不针对"该时间点发生的事是否属实"**——是模型
+    知识时效性的局限，不是文档的问题。
+
+    三个条件同时成立才算：issue_type/category 落在事实类范围内、`reason`/`suggestion` 命中
+    `config.RECENCY_DOUBT_KEYWORDS`（"训练数据""知识截止""较新"这类怀疑"时间太新"的措辞，不是
+    泛泛的事实怀疑）、原文里最大的年份落在 `[知识截止年份, +KNOWLEDGE_CUTOFF_GRACE_YEARS]`
+    区间内——超出宽限期视为真的离谱（如相差几十年），不算这一类，保留给人工核实。
     """
     if raw.category != "factual" and raw.issue_type != "常识与事实性错误":
-        return state
-
+        return False
     combined = f"{raw.reason}{raw.suggestion}"
     if not _has_recency_doubt_wording(combined):
-        return state
-
+        return False
     years = _extract_years(raw.original_text) or _extract_years(combined)
     if not years:
-        return state
-
+        return False
     max_year = max(years)
     if max_year <= config.LLM_KNOWLEDGE_CUTOFF_YEAR:
-        return state  # 年份没超过知识截止，不属于这条豁免场景
-    if max_year - config.LLM_KNOWLEDGE_CUTOFF_YEAR > config.KNOWLEDGE_CUTOFF_GRACE_YEARS:
-        return state  # 超出宽限期太多，视为真的离谱，不豁免
-
-    notes = state.notes + [
-        f"疑似因LLM知识时效性(截止{config.LLM_KNOWLEDGE_CUTOFF_YEAR}年)导致的误判"
-        f"(原文年份{max_year}，未超过{config.KNOWLEDGE_CUTOFF_GRACE_YEARS}年宽限期)，降级为存疑待核实+最低优先级"
-    ]
-    suggestion = "该问题疑似因AI知识时效性（训练数据未覆盖到这一时间点）产生的误判，建议直接忽略，除非另有证据：" + state.suggestion
-    return replace(state, layer=config.LAYER_DOUBTFUL, priority=config.PRIORITY_LOW, suggestion=suggestion, notes=notes)
+        return False
+    return max_year - config.LLM_KNOWLEDGE_CUTOFF_YEAR <= config.KNOWLEDGE_CUTOFF_GRACE_YEARS
 
 
 def _compute_chunk_tail_blocks(chunked: ChunkedDocument | None) -> set[int]:
@@ -228,46 +148,49 @@ def _compute_chunk_tail_blocks(chunked: ChunkedDocument | None) -> set[int]:
     return tail_blocks
 
 
-def _apply_chunk_boundary_downgrade(
-    raw: RawIssue,
-    block: ParsedBlock | None,
-    tail_blocks: set[int],
-    state: _ClassificationState,
-) -> _ClassificationState:
-    """规则H：分块(chunk)边界截断误判豁免。
+def _is_chunk_boundary_truncation(raw: RawIssue, block: ParsedBlock | None, tail_blocks: set[int]) -> bool:
+    """LLM 报的"内容不完整/缺标点"，其实是它在分块边界处看不到后续内容造成的误判。
 
-    起因：真实文档里一段悬挂缩进排版的列表被PyMuPDF拆成了两个ParsedBlock，又恰好被分块
-    算法切在两个不同chunk里——LLM校对前一个chunk时，正文原文在此处硬生生截断，看到的就是
-    一段"戛然而止"的文本，把"分块导致看不到后续"误判成"内容不完整/标点缺失"。
+    `config.OVERLAP_BLOCKS` 的重叠区只让后一块向前携带上一块的尾部供理解上文，从未设计"预览
+    下一块"。所以落在"所在 chunk 正文最后一个 block"里的内容，在 LLM 的视野里就是到此为止——
+    它据此判断"这句话没说完"是**合理的**，不是凭空捏造，因此不能靠改提示词指望它猜到自己看漏
+    了内容，只能由系统层用确定性的结构事实来识别。
 
-    命中条件：issue所在block是它所在chunk正文的最后一个block（且该chunk不是全文档最后一
-    个chunk）+ block文本本身不以句末标点收尾（看起来像被截断，不是正常段落收尾）+ 被flag
-    的原文原样出现在该block的结尾处（避免"block确实在chunk尾但issue其实在block中间"的误伤）。
-    只在基础归层已判定为"确定性错误"时才降级——存疑/引文/风格本身已经比确定性错误宽松。
+    四个条件同时成立：`block_index` 在 `tail_blocks` 里（是所在 chunk 正文尾块，且该 chunk 不是
+    全文档最后一块——最后一块后面确实没有内容了）**且** block 原文不以句末标点收尾（正常收尾的
+    段落即使卡在边界也不该被怀疑）**且** 被 flag 的 original_text 原样是该 block 的结尾片段
+    （排除"block 确实在 chunk 尾、但问题其实出在 block 中间别处"）。
+
+    **为什么不在解析阶段把这类 block 合并回去**：诊断真实案例时量过，被拆开的两个 block 之间的
+    行间距（约12pt）和同一悬挂缩进段落里"真正的新条目"之间几乎完全相同（同一份文档实测都在
+    12.2~13.0pt），唯一可靠的区分信号是横坐标缩进——那是这份文档排版软件的具体几何特征，换个
+    软件未必成立，而且完全不覆盖 OCR/Word 两条通道。这里用的"是不是 chunk 正文尾块"是从
+    `ChunkedDocument` 直接读出的结构事实，不依赖任何排版几何假设。
     """
-    if state.layer != config.LAYER_CONFIRMED:
-        return state
-    if raw.block_index not in tail_blocks:
-        return state
-    if block is None:
-        return state
-
+    if raw.block_index not in tail_blocks or block is None:
+        return False
     block_text = block.text.rstrip()
     if block_text and block_text[-1] in _SENTENCE_TERMINAL_PUNCT:
-        return state  # block本身以句末标点正常收尾，不像是被截断的
+        return False
     flagged = raw.original_text.strip()
-    if not flagged or not block_text.endswith(flagged):
-        return state  # 被flag的原文不是该block的结尾片段，不是这次要拦的场景
+    return bool(flagged) and block_text.endswith(flagged)
 
-    notes = state.notes + [
-        "疑似因分块(chunk)边界截断导致的误判：该block是所在分块正文的最后一块，"
-        "且不以句末标点收尾，LLM校对时未看到后续分块内容"
-    ]
-    suggestion = (
-        "该问题疑似因文档分块处理、AI在此处未能看到后续分块内容而产生的误判"
-        "（原文在此处被分块边界截断，并非原文真的不完整），建议对照原文续接内容核实后再处理：" + state.suggestion
+
+def is_artifact_misjudgment(raw: RawIssue, block: ParsedBlock | None, tail_blocks: set[int]) -> bool:
+    """这条 issue 是不是"我们自己造成的误判"——解析伪影、模型知识边界、分块边界三选一。
+
+    三类的共同点：**问题不在文档里，在我们这条流水线上**。它们原先各自降级为存疑待核实并在
+    建议前贴一句"疑似……建议核实后再处理"，现在整条丢弃——用户明确要求：那句话本身就是噪声，
+    用户看到的仍是一条要处理的问题，而它百分之百不是原文的错。
+
+    判定挪到归层**之前**，所以不再看 layer，引文类/风格类也一并丢。不违反引文保护铁律——那条
+    要的是"不对引文提改动建议"，这里是把一条压根不存在的问题整个删掉，比"原文照录"更保守。
+    """
+    return (
+        _is_recency_misjudgment(raw)
+        or _is_linewrap_space_artifact(raw, block)
+        or _is_chunk_boundary_truncation(raw, block, tail_blocks)
     )
-    return replace(state, layer=config.LAYER_DOUBTFUL, priority=config.PRIORITY_LOW, suggestion=suggestion, notes=notes)
 
 
 def _apply_priority_override(
@@ -294,9 +217,5 @@ def _apply_priority_override(
 _MODIFIER_RULES = (
     ("OCR低置信度降级(规则C)", _apply_ocr_downgrade),
     ("未定位封顶(规则D)", _apply_unlocated_cap),
-    ("PDF换行符转写成空格的伪影豁免(规则I)", _apply_linewrap_space_artifact_downgrade),
-    ("版式错乱/空格差异兜底降级(规则J)", _apply_layout_and_space_artifact_downgrade),
-    ("知识时效性豁免(规则G，依赖前面规则已判定的层级)", _apply_recency_downgrade),
-    ("分块边界截断豁免(规则H，只在仍是确定性错误时生效，需在G之后跑)", _apply_chunk_boundary_downgrade),
     ("高优先级覆盖(政治敏感/民族地名，与layer无关，放最后)", _apply_priority_override),
 )
