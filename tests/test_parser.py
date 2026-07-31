@@ -55,13 +55,35 @@ def double_column_doc():
 # 完全无分隔地粘连成乱码，误导LLM把"解析伪影"当成"错别字/语法问题"来报）
 # ---------------------------------------------------------------------------
 
+def _line(text, bbox, size):
+    """按 PyMuPDF `rawdict` 的形状造一个 line：字符在 bbox 里等宽排开。
+
+    `rawdict` 比 `dict` 多的就是每个 span 里的 `chars`（单字符 bbox）——只有它能看出
+    全角开括号的墨迹偏在字框右半（见 core/parser/_glyphs.py）。等宽铺开对只关心**行级**
+    拼接的用例足够；要验证字符级排序的用例（下面"全角开括号"一节）另外逐字给真实坐标。
+    """
+    x0, y0, x1, y1 = bbox
+    step = (x1 - x0) / len(text) if text else 0.0
+    chars = [{"c": c, "bbox": (x0 + i * step, y0, x0 + (i + 1) * step, y1)} for i, c in enumerate(text)]
+    return {"bbox": bbox, "spans": [{"size": size, "chars": chars}]}
+
+
+def _char_line(chars, size=8.5):
+    """逐字给定 (字符, x0, x1) 的 line——供需要真实字符坐标的用例用，y 统一取一行的高度。"""
+    y0, y1 = 522.2, 530.7
+    return {
+        "bbox": (min(c[1] for c in chars), y0, max(c[2] for c in chars), y1),
+        "spans": [{"size": size, "chars": [{"c": c, "bbox": (x0, y0, x1, y1)} for c, x0, x1 in chars]}],
+    }
+
+
 class _FakeNativePage:
-    """伪造一个具备 get_text("dict") 接口的对象，隔离测试 _extract_native_page_raw
+    """伪造一个具备 get_text("rawdict") 接口的对象，隔离测试 _extract_native_page_raw
     的拼接逻辑，不依赖真实PDF文件里恰好存在多行block。两行的bbox在y轴上完全不重叠
     （100~115 vs 118~133），代表纵向上真正独立的两行，不应被判定为同一视觉行。"""
 
     def get_text(self, mode):
-        assert mode == "dict"
+        assert mode == "rawdict"
         return {
             "width": 600.0,
             "height": 800.0,
@@ -70,8 +92,8 @@ class _FakeNativePage:
                     "type": 0,
                     "bbox": (50.0, 100.0, 550.0, 140.0),
                     "lines": [
-                        {"bbox": (50.0, 100.0, 200.0, 115.0), "spans": [{"text": "第一行文字：", "size": 12.0}]},
-                        {"bbox": (50.0, 118.0, 200.0, 133.0), "spans": [{"text": "第二行文字。", "size": 12.0}]},
+                        _line("第一行文字：", (50.0, 100.0, 200.0, 115.0), 12.0),
+                        _line("第二行文字。", (50.0, 118.0, 200.0, 133.0), 12.0),
                     ],
                 }
             ],
@@ -95,7 +117,7 @@ class _FakeNativePageSameRowMisplit:
     "项目符号应换行"的格式问题，见 core/parser/CLAUDE.md）。"""
 
     def get_text(self, mode):
-        assert mode == "dict"
+        assert mode == "rawdict"
         return {
             "width": 600.0,
             "height": 800.0,
@@ -104,8 +126,8 @@ class _FakeNativePageSameRowMisplit:
                     "type": 0,
                     "bbox": (90.0, 698.5, 524.4, 710.1),
                     "lines": [
-                        {"bbox": (90.0, 698.5, 98.3, 710.1), "spans": [{"text": "", "size": 10.0}]},
-                        {"bbox": (111.0, 698.9, 524.4, 709.4), "spans": [{"text": "系统管理员享有学生的功能", "size": 10.5}]},
+                        _line("", (90.0, 698.5, 98.3, 710.1), 10.0),
+                        _line("系统管理员享有学生的功能", (111.0, 698.9, 524.4, 709.4), 10.5),
                     ],
                 }
             ],
@@ -126,7 +148,7 @@ class _FakeNativePageBarelyOverlapping:
     应仍判定为纵向上真正不同的两行，用换行符拼接，不能被误判成同一视觉行。"""
 
     def get_text(self, mode):
-        assert mode == "dict"
+        assert mode == "rawdict"
         return {
             "width": 600.0,
             "height": 800.0,
@@ -135,8 +157,8 @@ class _FakeNativePageBarelyOverlapping:
                     "type": 0,
                     "bbox": (50.0, 100.0, 550.0, 140.0),
                     "lines": [
-                        {"bbox": (50.0, 100.0, 200.0, 116.0), "spans": [{"text": "第一行文字：", "size": 12.0}]},
-                        {"bbox": (50.0, 115.0, 200.0, 133.0), "spans": [{"text": "第二行文字。", "size": 12.0}]},
+                        _line("第一行文字：", (50.0, 100.0, 200.0, 116.0), 12.0),
+                        _line("第二行文字。", (50.0, 115.0, 200.0, 133.0), 12.0),
                     ],
                 }
             ],
@@ -150,6 +172,294 @@ def test_native_pdf_barely_overlapping_lines_still_join_with_newline():
 
     assert len(raw_blocks) == 1
     assert raw_blocks[0]["text"] == "第一行文字：\n第二行文字。"
+
+
+# ---------------------------------------------------------------------------
+# 被栏宽顶回来的续写块并回上一块（core/parser/_paragraphs.py）：这类期刊里
+# PyMuPDF 的一个 block 常常就是一个视觉行，同一段话被栏宽切开后落在相邻的两个
+# block 里，core/chunker/ 在块之间插 `\n`，LLM 就看到"…工业典型应用场\n景，助力…"
+# 这种词中断行。七道闸门各挡一类实测到的误合并，下面逐条钉住。
+# ---------------------------------------------------------------------------
+
+def _wrap_block(text, bbox, size=8.0, column="col1", last_row=None):
+    """构造一个已排好序、带 column 的块（`_order_native_page` 输出的形状）。"""
+    return {
+        "text": text,
+        "bbox": bbox,
+        "avg_size": size,
+        "column": column,
+        "zone": "body",
+        "block_type": "paragraph",
+        "last_row_bbox": last_row or bbox,
+        "last_row_size": size,
+    }
+
+
+# 一栏宽 [50, 250]：满行顶到 250，正文字号 8.0，行高 10
+def _full_line(text, y, **kw):
+    return _wrap_block(text, (50.0, y, 250.0, y + 10.0), **kw)
+
+
+def test_wrapped_blocks_same_column_continuation_merges():
+    from core.parser._paragraphs import merge_wrapped_blocks
+
+    merged = merge_wrapped_blocks([
+        _full_line("讲解AI Agent关键技术与工业典型应用场", 100.0),
+        _full_line("景，助力企业把握技术前沿。", 111.0),
+    ])
+
+    assert len(merged) == 1
+    # 中文续写行之间不插任何分隔符
+    assert merged[0]["text"] == "讲解AI Agent关键技术与工业典型应用场景，助力企业把握技术前沿。"
+
+
+def test_wrapped_blocks_latin_word_boundary_gets_a_space():
+    """★防线：断裂处两侧都是拉丁字母/数字时补空格，否则造出 `GEVernova` 这种连写词。"""
+    from core.parser._paragraphs import merge_wrapped_blocks
+
+    merged = merge_wrapped_blocks([
+        _full_line("通用电气维尔萨公司（GE", 100.0),
+        _full_line("Vernova）宣布与投资机构达成协议", 111.0),
+    ])
+
+    assert len(merged) == 1
+    assert merged[0]["text"] == "通用电气维尔萨公司（GE Vernova）宣布与投资机构达成协议"
+
+
+def test_wrapped_blocks_across_columns_do_not_merge():
+    from core.parser._paragraphs import merge_wrapped_blocks
+
+    merged = merge_wrapped_blocks([
+        _full_line("上一栏最后一行没说完的内容还在继续排", 100.0, column="col1"),
+        _full_line("下一栏开头是另一段毫不相干的文字", 111.0, column="col2"),
+    ])
+
+    assert len(merged) == 2
+
+
+def test_wrapped_blocks_spanning_title_does_not_merge():
+    from core.parser._paragraphs import merge_wrapped_blocks
+
+    merged = merge_wrapped_blocks([
+        _full_line("横跨整页的通栏标题没有句末标点", 100.0, column="span"),
+        _full_line("下面这一段是栏内正文的开头一行内容", 111.0, column="span"),
+    ])
+
+    assert len(merged) == 2
+
+
+def test_wrapped_blocks_different_font_size_do_not_merge():
+    """标题字号比正文大，不该被并进下面的正文。"""
+    from core.parser._paragraphs import merge_wrapped_blocks
+
+    merged = merge_wrapped_blocks([
+        _full_line("这是一个字号明显更大的小标题排满了一整行", 100.0, size=10.0),
+        _full_line("这是紧接在标题下面的正文第一行内容", 111.0, size=8.0),
+    ])
+
+    assert len(merged) == 2
+
+
+def test_wrapped_blocks_short_last_line_does_not_merge():
+    """★防线：目录页码 `2`、竖排刊名这类又短又恰好靠右的块，必须被"满行"闸门挡住。"""
+    from core.parser._paragraphs import merge_wrapped_blocks
+
+    merged = merge_wrapped_blocks([
+        _wrap_block("2", (240.0, 100.0, 250.0, 110.0)),
+        _full_line("论坛计划与参会指南", 111.0),
+    ])
+
+    assert len(merged) == 2
+
+
+def test_wrapped_blocks_next_starting_with_list_marker_does_not_merge():
+    from core.parser._paragraphs import merge_wrapped_blocks
+
+    merged = merge_wrapped_blocks([
+        _full_line("• 华润三九：以数字化重塑中药生产全流程管控", 100.0),
+        _full_line("• 格力电器：黑灯工厂的产线自动化实践", 111.0),
+    ])
+
+    assert len(merged) == 2
+
+
+def test_wrapped_blocks_dot_leader_does_not_merge():
+    """目录行 `标题………3` 的下一块是目录的下一条，不是它的续写。"""
+    from core.parser._paragraphs import merge_wrapped_blocks
+
+    merged = merge_wrapped_blocks([
+        _full_line("（一）报名方式…………………………3", 100.0),
+        _full_line("（二）进入会场的路线与停车指引说明", 111.0),
+    ])
+
+    assert len(merged) == 2
+
+
+def test_wrapped_blocks_sentence_end_does_not_merge():
+    from core.parser._paragraphs import merge_wrapped_blocks
+
+    merged = merge_wrapped_blocks([
+        _full_line("本次论坛的全部议程到此已经介绍完毕。", 100.0),
+        _full_line("下面是完全另起一段的新内容开头一行", 111.0),
+    ])
+
+    assert len(merged) == 2
+
+
+def test_wrapped_blocks_far_apart_do_not_merge():
+    """纵向隔了一个段落间距/跨了版块，不是同一段。"""
+    from core.parser._paragraphs import merge_wrapped_blocks
+
+    merged = merge_wrapped_blocks([
+        _full_line("上一个版块最后一行文字排满了整整一行", 100.0),
+        _full_line("隔了很远的下一个版块开头的一行文字", 160.0),
+    ])
+
+    assert len(merged) == 2
+
+
+def test_wrapped_blocks_judge_by_last_row_not_block_bbox():
+    """★防线：判"顶到栏最右"必须用块的**最后一行**，不是块 bbox。
+
+    真实踩坑：`5. 目前的局限性` 这种小标题，块 bbox 的 x1 被块内上面更长的行顶到了
+    栏右，用块 bbox 判就会把它误判成续写行、把下面的正文并进来。
+    """
+    from core.parser._paragraphs import merge_wrapped_blocks
+
+    heading = _wrap_block(
+        "上面这行排满了一整行文字所以块很宽\n5. 目前的局限性",
+        (50.0, 90.0, 250.0, 110.0),                 # 块 bbox 顶到了栏右 250
+        last_row=(50.0, 100.0, 130.0, 110.0),       # 但最后一行只排到 130
+    )
+    merged = merge_wrapped_blocks([heading, _full_line("这是紧接在小标题下面的正文", 111.0)])
+
+    assert len(merged) == 2
+
+
+# ---- 块内行拼接（同一段被栏宽切开时两截落在一个block的两个line里）----
+
+def test_wrapped_lines_same_row_cells_stay_newline():
+    """★防线：表格同一行的两格（`制造业AIAgent实战落地特训营` | `合肥`）必须靠"纵向重叠"
+    这道下界挡住，坐标取自真实文档（预览版PDF第3页）。
+
+    这两格 y 只差 0.63pt、重叠 92%，横向却隔了 22 倍行高——`_lines_share_same_row` 的横向
+    闸门会放行它们，而"紧邻"只判上界的话，负间距天然满足，两格就被拼成了病句。
+    """
+    from core.parser._paragraphs import _local_right_edge, line_join_separator
+
+    boxes = [(112.0, 147.39, 223.4, 154.89), (392.9, 148.02, 408.2, 155.52)]
+    sep = line_join_separator("制造业AIAgent实战落地特训营", boxes[0], 7.5,
+                              "合肥", boxes[1], 7.5, _local_right_edge(boxes, boxes[0]))
+
+    assert sep is None
+
+def test_wrapped_lines_inside_block_join_seamlessly():
+    """活动日历单元格里的两行标题：行0顶到本竖排最右、行1是它的续写，坐标取自真实文档。"""
+    from core.parser._paragraphs import _local_right_edge, line_join_separator
+
+    boxes = [(173.8, 137.0, 246.0, 144.5), (173.8, 145.0, 224.7, 152.5)]
+    sep = line_join_separator("AI赋能设备全寿命周期", boxes[0], 7.0,
+                              "管理高级研修班", boxes[1], 7.0,
+                              _local_right_edge(boxes, boxes[0]))
+
+    assert sep == ""
+
+
+def test_wrapped_lines_local_right_edge_ignores_side_by_side_cell():
+    """★防线：块内并排两格时，尺子必须是本格的右边距，不是整个块的最右。
+
+    真实文档（预览版PDF第17页）有个块含左右两格共4行：右格 x∈[277,344]、左格 x∈[216,258]。
+    拿块最右 344 当尺子，左格的满行永远够不着，一处也合不上。
+    """
+    from core.parser._paragraphs import _local_right_edge
+
+    boxes = [
+        (277.3, 526.0, 343.6, 533.0),   # 右格 行0
+        (277.3, 533.5, 335.5, 540.5),   # 右格 行1
+        (215.7, 519.0, 257.5, 526.0),   # 左格 行0
+        (215.7, 526.5, 251.2, 533.5),   # 左格 行1
+    ]
+
+    assert _local_right_edge(boxes, boxes[2]) == 257.5   # 左格：只看左格自己
+    assert _local_right_edge(boxes, boxes[0]) == 343.6   # 右格：只看右格自己
+
+
+def test_wrapped_lines_short_line_inside_block_stays_newline():
+    """日历里的日期数字（宽约1.2个字）顶到格子最右也不算满行，必须仍然换行。"""
+    from core.parser._paragraphs import line_join_separator
+
+    sep = line_join_separator("10", (129.4, 126.0, 137.9, 133.0), 7.0,
+                              "11", (129.4, 134.0, 138.0, 141.0), 7.0, 137.9)
+
+    assert sep is None
+
+
+def test_last_visual_row_unions_misplit_lines():
+    """`_last_visual_row` 要把被 PyMuPDF 误拆的同一视觉行并起来，否则末行宽度被低估。"""
+    from core.parser.native_pdf import _last_visual_row
+
+    bbox, size = _last_visual_row(
+        [(50.0, 90.0, 250.0, 100.0), (50.0, 101.0, 120.0, 111.0), (125.0, 101.5, 250.0, 111.0)],
+        [8.0, 8.0, 8.5],
+    )
+
+    assert bbox == (50.0, 101.0, 250.0, 111.0)
+    assert size == 8.5
+
+
+# ---------------------------------------------------------------------------
+# 字符级装配的两件事要**每行**都做，不能只挂在"同一视觉行被拆成两个line"那条路径上：
+# 按墨迹位置重排字序、清掉被相邻字符盖住的填充空格。判据都只看坐标。
+# 另：编码成未映射占位码位的词间空格（`AI\x01Agent`）要还原成真空格，不能当装饰删掉。
+# ---------------------------------------------------------------------------
+
+def _char(c, x0, x1, y0=100.0, y1=110.0):
+    return {"c": c, "bbox": (x0, y0, x1, y1)}
+
+
+def test_single_line_block_reorders_misplaced_bracket():
+    """★防线：`2《. 航空…》` 里 `.` 的字框整个落在 `《` 的空白左半，PDF流序是 `2 《 .`。
+
+    坐标取自真实文档（预览版PDF第6页）。这一行没被 PyMuPDF 拆开，走不到
+    `_merge_same_row_chars`，只有逐行排序才修得掉。
+    """
+    from core.parser._glyphs import _chars_text, sort_line_by_ink
+
+    chars = [_char("2", 270.967, 275.684), _char("《", 273.586, 282.086),
+             _char(".", 275.493, 277.856), _char("航", 281.915, 290.415)]
+
+    assert _chars_text(sort_line_by_ink(chars)) == "2.《航"
+
+
+def test_sort_line_by_ink_keeps_correct_line_unchanged():
+    """本来就正确的 `1.《数据` 排完必须原样不动——逐行排序是新加的，这条钉住它不乱动好行。"""
+    from core.parser._glyphs import _chars_text, sort_line_by_ink
+
+    chars = [_char("1", 57.34, 62.06), _char(".", 62.44, 64.80),
+             _char("《", 61.10, 69.60), _char("数", 69.60, 78.10)]
+
+    assert _chars_text(sort_line_by_ink(chars)) == "1.《数"
+
+
+def test_restore_unmapped_glyph_space_between_latin():
+    """`AI Agent` 在PDF里是 `A I \\x01 A g e n t`，那个占位码位就是词间空格，删掉会变 `AIAgent`。"""
+    from core.parser._glyphs import _chars_text, restore_unmapped_glyph_spaces
+
+    span_chars = [[_char("A", 70.7, 75.9), _char("I", 76.3, 78.8)],
+                  [_char("\x01", 78.8, 80.7), _char("A", 80.7, 85.8), _char("g", 86.2, 91.0)]]
+    restore_unmapped_glyph_spaces(span_chars)
+
+    assert _chars_text([c for s in span_chars for c in s]) == "AI Ag"
+
+
+def test_unmapped_glyph_next_to_cjk_stays_decorative():
+    """★防线：汉字旁边的占位码位是装饰图标（`\\x01活动日历`），必须仍被当装饰、照删。"""
+    from core.parser._glyphs import restore_unmapped_glyph_spaces
+
+    span_chars = [[_char("道", 10.0, 18.5), _char("\x01", 18.5, 20.4), _char("活", 20.4, 28.9)]]
+    restore_unmapped_glyph_spaces(span_chars)
+
+    assert span_chars[0][1]["c"] == "\x01"
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +512,7 @@ class _FakeNativePageCjkVariant:
     normalize_cjk_variants 函数本身正确。"""
 
     def get_text(self, mode):
-        assert mode == "dict"
+        assert mode == "rawdict"
         return {
             "width": 600.0,
             "height": 800.0,
@@ -211,7 +521,7 @@ class _FakeNativePageCjkVariant:
                     "type": 0,
                     "bbox": (50.0, 100.0, 550.0, 116.0),
                     "lines": [
-                        {"bbox": (50.0, 100.0, 200.0, 116.0), "spans": [{"text": "⼯业互联⽹平台", "size": 12.0}]},
+                        _line("⼯业互联⽹平台", (50.0, 100.0, 200.0, 116.0), 12.0),
                     ],
                 }
             ],
@@ -269,7 +579,7 @@ class _FakeNativePageUnmappedGlyphs:
     坐标让两行在y轴上完全不重叠，代表纵向真正独立的两行。"""
 
     def get_text(self, mode):
-        assert mode == "dict"
+        assert mode == "rawdict"
         return {
             "width": 600.0,
             "height": 800.0,
@@ -278,8 +588,8 @@ class _FakeNativePageUnmappedGlyphs:
                     "type": 0,
                     "bbox": (50.0, 100.0, 550.0, 140.0),
                     "lines": [
-                        {"bbox": (50.0, 100.0, 60.0, 115.0), "spans": [{"text": "\x01", "size": 12.0}]},
-                        {"bbox": (50.0, 120.0, 300.0, 135.0), "spans": [{"text": "e-works\x01简介", "size": 12.0}]},
+                        _line("\x01", (50.0, 100.0, 60.0, 115.0), 12.0),
+                        _line("e-works\x01简介", (50.0, 120.0, 300.0, 135.0), 12.0),
                     ],
                 }
             ],
@@ -296,6 +606,264 @@ def test_native_pdf_extract_strips_unmapped_glyphs_and_drops_icon_only_line():
     assert raw_blocks[0]["text"] == "e-works简介"
 
 
+# ---------------------------------------------------------------------------
+# 全角开括号的墨迹只占字框右半，导致字框顺序 ≠ 视觉顺序（core/parser/_glyphs.py）
+# 坐标全部取自真实文档（预览版活动计划第6页 `1.《数据治理框架及实践之道》`，字号8.5），
+# 改动前拼出来是 `1《 . 数据治理框架及实践之道》`，一份刊物里几十条"书名号里多个句点"
+# 的假错误全出自这里。
+# ---------------------------------------------------------------------------
+
+class _FakeNativePageOpenBracketMisorder:
+    """PyMuPDF 把 `1.《数据…》` 拆成 `1《` / `. 数据…》` 两个 line：`《` 字框 61.10 起、
+    墨迹却约从 64.8 才开始，`.`(62.44–64.80) 整个落在它的空白左半里，`《` 与 `.` 之间
+    那个 64.80–69.43 的空格是排版填充（字框几乎完全被 `《` 盖住）。"""
+
+    def get_text(self, mode):
+        assert mode == "rawdict"
+        return {
+            "width": 600.0,
+            "height": 800.0,
+            "blocks": [
+                {
+                    "type": 0,
+                    "bbox": (57.3, 522.2, 175.5, 530.7),
+                    "lines": [
+                        _char_line([("1", 57.34, 62.06), ("《", 61.10, 69.60)]),
+                        _char_line(
+                            [(".", 62.44, 64.80), (" ", 64.80, 69.43)]
+                            + [(c, 69.43 + i * 8.5, 77.93 + i * 8.5) for i, c in enumerate("数据治理框架及实践之道》")]
+                        ),
+                    ],
+                }
+            ],
+        }
+
+
+def test_native_pdf_open_bracket_order_restored():
+    """★ 那几十条假错误的核心用例：句点必须落回书名号外面，填充空格一并消失。"""
+    from core.parser.native_pdf import _extract_native_page_raw
+
+    raw_blocks, _ = _extract_native_page_raw(_FakeNativePageOpenBracketMisorder())
+
+    assert raw_blocks[0]["text"] == "1.《数据治理框架及实践之道》"
+
+
+def test_ink_adjusted_x_shifts_only_opening_brackets():
+    """★ 防"顺手对称处理"：闭括号/后引号的墨迹在字框左半，字框左边界与视觉位置本来就
+    一致，做了修正反而会排坏。"""
+    from core.parser._glyphs import _ink_adjusted_x
+
+    box = (61.10, 522.2, 69.60, 530.7)
+    assert _ink_adjusted_x({"c": "《", "bbox": box}) == 65.35
+    assert _ink_adjusted_x({"c": "》", "bbox": box}) == 61.10
+    assert _ink_adjusted_x({"c": "”", "bbox": box}) == 61.10
+    assert _ink_adjusted_x({"c": "数", "bbox": box}) == 61.10
+
+
+def test_filler_space_covered_by_neighbour_dropped_but_word_space_kept():
+    """字框被邻字盖住的是排版填充，要丢；与左右邻字都不重叠的是真正的词间隔，要留。"""
+    from core.parser._glyphs import _chars_text, drop_filler_spaces
+
+    filler = [
+        {"c": ".", "bbox": (62.44, 0.0, 64.80, 1.0)},
+        {"c": " ", "bbox": (64.80, 0.0, 69.43, 1.0)},
+        {"c": "《", "bbox": (61.10, 0.0, 69.60, 1.0)},
+    ]
+    assert _chars_text(drop_filler_spaces(filler)) == ".《"
+
+    real = [
+        {"c": "A", "bbox": (10.0, 0.0, 15.0, 1.0)},
+        {"c": " ", "bbox": (15.0, 0.0, 19.0, 1.0)},
+        {"c": "B", "bbox": (19.0, 0.0, 24.0, 1.0)},
+    ]
+    assert _chars_text(drop_filler_spaces(real)) == "A B"
+
+
+class _FakeNativePageStackedLines:
+    """★ 防过度合并：79期第19页股票表格里 `*ST` 与 `⼯智` 被拆成两个 line，但两者 x 范围
+    几乎完全重合（叠印在同一位置，重叠 13.7pt ≈ 两个字宽）。逐字符排会排成 `⼯*S智T`，
+    按视觉顺序前后调也没有可靠依据（只差 0.79pt），应保持 PyMuPDF 原序用空格拼。"""
+
+    def get_text(self, mode):
+        assert mode == "rawdict"
+        return {
+            "width": 1009.0,
+            "height": 720.0,
+            "blocks": [
+                {
+                    "type": 0,
+                    "bbox": (707.36, 468.74, 722.26, 476.19),
+                    "lines": [
+                        _char_line([("*", 708.15, 711.92), ("S", 711.92, 716.57), ("T", 716.40, 721.06)]),
+                        _char_line([("⼯", 707.36, 714.81), ("智", 714.81, 722.26)]),
+                    ],
+                }
+            ],
+        }
+
+
+def test_native_pdf_stacked_lines_not_merged_char_by_char():
+    from core.parser.native_pdf import _extract_native_page_raw
+
+    raw_blocks, _ = _extract_native_page_raw(_FakeNativePageStackedLines())
+
+    assert raw_blocks[0]["text"] == "*ST 工智"  # 康熙部首码位已由 _cjk_variants 归一化
+
+
+class _FakeNativePageReversedRowOrder:
+    """真实场景复现：PyMuPDF 给的行序与视觉顺序相反——`合肥`(x393) 排在
+    `9月17-18日`(x332) 前面。两段横向完全不重叠，按视觉顺序调过来用空格拼。"""
+
+    def get_text(self, mode):
+        assert mode == "rawdict"
+        return {
+            "width": 600.0,
+            "height": 800.0,
+            "blocks": [
+                {
+                    "type": 0,
+                    "bbox": (332.0, 522.2, 410.0, 530.7),
+                    "lines": [
+                        _line("合肥", (393.0, 522.2, 410.0, 530.7), 8.5),
+                        _line("9月17-18日", (332.0, 522.2, 380.0, 530.7), 8.5),
+                    ],
+                }
+            ],
+        }
+
+
+def test_native_pdf_same_row_lines_reordered_by_x():
+    from core.parser.native_pdf import _extract_native_page_raw
+
+    raw_blocks, _ = _extract_native_page_raw(_FakeNativePageReversedRowOrder())
+
+    assert raw_blocks[0]["text"] == "9月17-18日 合肥"
+
+
+class _FakeNativePageAdjacentHeadings:
+    """★ 防"只要挨着就按字符拼"：真实文档里 `课程介绍`(574.7–603.6) 与
+    `讲师介绍`(603.4–624.3) 是并排的两个表头，字框有 0.2pt 擦边重叠但并没有交错，
+    按字符拼会把中间那个必要的分隔空格吃掉，变成 `课程介绍讲师介绍`。"""
+
+    def get_text(self, mode):
+        assert mode == "rawdict"
+        return {
+            "width": 800.0,
+            "height": 800.0,
+            "blocks": [
+                {
+                    "type": 0,
+                    "bbox": (574.7, 333.0, 624.3, 338.2),
+                    "lines": [
+                        _line("课程介绍", (574.73, 333.0, 603.62, 338.2), 5.2),
+                        _line("讲师介绍", (603.42, 333.0, 624.25, 338.2), 5.2),
+                    ],
+                }
+            ],
+        }
+
+
+def test_native_pdf_adjacent_headings_keep_separating_space():
+    from core.parser.native_pdf import _extract_native_page_raw
+
+    raw_blocks, _ = _extract_native_page_raw(_FakeNativePageAdjacentHeadings())
+
+    assert raw_blocks[0]["text"] == "课程介绍 讲师介绍"
+
+
+# ---------------------------------------------------------------------------
+# 排版字距微调被导出成真空格：`APS`→`A PS`、`BOM`→`B O M`（core/parser/_glyphs.py）
+# 判据是"空格宽度 vs 同span内字母间隙的中位数"——**不是**按字号或众数空格宽归一化，
+# 那条在真实数据上证伪过（两端对齐会压缩真词间空格，与假空格完全交叠）。
+# ---------------------------------------------------------------------------
+
+def _tracked_span(text, x0=133.95, char_w=5.16, tracking=1.28, size=8.5):
+    """按"整段均匀施加字距"铺出一个 span：每个字符之间（含空格位置）都隔 tracking。
+
+    这样空格宽度恰好等于字母间隙，正是真实文档里假空格的样子。
+    """
+    chars = []
+    x = x0
+    for c in text:
+        w = tracking if c == " " else char_w
+        chars.append({"c": c, "bbox": (x, 0.0, x + w, 8.5)})
+        x += w + (0.0 if c == " " else tracking)
+    return {"size": size, "chars": chars}
+
+
+def test_tracking_space_between_latin_dropped():
+    """★ 用户报的那类：`A PS` 里那个 1.28pt 的空格与字母间隙同宽，是字距微调不是词间隔。"""
+    from core.parser._glyphs import _chars_text, _drop_tracking_spaces
+
+    span = _tracked_span("注重A PS应用落地深入学习")
+    assert _chars_text(_drop_tracking_spaces(span["chars"])) == "注重APS应用落地深入学习"
+
+
+def test_real_word_space_kept_even_when_narrow():
+    """★ 防阈值调过头：两端对齐排版会把真词间空格压得很窄（`Plant Design` 只有众数宽的
+    0.45），但它仍远宽于字母间隙——普通紧排文本里字母是贴着的。"""
+    from core.parser._glyphs import _chars_text, _drop_tracking_spaces
+
+    chars = []
+    x = 0.0
+    for c in "Featured Topic 与 Plant Design":
+        w = 2.42 if c == " " else 4.8
+        chars.append({"c": c, "bbox": (x, 0.0, x + w, 8.5)})
+        x += w + 0.10  # 紧排：字母间隙 0.1pt，远小于 2.42 的空格
+    assert _chars_text(_drop_tracking_spaces(chars)) == "Featured Topic 与 Plant Design"
+
+
+def test_tracking_space_needs_latin_on_both_sides():
+    """★ 汉字与URL之间那类真空格（`数字化企业网 www.e-works`，几百处）不进删除范围，
+    哪怕它窄到和字母间隙同宽。"""
+    from core.parser._glyphs import _chars_text, _drop_tracking_spaces
+
+    span = _tracked_span("数字化企业网 www")
+    assert _chars_text(_drop_tracking_spaces(span["chars"])) == "数字化企业网 www"
+
+
+def test_tracking_space_skipped_when_too_few_gap_samples():
+    """样本量不足时不判定——中位数不可靠，宁可漏修也不误删。"""
+    from core.parser._glyphs import _chars_text, _drop_tracking_spaces
+
+    span = _tracked_span("A B")  # 非空格字符对只有 0 组，够不到最小样本量
+    assert _chars_text(_drop_tracking_spaces(span["chars"])) == "A B"
+
+
+class _FakeNativePageTrackingSpaces:
+    """真实场景复现（预览版第9页 `注重APS应用落地`，字号8.5）：`A`=[133.95,139.11]、
+    空格=[139.11,140.39] 宽仅 1.28pt、`P`=[140.39,145.76]、`S`=[146.95,152.03]——
+    `P` 与 `S` 之间同样有 1.19pt 间隙却没有空格字符，同一行同一种间距编码得不一致。"""
+
+    def get_text(self, mode):
+        assert mode == "rawdict"
+        return {
+            "width": 600.0,
+            "height": 800.0,
+            "blocks": [
+                {
+                    "type": 0,
+                    "bbox": (100.0, 100.0, 200.0, 115.0),
+                    "lines": [_tracked_span_line("聚焦实施注重A PS应用落地")],
+                }
+            ],
+        }
+
+
+def _tracked_span_line(text):
+    span = _tracked_span(text)
+    xs = [c["bbox"] for c in span["chars"]]
+    return {"bbox": (xs[0][0], 100.0, xs[-1][2], 115.0), "spans": [span]}
+
+
+def test_native_pdf_extract_drops_tracking_spaces():
+    from core.parser.native_pdf import _extract_native_page_raw
+
+    raw_blocks, _ = _extract_native_page_raw(_FakeNativePageTrackingSpaces())
+
+    assert raw_blocks[0]["text"] == "聚焦实施注重APS应用落地"
+
+
 class _FakeNativePageSpreadMisjoin:
     """补丁回归测试用：跨页对开版面（一个物理页印着左右两个页码）里，左页和右页同一
     水平线上两块**毫不相干**的文字，y轴100%重叠但横向相距半个页面，被PyMuPDF聚成了
@@ -303,7 +871,7 @@ class _FakeNativePageSpreadMisjoin:
     标题 + 左页栏1的正文），只按y轴判定会把两者空格拼成一句串文喂给LLM。"""
 
     def get_text(self, mode):
-        assert mode == "dict"
+        assert mode == "rawdict"
         return {
             "width": 1009.0,
             "height": 720.0,
@@ -312,11 +880,8 @@ class _FakeNativePageSpreadMisjoin:
                     "type": 0,
                     "bbox": (44.5, 128.2, 821.8, 141.8),
                     "lines": [
-                        {"bbox": (765.2, 128.2, 821.8, 141.8), "spans": [{"text": "联系方式", "size": 13.0}]},
-                        {
-                            "bbox": (44.5, 130.2, 243.0, 138.7),
-                            "spans": [{"text": "造运营系统建设思路；通过课堂培训与实际演练相结", "size": 8.5}],
-                        },
+                        _line("联系方式", (765.2, 128.2, 821.8, 141.8), 13.0),
+                        _line("造运营系统建设思路；通过课堂培训与实际演练相结", (44.5, 130.2, 243.0, 138.7), 8.5),
                     ],
                 }
             ],
@@ -607,6 +1172,19 @@ def test_strip_headers_footers_extracts_numeric_zone_text_as_doc_page():
     assert doc_pages == ["12"]
     # 页码文本本身应从保留的块里剔除，不当正文送审
     assert [b["text"] for b in stripped[0]] == ["正文内容"]
+
+
+def test_strip_headers_footers_collapses_whitespace_in_spread_doc_page():
+    """★防线：跨页对开一个物理页印两个页码，PyMuPDF 聚成一个块 `"31\\n32"`。
+
+    不折叠的话位置描述会变成 `文档第31\\n32页第1栏`，在界面和 Excel 的"问题位置"列里
+    断成两行。真实文档实测：三份期刊共 3276 条位置串带换行。
+    """
+    from core.parser.native_pdf import _strip_headers_footers
+
+    _stripped, doc_pages = _strip_headers_footers([[{"text": "31\n32", "zone": "bottom"}]])
+
+    assert doc_pages == ["31 32"]
 
 
 def test_strip_headers_footers_no_numeric_zone_text_returns_none():

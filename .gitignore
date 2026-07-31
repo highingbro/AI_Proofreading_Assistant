@@ -5,6 +5,11 @@ __pycache__/
 
 data/app.db
 data/app_*.db
+data/*.db.bak
 data/app.log
+
+# 密钥走环境变量，不读 .env；这条只是防止有人建了 .env 之后误提交
+.env
 data/uploads/*
 data/exports/*
+samples/*

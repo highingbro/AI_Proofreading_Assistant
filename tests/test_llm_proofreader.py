@@ -561,15 +561,12 @@ def test_chat_completion_missing_config_raises_without_request(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 动态超时估算
+# 固定超时
 # ---------------------------------------------------------------------------
 
-def test_dynamic_timeout_is_flat_900s_regardless_of_text_length(monkeypatch, llm_env):
-    """data/app.log 真实数据显示原来的动态估算系数（按qwen3.6-plus实测拟合）对当前实际
-    使用的模型偏紧，大量请求在估算值边界被提前判超时、触发本可避免的重试——
-    config.LLM_TIMEOUT_MIN_SECONDS/MAX_SECONDS 都改成900后，_estimate_timeout 的
-    动态公式不再实际生效（min(max(estimated,900),900) 恒等于900），不管输入长短
-    统一给900秒上限，不再随文本长度浮动。"""
+def test_timeout_is_flat_regardless_of_text_length(monkeypatch, llm_env):
+    """超时固定为 config.LLM_TIMEOUT_FIXED_SECONDS，不随文本长度浮动（原因见
+    core/llm_client.py 模块docstring）。"""
     captured_timeouts = []
 
     def fake_post(url, headers=None, json=None, timeout=None):
@@ -582,10 +579,10 @@ def test_dynamic_timeout_is_flat_900s_regardless_of_text_length(monkeypatch, llm
     chat_completion("s" * 5000, "u" * 5000)
 
     short_timeout, long_timeout = captured_timeouts
-    assert short_timeout == long_timeout == 900 == config.LLM_TIMEOUT_MIN_SECONDS == config.LLM_TIMEOUT_MAX_SECONDS
+    assert short_timeout == long_timeout == config.LLM_TIMEOUT_FIXED_SECONDS
 
 
-def test_llm_timeout_env_override_takes_precedence_over_dynamic(monkeypatch, llm_env):
+def test_llm_timeout_env_override_takes_precedence_over_fixed(monkeypatch, llm_env):
     monkeypatch.setattr(config, "LLM_TIMEOUT", 77)
     captured = {}
 
@@ -595,7 +592,7 @@ def test_llm_timeout_env_override_takes_precedence_over_dynamic(monkeypatch, llm
 
     monkeypatch.setattr(llm_client.requests, "post", fake_post)
 
-    chat_completion("s" * 5000, "u" * 5000)  # 文本很长也应固定用77，不走动态估算
+    chat_completion("s" * 5000, "u" * 5000)  # 文本很长也应固定用77，不走LLM_TIMEOUT_FIXED_SECONDS
     assert captured["timeout"] == 77
 
 

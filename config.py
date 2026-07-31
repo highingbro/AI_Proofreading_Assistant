@@ -83,22 +83,16 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://dashscope.aliyuncs.com/co
 # 实际使用的密钥环境变量是 DASHSCOPE_API_KEY（阿里云DashScope标准命名），这个没有默认值，必须设置。
 LLM_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 
-LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v3.2")
-# 不设默认值：留空(None)时 chat_completion 按文本长度动态估算超时（见下方 LLM_TIMEOUT_* 四项）；
-# 一旦设置该环境变量，视为显式指定固定超时，不再动态估算。
+LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-pro")
+# 不设默认值：留空(None)时 chat_completion 固定用 LLM_TIMEOUT_FIXED_SECONDS；一旦设置该
+# 环境变量，视为显式指定超时，覆盖固定值。
 LLM_TIMEOUT = int(os.environ["LLM_TIMEOUT"]) if os.environ.get("LLM_TIMEOUT") else None
-# 动态超时估算参数：timeout = 基础值 + 总字符数(system_prompt+user_content) × 每字符系数，限定在[MIN, MAX]区间。
-# 系数原本来自实测（qwen3.6-plus，300秒超时下，3900~5600字总输入实际耗时178~212秒），
-# 但 data/app.log 真实数据显示当前实际使用的模型（默认LLM_MODEL="glm-5.1"，与这组系数
-# 实测时用的模型不一致）耗时经常逼近/超过按这组系数算出的估算值（约5400字输入估算
-# ~280s，真实成功耗时集中在210~274s，大量请求在280s边界被提前判超时、触发本可避免的
-# 重试），说明这组系数对当前模型偏紧。MIN/MAX 都改成 900，让 bounded 恒等于900，不再
-# 按输入长度动态估算——BASE/PER_CHAR 两个系数暂时不生效（仍保留，方便以后想恢复动态
-# 估算或用新数据重新拟合系数时参考），只改这两行就能整体调宽。
-LLM_TIMEOUT_BASE_SECONDS = 90
-LLM_TIMEOUT_PER_CHAR_SECONDS = 0.035
-LLM_TIMEOUT_MIN_SECONDS = 900
-LLM_TIMEOUT_MAX_SECONDS = 900
+# 曾按文本长度动态估算超时，系数来自早期实测（qwen3.6-plus，300秒超时下，3900~5600字
+# 总输入实际耗时178~212秒）；但 data/app.log 真实数据显示当前实际使用的模型（deepseek-v3.2）
+# 耗时经常逼近/超过按这组系数算出的估算值（约5400字输入估算~280s，真实成功耗时集中在
+# 210~274s，大量请求在280s边界被提前判超时、触发本可避免的重试），说明这组系数对当前
+# 模型偏紧。改为固定值，不再随输入长度浮动。
+LLM_TIMEOUT_FIXED_SECONDS = 900
 LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "3"))
 LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0"))
 
@@ -193,12 +187,29 @@ NATIVE_SAME_ROW_OVERLAP_MIN_RATIO = 0.5
 # 数据：项目符号误拆场景间隙只有1.2倍行高，跨页对开误聚场景是61倍，取3倍两边都留
 # 出充分余量（见 core/parser/CLAUDE.md"跨页对开版面"一节）。
 NATIVE_SAME_ROW_MAX_GAP_HEIGHT_RATIO = 3.0
+# 同上，判定为同一视觉行、且两段字符按坐标排序后真的交错时，要按字符级重新拼接（见
+# core/parser/_glyphs.py）。拼接时丢掉"字框被相邻字符盖住"的排版填充空格——与任一侧
+# 邻字的横向重叠超过自身宽度的这个比例就算填充。真实数据（`1.《数据…》` 里 `.` 与
+# `《` 之间那个空格）重叠比例是100%，真正的词间隔空格与左右邻字重叠为0，取0.5两边都
+# 留出充分余量。
+NATIVE_FILLER_SPACE_MIN_COVER_RATIO = 0.5
+# A类：排版字距微调（tracking）被导出成真空格字符时（`APS`变成`A PS`、`BOM`变成`B O M`，
+# 三份期刊里100多处），靠"空格宽度 / 同一span内非空格字符间隙的中位数"识别——字距是整段
+# 均匀施加的，假空格宽度恰好等于字母间隙，真词间空格远宽于字母间隙。全量实测：假空格
+# 0.94~1.40，真词间空格 ≥4.0（紧排文本里字母间隙≈0，比值上百），中间2~3一个样本都没有，
+# 取2.0两侧余量0.6/2.0。**不要改回"按空格宽/字号"或"按该字体众数空格宽"归一化**，那两条
+# 都在真实数据上证伪过（两端对齐会压缩真词间空格，与假空格完全交叠），理由见
+# core/parser/_glyphs.py::_drop_tracking_spaces。
+NATIVE_TRACKING_SPACE_MAX_GAP_RATIO = 2.0
+# 同上：一个span内非空格字符对少于这个数时不做上述判定——中位数样本量不足不可靠，宁可
+# 漏修也不误删。真实命中场景的样本量普遍在14~20对，3只是挡住"整段就一两个字符"的极端情况。
+NATIVE_TRACKING_SPACE_MIN_GAP_SAMPLES = 3
 
 # A类：判断一次换行到底是"排版被页宽顶到头才换的行"（下一行是同一句话的延续，中文里
 # 两行之间不该留任何分隔）还是"内容说完了主动换的行"（标题、列表项、段落结束，必须
 # 留分隔否则会被读成一句病句）。判据一：这一行的右边界离本栏最右还剩不到多少个字的
 # 宽度——剩不下一个字就说明是被宽度顶回来的，用字号近似一个汉字的宽度。
-# 起因见 core/parser/CLAUDE.md"页宽自动换行的续写行要无缝拼接"一节：不区分这两种
+# 起因见 core/parser/CLAUDE.md"被栏宽顶回来的续写块并回上一块"一节：不区分这两种
 # 换行、一律插换行符，会把"是最根本的成/功要素。"这种词中断行原样喂给LLM，被当成
 # 多余空格/漏字报出来。
 NATIVE_WRAP_RIGHT_EDGE_TOLERANCE_CHARS = 1.0
@@ -206,6 +217,16 @@ NATIVE_WRAP_RIGHT_EDGE_TOLERANCE_CHARS = 1.0
 # （某期刊四栏正文）：相邻正文行间距约为行高的0.94倍，标题与正文之间1.27倍，段落
 # 之间更大——取1.5既容得下正常行距波动，又挡得住跨段/跨版块的"假续写"。
 NATIVE_WRAP_MAX_LINE_GAP_RATIO = 1.5
+# 判据三：两块的平均字号相差不超过这个pt数，才可能是同一段被栏宽切开的。真实数据
+# （预览版四栏正文8.0 vs 小标题9.5、大标题14+）：同段两块的字号差实测全是0.0（同一段
+# 本来就是同一种字号，差异只来自块内混排的英文/数字），取0.6留出混排波动的余量，又
+# 挡得住最小的标题-正文落差1.5。
+NATIVE_WRAP_SAME_SIZE_TOLERANCE = 0.6
+# 判据四：上一块的最后一行宽度要达到这个字数（用字号近似一个汉字宽度），才算"满行"。
+# 判据一只问"右边界够不够靠右"，一个缩在栏中间、既短又恰好右对齐的行也能蒙混过关——
+# 目录页码块 `2`、竖排刊名 `二/O/二/六` 就是这么被误判成续写行的。真实数据：被栏宽顶
+# 回来的正文满行普遍在18~24个字宽，上述误判样本全在3个字宽以内，取8两侧余量都很大。
+NATIVE_WRAP_MIN_FULL_LINE_CHARS = 8.0
 
 # B类（OCR）跨页检测：宽高比超过该阈值才可能是两页拼接的横版扫描
 SPREAD_ASPECT_RATIO_THRESHOLD = 1.6
@@ -284,7 +305,7 @@ HIGH_PRIORITY_ISSUE_TYPES = ("政治敏感性表述", "民族与地名规范")
 # 时效性局限造成的误判，不是真正的事实性错误。命中下面关键词+年份在容忍窗口内时，把该
 # issue强制降级为存疑待核实+最低优先级（不直接剔除：保留可审计性，用户在界面上一眼就能
 # 判断要不要忽略；如果关键词误判了真正的事实性错误，信息不会凭空消失）。
-LLM_KNOWLEDGE_CUTOFF_YEAR = 2026  # 拍脑袋定的初值，需要按实际配置的模型（）真实知识截止时间校正
+LLM_KNOWLEDGE_CUTOFF_YEAR = 2026  # 拍脑袋定的初值，需要按实际配置的模型（LLM_MODEL）真实知识截止时间校正
 KNOWLEDGE_CUTOFF_GRACE_YEARS = 2  # 文中年份超过"截止年份+此宽限期"还被怀疑"太新"，才视为真的离谱，不豁免
 RECENCY_DOUBT_KEYWORDS = (
     "训练数据", "知识截止", "知识范围", "我的认知", "未收录", "无法查证是否存在",
@@ -295,6 +316,17 @@ RECENCY_DOUBT_KEYWORDS = (
 # 关键词——真实数据（data/app.db 35号记录）里出现过的原话摘出，命中任一即认为
 # LLM自己都没看懂被打乱的版面，不是"一眼就能看出"的确定性语言错误。
 LAYOUT_ARTIFACT_KEYWORDS = ("排版错乱", "跨行", "错行", "错位", "乱码", "段落顺序", "图片位置")
+
+# LLM自陈"这条本来就不该报"时的措辞——提示词"补充规则三：历史反馈规避"要求命中规避
+# 规则的内容直接不要输出，但真实数据里LLM会照样输出一条issue、把"我为什么不该报它"
+# 写进suggestion/reason（如"根据历史反馈规避规则第三条，此类因换行导致的词语拆分不应
+# 报告为问题"）。命中即整条丢弃：LLM自己都判定这不是问题，没有人工核实价值。
+# 措辞限定在"报告/作为问题"和"历史反馈规避"这两个模式上，不收"无需修改""不建议改动"
+# 这类宽泛说法——引文类的固定suggestion就是"原文照录，不建议改动"，收进来会误伤整层。
+NON_ISSUE_SELF_DECLARATION_KEYWORDS = (
+    "不应报告为问题", "不报告为问题", "不作为问题报告", "不应作为问题",
+    "不视为问题", "不属于问题", "历史反馈规避",
+)
 
 # ---------- 原稿比对配置（core/comparer.py使用）----------
 # 句子级diff的切分标点：按这几个句末标点把段落切成句子列表再逐句比较，标点保留在

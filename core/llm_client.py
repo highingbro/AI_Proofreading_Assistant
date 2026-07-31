@@ -17,28 +17,22 @@ core.proofreader.proofread_document 会用线程池并发调用本函数校对�
 1. LLM_API_KEY 实际读取环境变量 DASHSCOPE_API_KEY（阿里云DashScope标准命名），
    不是字面的 LLM_API_KEY——config.py 里属性名仍叫 LLM_API_KEY，只是内部命名，
    读取源不同。这是唯一没有默认值、真正必填的一项。
-2. LLM_MODEL 默认值 "qwen3.6-plus"，不强制要求设置环境变量，仍支持该环境
+2. LLM_MODEL 默认值 "deepseek-v3.2"，不强制要求设置环境变量，仍支持该环境
    变量覆盖换模型。
 3. LLM_BASE_URL 默认是 DashScope 兼容模式公开固定地址
    （https://dashscope.aliyuncs.com/compatible-mode/v1），同样支持环境变量
    覆盖。
-4. LLM_TIMEOUT 按文本长度动态估算，不是固定值——详见下方专门一段。
+4. LLM_TIMEOUT 默认固定为 config.LLM_TIMEOUT_FIXED_SECONDS——详见下方专门一段。
 5. LLM调用用 requests 直接发REST请求，没有引入 openai/dashscope SDK：避免
    额外SDK依赖与版本兼容负担，REST接口本身足够简单直接（见 requirements.txt
    里的注释）。
 
-超时是按文本长度动态估算的，不是固定值：config.LLM_TIMEOUT 默认不设
-（None），本函数内部用 _estimate_timeout() 按 system_prompt+user_content
-总字符数算：timeout = LLM_TIMEOUT_BASE_SECONDS + 总字符数 ×
-LLM_TIMEOUT_PER_CHAR_SECONDS，限定在
-[LLM_TIMEOUT_MIN_SECONDS, LLM_TIMEOUT_MAX_SECONDS] 区间（都在 config.py
-里，带实测依据的注释）。起因：真实文档大小的chunk（约3000~5000字总输入）
-用固定120秒超时会稳定超时失败（4次重试全部撞线），而实际耗时普遍在
-180~212秒——500字左右的小样本能在120秒内勉强成功纯属侥幸。优先级：显式传
-timeout= 参数 > 环境变量 LLM_TIMEOUT（一旦设置就固定用它，不再动态估算）>
-动态估算。系数是从有限的几个实测样本粗略拟合的，同规模输入的真实耗时本身
-波动就有20秒以上（推测与实际问题条数/输出长度有关），不是精确公式，只是
-留了较宽松的余量。
+超时固定为 config.LLM_TIMEOUT_FIXED_SECONDS（900秒），不随文本长度浮动——
+起因：真实文档大小的chunk（约3000~5000字总输入）用固定120秒超时会稳定超时
+失败（4次重试全部撞线），而实际耗时普遍在180~212秒；曾按文本长度动态估算，
+但真实模型耗时经常逼近/超过估算值，反而提前触发本可避免的重试，改为统一
+固定值更宽松（详见 config.py 里的注释）。优先级：显式传 timeout= 参数 >
+环境变量 LLM_TIMEOUT（一旦设置就固定用它）> LLM_TIMEOUT_FIXED_SECONDS。
 """
 
 from __future__ import annotations
@@ -79,14 +73,6 @@ def _backoff_delay(attempt_index: int) -> float:
     return _BACKOFF_SECONDS[-1]
 
 
-def _estimate_timeout(system_prompt: str, user_content: str) -> int:
-    """按文本总长度动态估算超时秒数，公式与取值见 config.py 里 LLM_TIMEOUT_* 常量的注释。"""
-    total_chars = len(system_prompt) + len(user_content)
-    estimated = config.LLM_TIMEOUT_BASE_SECONDS + total_chars * config.LLM_TIMEOUT_PER_CHAR_SECONDS
-    bounded = min(max(estimated, config.LLM_TIMEOUT_MIN_SECONDS), config.LLM_TIMEOUT_MAX_SECONDS)
-    return int(bounded)
-
-
 def chat_completion(
     system_prompt: str,
     user_content: str,
@@ -99,8 +85,8 @@ def chat_completion(
 
     temperature = config.LLM_TEMPERATURE if temperature is None else temperature
     if timeout is None:
-        # 显式传参 > LLM_TIMEOUT 环境变量固定值 > 按文本长度动态估算
-        timeout = config.LLM_TIMEOUT if config.LLM_TIMEOUT is not None else _estimate_timeout(system_prompt, user_content)
+        # 显式传参 > LLM_TIMEOUT 环境变量固定值 > LLM_TIMEOUT_FIXED_SECONDS
+        timeout = config.LLM_TIMEOUT if config.LLM_TIMEOUT is not None else config.LLM_TIMEOUT_FIXED_SECONDS
     max_retries = config.LLM_MAX_RETRIES
 
     url = f"{config.LLM_BASE_URL.rstrip('/')}/chat/completions"

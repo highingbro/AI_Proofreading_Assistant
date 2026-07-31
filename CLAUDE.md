@@ -11,7 +11,7 @@
 app.py              Streamlit 入口（任务选择闸门+标准校对流+Excel导出+追问+历史记录详情页+反馈学习管理+原稿比对）——UI设计决策见文件顶部 docstring
 config.py           全局配置：路径、任务状态常量、分层/优先级常量、LLM配置、结果分层阈值、追问上下文配置、反馈学习阈值、OCR相关参数
 core/
-  parser/           文档解析（已实现）——PDF/Word 统一解析，子目录拆成 native_pdf.py(A类)/ocr_pdf.py(B类)/docx_parser.py(C类)/_common.py/_cjk_variants.py/_types.py，详见 core/parser/CLAUDE.md
+  parser/           文档解析（已实现）——PDF/Word 统一解析，子目录拆成 native_pdf.py(A类)/ocr_pdf.py(B类)/docx_parser.py(C类)/_columns.py/_common.py/_cjk_variants.py/_glyphs.py/_paragraphs.py/_types.py，详见 core/parser/CLAUDE.md
   chunker/          长文档分块（已实现）——子目录拆成 _types.py/fill_units.py/greedy_fill.py/locate.py，详见 core/chunker/CLAUDE.md
   llm_client.py     LLM调用封装（已实现，单文件）——设计决策见文件顶部 docstring
   proofreader/      校对提示词组装 + 单块/全文档校对（已实现）——子目录拆成 _types.py/prompt_builder.py/response_parser.py/locator.py，详见 core/proofreader/CLAUDE.md
@@ -31,6 +31,8 @@ tools/preview_parse.py    手动预览 core/parser/ 解析结果的调试脚本
 tools/preview_chunks.py   手动预览 core/chunker/ 分块结果的调试脚本
 tools/run_proofread.py    串起 解析→分块→校对 全链路，跑LLM调用的调试脚本（耗API额度，支持 --save-json 保存RawIssue供离线调分层规则）
 tools/preview_classify.py 预览 core/classifier/ 分层结果的调试脚本（支持 --from-json 离线模式，不耗额度）
+tools/parse_noise_metrics.py 量化A类解析残留的三类噪声（句中换行/位置断行/括号错位）+ dump全文本，改解析逻辑前后各跑一次做验收，零成本
+tools/issue_noise_report.py   按噪声分类对比两条校对记录的issue（N1括号错位/N2位置串断裂/N3长正文被栏宽切开/N3短单元格两行标题）——解析层改动的最终验收以数据库产出为准，不看总条数（同文档连跑五次总数波动 35~108）
 prompt/             各阶段开发提示词（给 Claude Code 分阶段下发用）
 prompt/proofread_rules.md    既有校对规则原文（十类维度），原样引用，不要改写
 prompt/proofread_system.md   校对系统提示词模板（含占位符，组装时动态注入规则原文与分块重叠标记）

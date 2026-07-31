@@ -14,12 +14,19 @@ import config
 from core.parser._cjk_variants import normalize_cjk_variants
 from core.parser._columns import _detect_column_boundaries
 from core.parser._common import _source_location
+from core.parser._glyphs import (
+    _chars_text,
+    _drop_tracking_spaces,
+    _merge_same_row_chars,
+    _reorder_same_row_lines,
+    _strip_edge_spaces,
+    drop_filler_spaces,
+    restore_unmapped_glyph_spaces,
+    sort_line_by_ink,
+)
+from core.parser._paragraphs import _local_right_edge, line_join_separator, merge_wrapped_blocks
 
 _NUMERIC_ZONE_RE = re.compile(r"^[\dIVXLCDMivxlcdm\-\.\s]{1,10}$")      # 匹配纯页码/罗马数字页码/带破折号的页码范围/带逗号，长度不超过10字符
-
-# 以这些字符收尾的行，视为"内容说完了主动换行"，不当续写行处理。只收句末/收束类
-# 标点，不含"，、"——逗号顿号收尾恰恰是句子没说完、下一行还要接着排的强信号。
-_LINE_STOP_CHARS = "。！？；…：.!?;:）)》」』】〕》\"'”’"
 
 
 def _zone_of(bbox: tuple[float, float, float, float], height: float) -> str:
@@ -63,28 +70,6 @@ def _lines_share_same_row(bbox_a: tuple[float, float, float, float], bbox_b: tup
     return gap <= smaller_height * config.NATIVE_SAME_ROW_MAX_GAP_HEIGHT_RATIO
 
 
-def _is_wrapped_continuation(text: str, bbox: tuple[float, float, float, float], right_edge: float, font_size: float) -> bool:
-    """这一行是不是"被页宽顶到头才换行"的续写行——即下一行是同一句话的直接延续。
-
-    两个信号必须同时成立才算（都不成立的判法太松，会把标题/列表项跟正文粘成病句）：
-    收尾没有句末/收束标点（`_LINE_STOP_CHARS`），且右边界离本栏最右不足一个字的宽度
-    （剩不下一个字，说明这行是被宽度顶回来的，不是内容说完了主动换的）。一个字的宽度
-    用字号近似——中文全角字符宽度就约等于字号。
-    """
-    if not text or text[-1] in _LINE_STOP_CHARS:
-        return False
-    tolerance = max(font_size, 1.0) * config.NATIVE_WRAP_RIGHT_EDGE_TOLERANCE_CHARS
-    return bbox[2] >= right_edge - tolerance
-
-
-def _lines_vertically_adjacent(bbox_a: tuple[float, float, float, float], bbox_b: tuple[float, float, float, float]) -> bool:
-    """b 是不是紧接在 a 下面的一行（而不是隔了一个段落间距/跨了一个版块）。"""
-    height_a = bbox_a[3] - bbox_a[1]
-    if height_a <= 0 or bbox_b[1] <= bbox_a[1]:
-        return False
-    return (bbox_b[1] - bbox_a[3]) <= height_a * config.NATIVE_WRAP_MAX_LINE_GAP_RATIO
-
-
 def _strip_unmapped_glyph_chars(text: str) -> str:
     """删掉 C0 控制字符（`\\n` 除外）——它们是"字体没给这个字形提供Unicode映射"的占位码位。
 
@@ -104,7 +89,12 @@ def _strip_unmapped_glyph_chars(text: str) -> str:
     语义，已经由 `_lines_share_same_row` 用空格拼进正文（见 core/parser/CLAUDE.md
     "PyMuPDF把同一视觉行误拆成两个line时"一节），删掉反而会丢信息。
     """
-    return "".join(ch for ch in text if ch == "\n" or not (ord(ch) < 0x20 or ord(ch) == 0x7F))
+    return "".join(ch for ch in text if ch == "\n" or not _is_unmapped_glyph_char(ch))
+
+
+def _is_unmapped_glyph_char(ch: str) -> bool:
+    """单个字符是不是上述占位码位。字符级装配（`_glyphs.py`）按字符过滤，用得上这一支。"""
+    return ord(ch) < 0x20 or ord(ch) == 0x7F
 
 
 def _extract_native_page_raw(page: "fitz.Page") -> tuple[list[dict], float]:
@@ -113,35 +103,86 @@ def _extract_native_page_raw(page: "fitz.Page") -> tuple[list[dict], float]:
     这里只是"提取"，不做分栏、不做阅读顺序还原、不剔除页眉页脚——
     那些都是后续步骤（_strip_headers_footers / _finalize_native_page）的事。
     """
-    data = page.get_text("dict")  # PyMuPDF 提取结果，是一棵 blocks→lines→spans 的嵌套结构
+    # 用 rawdict 而不是 dict：两者的 blocks→lines→spans 结构和字段完全一致（真实文档
+    # 逐字段比对过，无差异），只是每个 span 多一个 `chars` 列表给出**单个字符**的 bbox。
+    # 字符级 bbox 是还原同一视觉行内真实字序所必需的——全角开括号的墨迹只占字框右半，
+    # span 级坐标看不出这件事（见 core/parser/_glyphs.py）。
+    data = page.get_text("rawdict")
     width, height = data["width"], data["height"]
     out: list[dict] = []
     for b in data["blocks"]:
         if b.get("type") != 0:
             continue  # type!=0 是图片块，跳过（只保留文字块）
-        lines_text = []
+        lines_chars: list[list[dict]] = []
         line_bboxes = []
+        line_sizes = []
         sizes = []
         for line in b["lines"]:
             # 一个block可能包含多行(line)，每行又由多个span组成（比如中途换了字体/字号）
             # 在**拼接之前**逐行删占位码位：整行只有装饰图标时它会变成空串、连同它的bbox
             # 一起不进 line_bboxes，相邻两行的同行判定就直接对彼此做，不会被一个不含文字的
             # "行"隔开。放到拼完之后再删就晚了。
-            t = _strip_unmapped_glyph_chars("".join(s["text"] for s in line["spans"]))
-            if t.strip():
-                lines_text.append(t.strip())
+            # 假空格（排版字距微调）逐span判定后删除——字距是span级的排版属性，跨span
+            # 混算会把两种排版的字符间隙搅在一起，见 _glyphs.py::_drop_tracking_spaces
+            # 先把"其实是词间空格"的占位码位改写成真空格（跨span看邻字，见
+            # _glyphs.py::restore_unmapped_glyph_spaces），剩下的才是真装饰图标、照删。
+            # 顺序不能倒：删完就看不出它两侧是不是拉丁字母了。
+            span_chars = [list(s["chars"]) for s in line["spans"]]
+            restore_unmapped_glyph_spaces(span_chars)
+            chars = []
+            for sc in span_chars:
+                chars.extend(
+                    _drop_tracking_spaces([c for c in sc if not _is_unmapped_glyph_char(c["c"])])
+                )
+            # 按墨迹位置重排字序、清掉被相邻字符盖住的填充空格：这两件事判据都只看坐标，
+            # 与"PyMuPDF 有没有把这一行拆成两个 line"无关，所以每行都要跑，不能像原来那样
+            # 只挂在字符级合并那条路径上（`1.《 AIAgent…》`、`2《. 航空…》` 都是漏在这里的）。
+            chars = _strip_edge_spaces(drop_filler_spaces(sort_line_by_ink(chars)))
+            if chars:
+                lines_chars.append(chars)
                 line_bboxes.append(line["bbox"])
+                line_sizes.append(max((s["size"] for s in line["spans"]), default=0.0))
             sizes.extend(s["size"] for s in line["spans"])  # 记录这一行里每个span的字号
         # 拼接block内多行文本：默认用换行符——block内每一行在原文里通常是独立的一行
         # （标题+正文、列表项、版式换行等不同语义单元），拼成空格会让LLM把它们读成一句
         # 连续的话，误判成"语法/标点问题"。但相邻两行若判定为_lines_share_same_row
-        # （PyMuPDF把同一视觉行错误拆成了两个line），改用空格拼接，避免"项目符号应换行"
-        # 这类因误拆产生的伪问题（换行/空格标记都不新增block，不改变block_index颗粒度，
-        # 下游分块/去重/追问上下文窗口都不受影响）。
-        text = lines_text[0] if lines_text else ""
-        for i in range(1, len(lines_text)):
-            sep = " " if _lines_share_same_row(line_bboxes[i - 1], line_bboxes[i]) else "\n"
-            text += sep + lines_text[i]
+        # （PyMuPDF把同一视觉行错误拆成了两个line），就不该换行，此时再分两种拼法：
+        # 两段字符按坐标排完真的交错（开括号错位那一类）就按字符级合并，否则仍用空格拼、
+        # 只是可能要按视觉顺序把两段前后调过来（详见 core/parser/_glyphs.py）。
+        # 换行/空格/字符级合并都不新增block，不改变block_index颗粒度，下游分块/去重/
+        # 追问上下文窗口都不受影响。
+        head = ""
+        tail = lines_chars[0] if lines_chars else []
+        tail_bbox = line_bboxes[0] if line_bboxes else None
+        tail_size = line_sizes[0] if line_sizes else 0.0
+        for i in range(1, len(lines_chars)):
+            cur, cur_bbox, cur_size = lines_chars[i], line_bboxes[i], line_sizes[i]
+            if _lines_share_same_row(line_bboxes[i - 1], line_bboxes[i]):
+                merged = _merge_same_row_chars(tail, cur)
+                if merged is not None:
+                    tail = merged
+                    tail_bbox = _union_bbox(tail_bbox, cur_bbox)
+                    tail_size = max(tail_size, cur_size)
+                    continue
+                if _reorder_same_row_lines(tail, cur):
+                    tail, cur = cur, tail
+                    tail_bbox, cur_bbox = cur_bbox, tail_bbox
+                    tail_size, cur_size = cur_size, tail_size
+                sep = " "
+            else:
+                # 不是同一视觉行，那就要问它是不是"被宽度顶回来的续写行"——是的话
+                # 无缝拼（表格/日历单元格里的两行标题就在这里被并回去，见 _paragraphs.py），
+                # 否则才是真正的换行。
+                sep = line_join_separator(
+                    _chars_text(tail), tail_bbox, tail_size,
+                    _chars_text(cur), cur_bbox, cur_size,
+                    _local_right_edge(line_bboxes, tail_bbox),
+                )
+                if sep is None:
+                    sep = "\n"
+            head += _chars_text(tail) + sep
+            tail, tail_bbox, tail_size = cur, cur_bbox, cur_size
+        text = head + _chars_text(tail)
         if not text:
             continue
         # 破损的PDF字体ToUnicode CMap有时会把正文汉字映射到"康熙部首"等码位上——
@@ -151,8 +192,47 @@ def _extract_native_page_raw(page: "fitz.Page") -> tuple[list[dict], float]:
         text = normalize_cjk_variants(text)
         avg_size = sum(sizes) / len(sizes) if sizes else 0.0  # 这个block的平均字号，供后续判断是否为标题用
         bbox = tuple(b["bbox"])
-        out.append({"text": text, "bbox": bbox, "avg_size": avg_size, "zone": _zone_of(bbox, height)})
+        last_row_bbox, last_row_size = _last_visual_row(line_bboxes, line_sizes)
+        out.append({
+            "text": text,
+            "bbox": bbox,
+            "avg_size": avg_size,
+            "zone": _zone_of(bbox, height),
+            # 块级续写判定（_paragraphs.py）问的是"这一块的**最后一行**有没有顶到栏最右"，
+            # 用块 bbox 的 x1 会被块内更长的行顶替，实测因此把 `5. 目前的局限性` 这种
+            # 小标题误判成续写行——它上面那行更长、顶到了栏右。
+            "last_row_bbox": last_row_bbox,
+            "last_row_size": last_row_size,
+        })
     return out, width
+
+
+def _union_bbox(a: tuple | None, b: tuple) -> tuple:
+    """两个字框的并集。同一视觉行被拆成多个 line 合并回去时，续写判定要问的是合起来那一行。"""
+    if a is None:
+        return tuple(b)
+    return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+
+
+def _last_visual_row(line_bboxes: list[tuple], line_sizes: list[float]) -> tuple[tuple, float]:
+    """块内最后一个**视觉行**的 bbox 与字号。
+
+    不能直接取 `line_bboxes[-1]`：PyMuPDF 会把同一视觉行误拆成多个 line（见
+    `_lines_share_same_row`），只取最后一个拿到的是这一行右半截的坐标，左边界偏右、
+    行宽偏窄，`_paragraphs.py` 的"满行"闸门会把真正的续写行挡掉。所以从末尾往回把
+    判定为同一行的 line 并起来。
+    """
+    if not line_bboxes:
+        return (0.0, 0.0, 0.0, 0.0), 0.0
+    i = len(line_bboxes) - 1
+    x0, y0, x1, y1 = line_bboxes[i]
+    size = line_sizes[i]
+    while i > 0 and _lines_share_same_row(line_bboxes[i - 1], line_bboxes[i]):
+        i -= 1
+        px0, py0, px1, py1 = line_bboxes[i]
+        x0, y0, x1, y1 = min(x0, px0), min(y0, py0), max(x1, px1), max(y1, py1)
+        size = max(size, line_sizes[i])
+    return (x0, y0, x1, y1), size
 
 
 # pages_raw: list[list[dict]]
@@ -170,6 +250,12 @@ def _strip_headers_footers(pages_raw: list[list[dict]]) -> tuple[list[list[dict]
     页眉/页脚文本本来就要被剔除，顺手记下来，不是重复文本（属于跨页重复的运
     行页眉/刊名不算页码，只有"命中数字/罗马数字形状"这一支才算）。一页内若
     有多处命中，取第一个——多个候选极少见，不做优先级判断。
+
+    **页码文本里的空白一律折成单个空格**：跨页对开刊物一个物理页印着左右两页的两个
+    页码，PyMuPDF 把它们聚成一个块、文本是 `"31\\n32"`（`_NUMERIC_ZONE_RE` 的字符集
+    含 `\\s`，整体匹配通过），位置描述就成了 `文档第31\\n32页第1栏`，在界面和 Excel
+    的"问题位置"列里断成两行。**不在这里把它拆成两个逻辑页**——A类通道没有跨页拆分，
+    那是另一件事（见 core/parser/CLAUDE.md"跨页对开版面"一节）。
     """
     # 第一遍：统计每一段"位于顶部/底部区域"的文本，在多少个不同页面里出现过
     zone_text_counter: Counter[str] = Counter()
@@ -195,7 +281,7 @@ def _strip_headers_footers(pages_raw: list[list[dict]]) -> tuple[list[list[dict]
                 continue  # 跨页重复的页眉/页脚正文（刊名/栏目名等），不是页码
             if in_zone and _NUMERIC_ZONE_RE.match(blk["text"]):
                 if doc_page is None:
-                    doc_page = blk["text"].strip()
+                    doc_page = " ".join(blk["text"].split())
                 continue  # 页码类文本
             kept.append(blk)
         result.append(kept)
@@ -303,6 +389,9 @@ def _finalize_native_page(
         b["block_type"] = _classify_native_block_type(b["avg_size"], body_size, b["zone"])
 
     ordered, mode = _order_native_page(raw_blocks, width, force_layout)
+    # 必须在排序之后合并：判"这一块被栏宽顶回来了"要知道本栏的文字右边距，那要等每个块
+    # 有了 column 字段才算得出来（见 core/parser/_paragraphs.py 顶部 docstring）。
+    ordered = merge_wrapped_blocks(ordered)
     # 转换成 _parse_pdf 期望的中间字典结构（跟B类OCR通道输出格式保持一致，方便后续合并处理）
     finalized = [
         {
