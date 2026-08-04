@@ -27,12 +27,19 @@ core.proofreader.proofread_document 会用线程池并发调用本函数校对�
    额外SDK依赖与版本兼容负担，REST接口本身足够简单直接（见 requirements.txt
    里的注释）。
 
-超时固定为 config.LLM_TIMEOUT_FIXED_SECONDS（900秒），不随文本长度浮动——
-起因：真实文档大小的chunk（约3000~5000字总输入）用固定120秒超时会稳定超时
-失败（4次重试全部撞线），而实际耗时普遍在180~212秒；曾按文本长度动态估算，
-但真实模型耗时经常逼近/超过估算值，反而提前触发本可避免的重试，改为统一
-固定值更宽松（详见 config.py 里的注释）。优先级：显式传 timeout= 参数 >
-环境变量 LLM_TIMEOUT（一旦设置就固定用它）> LLM_TIMEOUT_FIXED_SECONDS。
+超时固定为 config.LLM_TIMEOUT_FIXED_SECONDS，不随文本长度浮动（取值依据见
+config.py 里的注释）。优先级：显式传 timeout= 参数 > 环境变量 LLM_TIMEOUT
+（一旦设置就固定用它）> LLM_TIMEOUT_FIXED_SECONDS。
+
+请求走模块级 `_SESSION` 复用连接池，不是每次新建连接：一轮校对并发发出
+PROOFREAD_MAX_CONCURRENT_CHUNKS 个请求打同一个域名，复用已建好的TLS连接省掉
+重复握手。池容量按并发数留一倍余量，池满会退化成每次新建连接、复用收益归零。
+
+**服务端偶发地把某个请求吞掉**（同一批并发的其他块几十秒内全部返回，剩一块
+一个字节没收到、耗满超时上限，重试同样的内容几十秒就成功）——这种情况下连接
+在TCP层一直是健康的，客户端无从提前发现，只能等满超时后重试。别再往"连接被
+中间设备回收"的方向找：实测卡住期间服务端仍在这条连接上持续发字节，连接没断，
+是对端应用层没产出。
 """
 
 from __future__ import annotations
@@ -41,6 +48,7 @@ import logging
 import time
 
 import requests
+from requests.adapters import HTTPAdapter
 
 import config
 
@@ -48,6 +56,24 @@ logger = logging.getLogger(__name__)
 
 # 固定退避序列（秒），对应提示词要求的 1s/4s/16s；超出序列长度的重试用最后一档兜底。
 _BACKOFF_SECONDS = (1, 4, 16)
+
+# 连接池容量：留出 PROOFREAD_MAX_CONCURRENT_CHUNKS 的一倍余量，避免并发校对时线程之间
+# 抢连接（池满会退化成每次新建连接，复用收益归零）。
+_POOL_MAXSIZE = config.PROOFREAD_MAX_CONCURRENT_CHUNKS * 2
+
+
+def _build_session() -> requests.Session:
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=_POOL_MAXSIZE, pool_maxsize=_POOL_MAXSIZE)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+# 模块级共享：底层 urllib3 连接池本身线程安全，且建好之后 chat_completion 只读不改
+# session 的任何属性（headers/params 都逐次随请求传），并发调用没有共享可变状态。
+# 打桩点也是它——测试要 patch `llm_client._SESSION.post`，不是 `requests.post`。
+_SESSION = _build_session()
 
 
 class LLMCallError(Exception):
@@ -107,7 +133,7 @@ def chat_completion(
     for attempt in range(max_retries + 1):
         start = time.monotonic()
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            resp = _SESSION.post(url, headers=headers, json=payload, timeout=timeout)
         except requests.RequestException as exc:
             last_error = f"网络错误: {exc}"
             logger.warning("LLM调用失败(第%d次尝试): %s", attempt + 1, last_error)

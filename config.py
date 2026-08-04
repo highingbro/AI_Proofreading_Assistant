@@ -83,16 +83,18 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://dashscope.aliyuncs.com/co
 # 实际使用的密钥环境变量是 DASHSCOPE_API_KEY（阿里云DashScope标准命名），这个没有默认值，必须设置。
 LLM_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 
-LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-pro")
+LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash-0731")
 # 不设默认值：留空(None)时 chat_completion 固定用 LLM_TIMEOUT_FIXED_SECONDS；一旦设置该
 # 环境变量，视为显式指定超时，覆盖固定值。
 LLM_TIMEOUT = int(os.environ["LLM_TIMEOUT"]) if os.environ.get("LLM_TIMEOUT") else None
-# 曾按文本长度动态估算超时，系数来自早期实测（qwen3.6-plus，300秒超时下，3900~5600字
-# 总输入实际耗时178~212秒）；但 data/app.log 真实数据显示当前实际使用的模型（deepseek-v3.2）
-# 耗时经常逼近/超过按这组系数算出的估算值（约5400字输入估算~280s，真实成功耗时集中在
-# 210~274s，大量请求在280s边界被提前判超时、触发本可避免的重试），说明这组系数对当前
-# 模型偏紧。改为固定值，不再随输入长度浮动。
-LLM_TIMEOUT_FIXED_SECONDS = 900
+
+# 这个值是在两种浪费之间取平衡，两侧都贴得很紧：
+# 往大取的代价——服务端会偶发地把某个请求吞掉（详见 core/llm_client.py），这种请求只能
+# 等满上限才会重试，上限就是每次中招白等的时长，最坏 ×(LLM_MAX_RETRIES+1)。
+# 往小取的代价——正常调用耗时分布很宽（app.log 按天统计均值 64~108 秒，最大 197 秒），
+# 取值低于这个上界会把慢的正常调用误杀成超时重试，白烧一次额度；按 150 秒算约有 6% 的
+# 调用会中招。210 只比实测上界高 13 秒，余量很薄，服务端慢的时段会有零星误杀。
+LLM_TIMEOUT_FIXED_SECONDS = 210
 LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "3"))
 LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0"))
 

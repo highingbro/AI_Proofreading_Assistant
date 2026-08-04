@@ -1,8 +1,9 @@
 """阶段4验收测试：LLM调用封装 + 校对提示词接入。
 
 不耗API额度部分：全部 mock core.proofreader.chat_completion 或更底层的
-requests.post，覆盖JSON解析容错、字段校验、定位回填、chat_completion自身
-的重试/退避逻辑。
+llm_client._SESSION.post（打桩目标是模块级 Session，不是 requests.post——
+chat_completion 走的是 Session），覆盖JSON解析容错、字段校验、定位回填、
+chat_completion自身的重试/退避逻辑。
 
 消耗额度的集成冒烟（@pytest.mark.integration，默认跳过，pytest -m integration 手动跑）：
 构造一段约500字、故意埋入5类已知错误的文本，走真实API，人工核对检出情况。
@@ -494,7 +495,7 @@ def test_chat_completion_retries_network_error_then_succeeds(monkeypatch, llm_en
             raise requests.exceptions.ConnectionError("网络错误")
         return _FakeResponse(200, json_data={"choices": [{"message": {"content": "校对结果"}}]})
 
-    monkeypatch.setattr(llm_client.requests, "post", fake_post)
+    monkeypatch.setattr(llm_client._SESSION, "post", fake_post)
 
     result = chat_completion("system", "user")
     assert result == "校对结果"
@@ -509,7 +510,7 @@ def test_chat_completion_exhausts_retries_raises(monkeypatch, llm_env):
         call_count[0] += 1
         raise requests.exceptions.Timeout("超时")
 
-    monkeypatch.setattr(llm_client.requests, "post", fake_post)
+    monkeypatch.setattr(llm_client._SESSION, "post", fake_post)
 
     with pytest.raises(LLMCallError):
         chat_completion("system", "user")
@@ -526,7 +527,7 @@ def test_chat_completion_honors_retry_after_header(monkeypatch, llm_env):
             return _FakeResponse(429, text="rate limited", headers={"Retry-After": "7"})
         return _FakeResponse(200, json_data={"choices": [{"message": {"content": "ok"}}]})
 
-    monkeypatch.setattr(llm_client.requests, "post", fake_post)
+    monkeypatch.setattr(llm_client._SESSION, "post", fake_post)
 
     result = chat_completion("system", "user")
     assert result == "ok"
@@ -540,7 +541,7 @@ def test_chat_completion_non_retryable_4xx_fails_immediately(monkeypatch, llm_en
         call_count[0] += 1
         return _FakeResponse(401, text="unauthorized")
 
-    monkeypatch.setattr(llm_client.requests, "post", fake_post)
+    monkeypatch.setattr(llm_client._SESSION, "post", fake_post)
 
     with pytest.raises(LLMCallError):
         chat_completion("system", "user")
@@ -554,7 +555,7 @@ def test_chat_completion_missing_config_raises_without_request(monkeypatch):
     def fail_if_called(*args, **kwargs):
         raise AssertionError("配置缺失时不应发起真实请求")
 
-    monkeypatch.setattr(llm_client.requests, "post", fail_if_called)
+    monkeypatch.setattr(llm_client._SESSION, "post", fail_if_called)
 
     with pytest.raises(LLMCallError):
         chat_completion("system", "user")
@@ -573,7 +574,7 @@ def test_timeout_is_flat_regardless_of_text_length(monkeypatch, llm_env):
         captured_timeouts.append(timeout)
         return _FakeResponse(200, json_data={"choices": [{"message": {"content": "ok"}}]})
 
-    monkeypatch.setattr(llm_client.requests, "post", fake_post)
+    monkeypatch.setattr(llm_client._SESSION, "post", fake_post)
 
     chat_completion("s" * 100, "u" * 100)
     chat_completion("s" * 5000, "u" * 5000)
@@ -590,7 +591,7 @@ def test_llm_timeout_env_override_takes_precedence_over_fixed(monkeypatch, llm_e
         captured["timeout"] = timeout
         return _FakeResponse(200, json_data={"choices": [{"message": {"content": "ok"}}]})
 
-    monkeypatch.setattr(llm_client.requests, "post", fake_post)
+    monkeypatch.setattr(llm_client._SESSION, "post", fake_post)
 
     chat_completion("s" * 5000, "u" * 5000)  # 文本很长也应固定用77，不走LLM_TIMEOUT_FIXED_SECONDS
     assert captured["timeout"] == 77
@@ -604,7 +605,7 @@ def test_explicit_timeout_param_overrides_everything(monkeypatch, llm_env):
         captured["timeout"] = timeout
         return _FakeResponse(200, json_data={"choices": [{"message": {"content": "ok"}}]})
 
-    monkeypatch.setattr(llm_client.requests, "post", fake_post)
+    monkeypatch.setattr(llm_client._SESSION, "post", fake_post)
 
     chat_completion("s", "u", timeout=13)
     assert captured["timeout"] == 13
