@@ -66,15 +66,31 @@ def test_rule_a_llm_self_reported_quotation():
     assert issue.priority == config.PRIORITY_LOW
 
 
-def test_rule_a_book_title_heuristic_overrides_llm_miss():
-    """核心断言：LLM没自报quotation，但original_text含书名号，系统层仍必须强制保护。"""
+def test_rule_a_long_quote_heuristic_overrides_llm_miss():
+    """核心断言：LLM没自报quotation，但original_text含长引号引文，系统层仍必须强制保护。"""
     raw = _raw_issue(
         category="normal", issue_type="标点符号问题",
-        original_text="《红楼梦》里写道贾宝玉出场时的场景",
+        original_text="他在会上说“数字化转型的本质是业务重构而非技术堆砌”，随后展开论述",
     )
     issue = classify_issue(raw, {})
     assert issue.layer == config.LAYER_QUOTATION
     assert "文本特征" in _notes_text(issue)
+
+
+def test_rule_a_book_title_alone_is_not_quotation():
+    """★防线：书名号不再触发引文保护。正文里最常见的书名号用法是列举自家课程/文件标题，
+    那是本方原创内容，序号、顿号、标题文字里的错都是真错，压成"原文照录"等于整层吞掉。
+    真实数据：库里 305 条引文类有 255 条只靠书名号命中，其中 239 条改动位置在《》外面。
+    """
+    raw = _raw_issue(
+        category="normal", issue_type="标点符号问题",
+        original_text="《数据治理平台建设与实战》 3.《数据治理平台实操演练》",
+        reason="并列课程名称之间缺失顿号",
+        suggestion="应改为“《数据治理平台建设与实战》、3.《数据治理平台实操演练》”",
+    )
+    issue = classify_issue(raw, {})
+    assert issue.layer != config.LAYER_QUOTATION
+    assert not issue.suggestion.startswith("原文照录")
 
 
 def test_rule_a_classical_particle_density_heuristic():
@@ -87,12 +103,12 @@ def test_rule_a_classical_particle_density_heuristic():
 
 
 def test_rule_a_strips_cjk_variant_fragment_from_reason_but_keeps_real_doubt():
-    """真实案例：书名号命中引文保护，但LLM把两个疑点写进同一句reason——"编号与标题之间
+    """真实案例：命中引文保护，但LLM把两个疑点写进同一句reason——"编号与标题之间
     的标点格式不统一，应为'4.'"是真疑点，"'⼊表'应为'入表'"纯粹是这份PDF的部首编码伪影
     （⼊是"入"的康熙部首变体，肉眼无异）。展示给用户的"疑点供参考"必须剔除后者，保留前者。
     """
     raw = _raw_issue(
-        category="normal", issue_type="语法结构问题",
+        category="quotation", issue_type="语法结构问题",
         original_text="4《 . 企业数据资产管理及⼊表实践》",
         reason="编号与标题之间的标点格式不统一，应为\"4.\"，且\"⼊表\"应为\"入表\"",
     )
@@ -580,10 +596,10 @@ def test_priority_override_applies_even_on_quotation_layer():
 # ---------------------------------------------------------------------------
 
 def test_rule_order_a_before_b_when_both_hit():
-    """引文里含人名改动建议：同时命中A(书名号特征)和B(factual)，必须落引文类。"""
+    """引文里含人名改动建议：同时命中A(长引号引文特征)和B(factual)，必须落引文类。"""
     raw = _raw_issue(
         category="factual", confidence="low",
-        original_text="《史记》记载,司马迁曾任太史令一职",
+        original_text="史料记载“司马迁曾任太史令一职,掌天时星历”并无异议",
         suggestion="'太史令'应改为'太史公'",
     )
     issue = classify_issue(raw, {})
@@ -859,7 +875,7 @@ def test_artifact_filter_drops_space_diff_inside_quotation():
     问题整个删掉，比"原文照录，不建议改动"更保守。
     """
     result = _classify_one(_raw_issue(
-        category="normal", issue_type="标点符号问题",
+        category="quotation", issue_type="标点符号问题",
         original_text="《AI 助力PMC实战进阶》", suggestion="《AI助力PMC实战进阶》",
     ))
 

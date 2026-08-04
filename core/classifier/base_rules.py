@@ -28,7 +28,7 @@ def _rule_quotation(raw: RawIssue, mode: str):
     if raw.issue_type == "引用与成语准确性":
         notes.append("issue_type=引用与成语准确性")
     if _has_quotation_feature(raw.original_text):
-        notes.append("original_text命中引文文本特征(书名号/长引号/文言虚词)")
+        notes.append("original_text命中引文文本特征(长引号/文言虚词)")
     if not notes:
         return None
     reason = _strip_visually_no_op_fragments(raw.reason or "")

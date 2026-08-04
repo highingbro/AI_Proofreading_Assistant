@@ -7,7 +7,6 @@ import re
 import config
 from core.proofreader import RawIssue
 
-_BOOK_TITLE_RE = re.compile(r"《[^《》]+》")
 _QUOTE_PAIRS = (
     re.compile(r"“([^“”]+)”"),
     re.compile(r"‘([^‘’]+)’"),
@@ -28,8 +27,13 @@ def _has_classical_feature(text: str) -> bool:
 
 
 def _has_quotation_feature(text: str) -> bool:
-    if _BOOK_TITLE_RE.search(text):
-        return True
+    """不认书名号《》：真实数据（data/app.db 全部引文类issue离线回放）里 305 条引文类
+    有 255 条只靠书名号命中，其中 239 条 LLM 想改的位置压根不在《》里面——序号与书名号
+    之间的多余点、零宽字符、公示文件年份写错，全被"原文照录，不建议改动"压掉了。剩下
+    16 条落在《》内部的也全是部首编码伪影（⾯向→面向），真引文一条没保住。根因是书名号
+    标的是"作品名"而非"引文"，而正文里最常见的书名号用法是列举自家课程/文件标题，那是
+    本方自己的原创内容，里面的错就是真错。
+    """
     for pattern in _QUOTE_PAIRS:
         for match in pattern.finditer(text):
             if len(match.group(1)) >= config.QUOTATION_QUOTE_MIN_CHARS:

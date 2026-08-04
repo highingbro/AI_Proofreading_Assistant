@@ -19,7 +19,9 @@
 
 判定原因：提示词原文里规则C/D的处理措辞是"**原**layer若为确定性错误→降级"、"**最高只能到**存疑待核实"，这类表述预设"已经有一个layer存在"，是修饰而非独立分支——按字面顺序当六条互斥规则逐条测试会导致C/D的命中条件（OCR置信度、located字段）永远无法与A/B/E已经命中的情况共同生效。`tests/test_classifier.py::test_rule_c_stacks_on_top_of_base_rule_f` 专门验证这一叠加行为（F判定确定性错误后被C的OCR降级修饰，`layer_notes` 里两条依据都保留）。
 
-其余启发式兜底规则（弥补LLM未自报 `category` 或 `issue_type` 判断不准的漏报场景，均在 `config.py` 里可调，宁可漏判不复杂化）：规则A额外识别书名号《》、≥10字的成对引号、文言虚词密度；规则B额外识别人名职务/机构名关键词+年份格式的"改写型"建议。**这两条兜底能力是设计铁律第2、3条"系统层兜底、不能只信LLM自报"的直接体现**——`tests/test_classifier.py::test_rule_a_book_title_heuristic_overrides_llm_miss` 就是验证"LLM没自报quotation，系统仍强制保护"的核心断言。
+其余启发式兜底规则（弥补LLM未自报 `category` 或 `issue_type` 判断不准的漏报场景，均在 `config.py` 里可调，宁可漏判不复杂化）：规则A额外识别≥10字的成对引号、文言虚词密度；规则B额外识别人名职务/机构名关键词+年份格式的"改写型"建议。**这两条兜底能力是设计铁律第2、3条"系统层兜底、不能只信LLM自报"的直接体现**——`tests/test_classifier.py::test_rule_a_long_quote_heuristic_overrides_llm_miss` 就是验证"LLM没自报quotation，系统仍强制保护"的核心断言。
+
+**规则A不认书名号《》，这是一条刻意的缺席**：书名号标的是"作品名"而非"引文"，而中文正文里最高频的书名号用法是列举自家课程/文件标题——那是本方的原创内容，里面的错就是真错。把 `data/app.db` 里全部引文类issue离线回放过一遍：305条中255条**只**靠书名号命中，其中239条LLM想改的位置压根不在《》里面（序号与书名号之间的多余点、零宽字符、公示文件年份写错），剩下16条落在《》内部的又全是部首编码伪影（`⾯向`→`面向`）——真引文一条没保住，却把239条真问题压成了"原文照录，不建议改动"整层吞掉。想按"改动位置是否落在《》内部"收窄也不成立：那16条证明《》内部命中的同样是伪影。书名被LLM擅改的场景改由 `category=quotation` 与 `issue_type=引用与成语准确性` 两条信号兜底，接受漏判。防线测试 `test_rule_a_book_title_alone_is_not_quotation`。
 
 跨块去重（`postprocess.py::_dedup`）按 `(block_index, 归一化original_text)` 分组，保留更保守的一条（保守度：引文类>存疑待核实>风格可选>确定性错误）；`located=False` 的条目没有可靠 `block_index`，不参与去重、原样全部保留。排序直接按 `block_index` 升序（`block_index` 本身是解析阶段按阅读顺序分配的全局序号，天然满足"页码升序,同页按block_index"，未定位条目排最后）。`stats` 字段名（`total_issues`/`count_confirmed`/`count_doubtful`/`count_quotation`/`count_optional`/`high_priority_count`）与 `db/database.py` 里 `records` 表列名逐一对齐，供 `core/workflow/`/`core/exporter.py` 直接写库。
 
@@ -57,7 +59,7 @@
 
 **改动验证方式（真实数据回放）**：把 `data/app.db` 里同一份刊物三次校对记录（record 45/46/47）的全部 issue 重新过一遍过滤器——record 47（改动前漏出的那次）71条丢21条，而**record 45/46 丢弃数为0**，证明新判据只拦到了原先漏网的字形变体假错误，没有误伤历史上已经正常保留的结果。调规则时建议照此回放，比只看单元测试更能暴露误伤。
 
-**这套过滤只检查 `raw.suggestion`，覆盖不到规则A(`_rule_quotation`)展示给用户的 `raw.reason`**——真实案例：书名号命中引文保护、"原文照录不建议改动"，但LLM把两个疑点写进同一句reason里，"编号与标题之间的标点格式不统一，应为'4.'"是真疑点，"'⼊表'应为'入表'"纯粹是部首编码伪影（⼊是"入"的康熙部首变体），`_filter_visually_no_op` 只看 `raw.suggestion` 整条是否零改动，从未检查过 `raw.reason`，这类噪声就原样展示成"疑点供参考"，误导核实方向。`_rule_quotation` 因此单独调用 `_strip_visually_no_op_fragments`（`postprocess.py`）对 `raw.reason` 做片段级剔除，不是整条丢弃——两个疑点混在同一句话里，整条丢会连真疑点一起丢，只能挑出零改动的那一段删掉（连同前面的"，且"/"、且"连接词一起删，避免留下悬空残句）；reason整句都是零改动时会退化成空字符串，此时 fallback 成不带冒号的"原文照录，不建议改动。"，不留"疑点供参考："空尾巴。判据复用 `_normalize_lookalike`/`_diff_is_only_cjk_variants`，与上面的整条丢弃逻辑标准一致。测试见 `tests/test_classifier.py::test_rule_a_strips_cjk_variant_fragment_from_reason_but_keeps_real_doubt`/`test_rule_a_reason_entirely_cjk_variant_falls_back_to_bare_suggestion`。
+**这套过滤只检查 `raw.suggestion`，覆盖不到规则A(`_rule_quotation`)展示给用户的 `raw.reason`**——真实案例：命中引文保护、"原文照录不建议改动"，但LLM把两个疑点写进同一句reason里，"编号与标题之间的标点格式不统一，应为'4.'"是真疑点，"'⼊表'应为'入表'"纯粹是部首编码伪影（⼊是"入"的康熙部首变体），`_filter_visually_no_op` 只看 `raw.suggestion` 整条是否零改动，从未检查过 `raw.reason`，这类噪声就原样展示成"疑点供参考"，误导核实方向。`_rule_quotation` 因此单独调用 `_strip_visually_no_op_fragments`（`postprocess.py`）对 `raw.reason` 做片段级剔除，不是整条丢弃——两个疑点混在同一句话里，整条丢会连真疑点一起丢，只能挑出零改动的那一段删掉（连同前面的"，且"/"、且"连接词一起删，避免留下悬空残句）；reason整句都是零改动时会退化成空字符串，此时 fallback 成不带冒号的"原文照录，不建议改动。"，不留"疑点供参考："空尾巴。判据复用 `_normalize_lookalike`/`_diff_is_only_cjk_variants`，与上面的整条丢弃逻辑标准一致。测试见 `tests/test_classifier.py::test_rule_a_strips_cjk_variant_fragment_from_reason_but_keeps_real_doubt`/`test_rule_a_reason_entirely_cjk_variant_falls_back_to_bare_suggestion`。
 
 ## "我们自己造成的误判"一律丢弃：知识边界 / 换行符转写 / 分块边界
 
