@@ -163,8 +163,8 @@ def _migrate_add_doc_page_column(conn: sqlite3.Connection) -> None:
     """给旧库的 issues 表补上 doc_page 列（双栏页提取到的期刊自身页码）。
 
     旧记录该列取值为 NULL——迁移前的行本来就没有做过这项提取，NULL 如实表达
-    "该功能上线前的数据"，导出时按现有"未提取到就留空"的规则展示，不会显示成
-    "PDF第x页"这种臆造值。
+    "该功能上线前的数据"，导出时按现有"未提取到就留空"的规则展示，不拿PDF页码
+    顶替。
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(issues)")}
     if "doc_page" not in cols:

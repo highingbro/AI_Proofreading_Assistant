@@ -191,7 +191,7 @@ def test_export_doc_page_column_shows_value_when_extracted(db_path, tmp_path, mo
     monkeypatch.setattr(config, "EXPORTS_DIR", tmp_path)
     record_id = create_record(task_id=_task(db_path), doc_name="期刊.pdf", doc_version="", task_type="标准校对", db_path=db_path)
     add_issue(
-        record_id=record_id, page_location="文档第12页左栏", doc_page="12", original_text="期刊正文",
+        record_id=record_id, page_location="第12页左栏", doc_page="12", original_text="期刊正文",
         issue_type="错别字与拼写", priority=config.PRIORITY_MEDIUM, layer=config.LAYER_CONFIRMED,
         suggestion="改为正确写法", status="已采纳", db_path=db_path,
     )
@@ -200,7 +200,7 @@ def test_export_doc_page_column_shows_value_when_extracted(db_path, tmp_path, mo
     ws = load_workbook(path).active
 
     row = next(r for r in ws.iter_rows(min_row=2, values_only=True) if r[2] == "期刊正文")
-    assert row[0] == "文档第12页左栏"
+    assert row[0] == "第12页左栏"
     assert row[1] == "12"
 
 

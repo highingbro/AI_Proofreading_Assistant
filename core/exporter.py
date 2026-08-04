@@ -52,12 +52,11 @@ ValueError。
    的需求，加一个用不到的开关只会增加复杂度）。"处理状态"列直接显示原始
    status（导出结果里恒为"已采纳"），独立的"批注"列显示 note（未写则留空）。
 
-"文档页码"列（issues.doc_page）：双栏期刊类文档自带印刷页码，跟PDF物理页码
-经常对不上，编辑核对回纸质刊物要看的是期刊页码，不是PDF页码（详见
-core/parser/CLAUDE.md）。这一列只在提取到期刊页码时才有值，没提取到（单栏
-文档，或双栏但那一页本身没有页码，如目录/封面）留空——不臆造、也不拿PDF
-页码顶替，PDF页码信息已经在"页码/位置"列里（双栏页提取不到期刊页码时会
-显示"PDF第N页"作为退路）。_HEADER 共9列。
+"页码/位置"列（issues.page_location）一律是PDF物理页码（"第N页左栏"），这是
+校对时对着PDF翻页找问题的唯一坐标；"文档页码"列（issues.doc_page）是双栏
+期刊类文档自带的印刷页码，只在提取到时才有值，没提取到（单栏文档，或双栏
+但那一页本身没有页码，如目录/封面）留空——不臆造、也不拿PDF页码顶替。两列
+并列，编辑要翻回纸质刊物时看后者。_HEADER 共9列。
 
 回归测试：tests/test_exporter.py::test_export_note_column_shows_value_and_status_is_plain、
 test_export_only_includes_accepted_issues、

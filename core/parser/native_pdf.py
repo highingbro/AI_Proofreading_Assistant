@@ -245,17 +245,17 @@ def _strip_headers_footers(pages_raw: list[list[dict]]) -> tuple[list[list[dict]
     传入的是多页的原始块列表（每页一个list），因为判断"是否是页眉页脚"
     必须对比多页——单看一页无法区分"页眉"和"恰好在页面顶部的正文标题"。
 
-    返回 (剔除后的块列表, 每页提取到的期刊页码)——后者供双栏页 _source_location
-    显示"文档第X页"用（详见 core/parser/CLAUDE.md）：命中 _NUMERIC_ZONE_RE 的
-    页眉/页脚文本本来就要被剔除，顺手记下来，不是重复文本（属于跨页重复的运
-    行页眉/刊名不算页码，只有"命中数字/罗马数字形状"这一支才算）。一页内若
-    有多处命中，取第一个——多个候选极少见，不做优先级判断。
+    返回 (剔除后的块列表, 每页提取到的期刊页码)——后者供 Excel"文档页码"列用
+    （详见 core/parser/CLAUDE.md）：命中 _NUMERIC_ZONE_RE 的页眉/页脚文本本来就
+    要被剔除，顺手记下来，不是重复文本（属于跨页重复的运行页眉/刊名不算页码，
+    只有"命中数字/罗马数字形状"这一支才算）。一页内若有多处命中，取第一个——多个
+    候选极少见，不做优先级判断。
 
     **页码文本里的空白一律折成单个空格**：跨页对开刊物一个物理页印着左右两页的两个
     页码，PyMuPDF 把它们聚成一个块、文本是 `"31\\n32"`（`_NUMERIC_ZONE_RE` 的字符集
-    含 `\\s`，整体匹配通过），位置描述就成了 `文档第31\\n32页第1栏`，在界面和 Excel
-    的"问题位置"列里断成两行。**不在这里把它拆成两个逻辑页**——A类通道没有跨页拆分，
-    那是另一件事（见 core/parser/CLAUDE.md"跨页对开版面"一节）。
+    含 `\\s`，整体匹配通过），不折叠的话 Excel"文档页码"单元格里会断成两行。
+    **不在这里把它拆成两个逻辑页**——A类通道没有跨页拆分，那是另一件事
+    （见 core/parser/CLAUDE.md"跨页对开版面"一节）。
     """
     # 第一遍：统计每一段"位于顶部/底部区域"的文本，在多少个不同页面里出现过
     zone_text_counter: Counter[str] = Counter()
@@ -377,7 +377,8 @@ def _finalize_native_page(
     转换成和 _parse_pdf 最终期望的统一字典格式。
 
     doc_page 是 _strip_headers_footers 从这一页页眉/页脚提取到的期刊页码（可能为
-    None），原样透传给 _source_location 和输出字典，供双栏页显示"文档第X页"。
+    None），原样透传进输出字典，供 Excel"文档页码"列作为补充信息；位置描述不用它，
+    一律报PDF物理页码（见 _common.py::_source_location）。
     """
     if not raw_blocks:
         return [], "single"  # 这一页剔除页眉页脚后什么都不剩，直接返回空结果
@@ -397,7 +398,7 @@ def _finalize_native_page(
         {
             "text": b["text"],
             "block_type": b["block_type"],
-            "source_location": _source_location(page_no, mode, b.get("column"), doc_page),
+            "source_location": _source_location(page_no, mode, b.get("column")),
             "confidence": None,  # 原生提取的文本没有OCR置信度这一说，固定填None
             "doc_page": doc_page,
         }

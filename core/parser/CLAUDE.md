@@ -82,16 +82,18 @@
 - 改完用 `tools/compare_columns.py --all` 过验收线（回归 0 / 四栏收益 ≥5），它把两套边界分别喂给真正的 `_order_native_page`，比的是**块接缝处的相邻字对**而不只是栏数——那才是病灶的最小可观测单位。全部实测数据与两侧余量在 `tools/column_probe_data.md`。
 - 单元测试见 `tests/test_parser.py`"A类分栏检测"一节 12 条纯几何用例，都做过反向验证。其中三条是防"顺手改回去"的：`test_columns_overflow_lines_do_not_close_gap`（占用率剖面取代二值覆盖图的核心机制）、`test_columns_spanning_title_uses_half_region_scale`（通栏门限必须按半区内容范围宽算，不是几何区域宽）、`test_content_x_range_uses_all_blocks`（内容范围**不**剔通栏块，与直觉相反）。**构造几何覆盖不了的那条防线要知道**：真实那页大表格靠 τ=0.06 挡住（0.08 就被拆栏），但它的占用率分布无法用构造数据复刻，只由 `compare_columns.py` 的真实文档对比覆盖。
 
-## 双栏页显示期刊自身页码，不是PDF物理页码
+## 位置描述一律用PDF物理页码；提取到的期刊页码另走一列
 
-期刊/活动手册这类双栏文档通常自带印刷页码，跟PDF物理页码经常对不上（比如封面/目录不计页码，PDF第5页对应期刊第3页）——编辑核对问题要翻回纸质刊物，PDF页码没有意义。`ParsedBlock.doc_page` 记录该页从页眉/页脚提取到的期刊页码文本（如`"12"`），`_common.py::_source_location` 在 `mode=="double"` 时优先用它拼成`"文档第X页"`，提取不到（比如目录、封面这类本身没有页码的页）才退回`"PDF第N页"`——用`"PDF"`前缀跟正常提取到的期刊页码区分开，不让编辑误以为PDF页码就是期刊页码。单栏文档不受影响，沿用`"第N页"`：普通Word转的报告类文档PDF页码本来就等于文档页码，不存在需要提取的问题。gating 只看这一页是不是双栏，跟走A类还是B类通道无关，两条通道各自独立提取：
+`_common.py::_source_location` 拼出的 `ParsedBlock.source_location`（→ `issues.page_location` → 界面问题卡与 Excel"页码/位置"列）**页码部分永远是PDF物理页码**，不分单栏双栏、不看该页有没有提取到期刊自身页码，只在分栏页追加"左栏/右栏/第k栏/通栏"。理由是期刊页码的提取本身不可靠（目录/封面这类页提取不到，跨页对开版面一页印两个页码），位置描述里混着两种页码体系反而更难核对；而校对时是对着PDF翻页找问题，PDF页码是唯一始终存在且始终准确的坐标。
+
+提取到的期刊页码仍单独保留在 `ParsedBlock.doc_page`，全链路透传到 Excel"文档页码"列（提取不到就留空，不拿PDF页码顶替），编辑要翻回纸质刊物时看那一列。提取跟走A类还是B类通道无关，两条通道各自独立做：
 
 - **A类**（`native_pdf.py::_strip_headers_footers`）：页眉/页脚区域里命中 `_NUMERIC_ZONE_RE`（纯数字/罗马数字/页码范围形状）的文本，本来就要被剔除、不当正文送审，顺手记下来作为该页的 `doc_page` 候选——不是新增判断，只是把已有判断的副作用利用起来。一页内多个候选取第一个。
 - **B类**（`ocr_pdf.py::_run_structure`）：版面检测模型自己会把页码区域打上 `"number"` 标签（跟页眉/页脚同一批 `_DROP_LABELS`），不需要像A类那样靠正则猜形状——直接读该标签区域的OCR文本。同样是本来就要丢弃的区域，丢弃前顺手记下文字。
 
 两条通道都不做"是否真的像页码"的额外校验：A类靠 `_NUMERIC_ZONE_RE` 的形状要求，B类靠版面模型自己的语义标签，信号已经足够强，没有必要再叠一层验证。
 
-测试见 `tests/test_parser.py`"双栏页期刊页码提取"一节（`_strip_headers_footers` 提取/不提取两种情况、`_run_structure` 有无`"number"`标签两种情况）和"`_source_location`"一节（双栏有/无doc_page、单栏不受影响三条用例）。全链路透传（`RawIssue.doc_page` → `ClassifiedIssue.doc_page` → `issues.doc_page` 列 → Excel"文档页码"列）见 `core/exporter.py` 模块docstring。
+测试见 `tests/test_parser.py`"双栏页期刊页码提取"一节（`_strip_headers_footers` 提取/不提取两种情况、`_run_structure` 有无`"number"`标签两种情况）和"`_source_location`"一节（单栏/两栏/多栏三条用例）。全链路透传（`RawIssue.doc_page` → `ClassifiedIssue.doc_page` → `issues.doc_page` 列 → Excel"文档页码"列）见 `core/exporter.py` 模块docstring。
 
 ## 跨页对开版面：PyMuPDF把左右两页同一水平线上的文字聚成一个block
 
@@ -128,11 +130,10 @@ LLM，LLM据此报出"应改为『探索生产制造运营系统建设思路』�
 **上面第一条修好并不能顺带修第二条**：`_lines_share_same_row` 只决定 block 内多行的**拼接符**
 是空格还是换行，**不改变 block 的划分和 bbox**，那个777pt宽的 bbox 照样会污染半区范围。
 
-**三、一个物理页印着两个页码，位置描述里出现换行。** `03` `04` 被聚成一个块 `"03\n04"`，
-`_NUMERIC_ZONE_RE`（字符集含 `\s`）整体匹配通过，于是 `_source_location` 拼出
-`文档第10\n9页第1栏`，在界面和 Excel 的"问题位置"列里断成两行。防线在
-`_strip_headers_footers` 记 `doc_page` 时把内部空白折成单个空格（`03 04`）。真实文档实测
-三份期刊共 3276 条这样的位置串，折叠后 0 条，**块文本零差异**（只动位置描述）。
+**三、一个物理页印着两个页码，页码文本里出现换行。** `03` `04` 被聚成一个块 `"03\n04"`，
+`_NUMERIC_ZONE_RE`（字符集含 `\s`）整体匹配通过，`doc_page` 就成了 `"03\n04"`，在 Excel
+"文档页码"单元格里断成两行。防线在 `_strip_headers_footers` 记 `doc_page` 时把内部空白
+折成单个空格（`03 04`），**块文本零差异**。
 **不在这里把它拆成两个逻辑页**——那是下面那件没做的事。
 
 **这一页的四栏检测现在成立了**（右半页不对称——栏3是正文、栏4是只有4行短文本的联系方式框

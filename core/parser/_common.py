@@ -119,26 +119,24 @@ def _detect_column_split(blocks: list[dict], width: float) -> float | None:
     return _split_region(blocks, 0.0, width, config.COLUMN_MIN_GAP_WIDTH_RATIO)
 
 
-def _source_location(page_no: int, mode: str, column: str | None, doc_page: str | None = None) -> str:
+def _source_location(page_no: int, mode: str, column: str | None) -> str:
     """拼出人类可读的位置描述，写进 ParsedBlock.source_location。
 
     column 取 'left'/'right'（两栏版面）、'col1'..'colN'（三栏以上，此时不用
     左/右描述，直接报第几栏）、'span'（跨栏）或 None（单栏）。
 
-    双栏页面（期刊/活动手册常见排版）通常自带印刷页码，跟PDF物理页码往往对不上——
-    校对结果要给编辑核对回纸质刊物用，PDF页码没有意义。doc_page 是从该页页眉/页脚
-    提取到的期刊自身页码文本（如"12"），提取到就用"文档第X页"，没提取到（比如目录、
-    封面这类本身没有页码的页）就退回"PDF第N页"，用"PDF"前缀跟正常提取到的期刊页码
-    区分开，不让编辑误以为PDF页码就是期刊页码。单栏页面（如普通Word转的报告）不受
-    影响，沿用"第N页"——这类文档PDF页码本来就等于文档页码，不存在需要提取的问题。
+    页码一律用PDF物理页码，不分单栏双栏、也不看该页有没有提取到期刊自身页码：
+    期刊页码的提取本身不可靠（目录/封面等页提取不到，对开版面会提取到两个），
+    位置描述里混着两种页码体系反而更难核对。校对时是对着PDF翻页找问题，PDF页码
+    是唯一始终存在且始终准确的坐标。提取到的期刊页码仍单独保留在
+    `ParsedBlock.doc_page`，走 Excel"文档页码"列作为补充信息。
     """
     if mode != "double" or column is None:
         return f"第{page_no}页"  # 单栏，或没有栏位信息，只报页码
-    page_part = f"文档第{doc_page}页" if doc_page else f"PDF第{page_no}页"
     if column == "left":
-        return f"{page_part}左栏"
+        return f"第{page_no}页左栏"
     if column == "right":
-        return f"{page_part}右栏"
+        return f"第{page_no}页右栏"
     if column.startswith("col") and column[3:].isdigit():
-        return f"{page_part}第{column[3:]}栏"
-    return f"{page_part}通栏"  # 分栏页面里跨越多栏的内容（如通栏标题/表格）
+        return f"第{page_no}页第{column[3:]}栏"
+    return f"第{page_no}页通栏"  # 分栏页面里跨越多栏的内容（如通栏标题/表格）

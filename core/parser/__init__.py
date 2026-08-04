@@ -122,7 +122,7 @@ def _parse_pdf(path: Path, force_layout: str, spread_order: str, ocr: str) -> Pa
                         {
                             "text": b["text"],
                             "block_type": b["block_type"],
-                            "source_location": _source_location(logical_page_no, mode, b.get("column"), doc_page),
+                            "source_location": _source_location(logical_page_no, mode, b.get("column")),
                             "confidence": b["confidence"],
                             "doc_page": doc_page,
                         }

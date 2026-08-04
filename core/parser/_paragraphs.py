@@ -4,8 +4,8 @@
 **相邻的两个 block** 里：
 
 ```
-文档第5页第1栏   "• 讲解AI Agent关键技术与工业典型应用场"     ← 一个 block
-文档第5页第1栏   "景，助力企业把握技术前沿。"                   ← 另一个 block
+第5页第1栏"• 讲解AI Agent关键技术与工业典型应用场"     ← 一个 block
+第5页第1栏"景，助力企业把握技术前沿。"                   ← 另一个 block
 ```
 
 `core/chunker/` 在 block 之间要插 `\\n`（原因见 core/chunker/CLAUDE.md），LLM 于是看到

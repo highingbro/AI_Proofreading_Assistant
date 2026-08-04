@@ -1177,8 +1177,7 @@ def test_strip_headers_footers_extracts_numeric_zone_text_as_doc_page():
 def test_strip_headers_footers_collapses_whitespace_in_spread_doc_page():
     """★防线：跨页对开一个物理页印两个页码，PyMuPDF 聚成一个块 `"31\\n32"`。
 
-    不折叠的话位置描述会变成 `文档第31\\n32页第1栏`，在界面和 Excel 的"问题位置"列里
-    断成两行。真实文档实测：三份期刊共 3276 条位置串带换行。
+    不折叠的话 Excel"文档页码"单元格里会断成两行。
     """
     from core.parser.native_pdf import _strip_headers_footers
 
@@ -1274,27 +1273,27 @@ def test_ocr_run_structure_no_number_label_returns_none_doc_page(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _source_location：双栏页优先显示提取到的期刊页码，没提取到退回PDF页码；
-# 单栏页完全不受影响
+# _source_location：页码一律用PDF物理页码，不分单栏双栏
 # ---------------------------------------------------------------------------
 
-def test_source_location_double_column_uses_doc_page_when_present():
+def test_source_location_double_column_uses_pdf_page():
     from core.parser._common import _source_location
 
-    assert _source_location(5, "double", "left", "12") == "文档第12页左栏"
-    assert _source_location(5, "double", "right", "12") == "文档第12页右栏"
+    assert _source_location(5, "double", "left") == "第5页左栏"
+    assert _source_location(5, "double", "right") == "第5页右栏"
 
 
-def test_source_location_double_column_falls_back_to_pdf_page_without_doc_page():
+def test_source_location_multi_column_reports_column_index():
     from core.parser._common import _source_location
 
-    assert _source_location(5, "double", "left", None) == "PDF第5页左栏"
+    assert _source_location(5, "double", "col3") == "第5页第3栏"
+    assert _source_location(5, "double", "span") == "第5页通栏"
 
 
-def test_source_location_single_column_unaffected_by_doc_page():
+def test_source_location_single_column_reports_page_only():
     from core.parser._common import _source_location
 
-    assert _source_location(5, "single", None, "12") == "第5页"
+    assert _source_location(5, "single", None) == "第5页"
 
 
 # ---------------------------------------------------------------------------
