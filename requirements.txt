@@ -1,5 +1,10 @@
 streamlit
 pytest
+# 不锁版本，但 1.27.2.2 起 Page.get_texttrace() 有引用计数 bug（每个 span 少给 None 加
+# 一次引用，会让解释器 Fatal none_dealloc 硬崩），由 core/parser/_glyph_repair.py 自行
+# 补偿，详见该文件 docstring。**别为了绕开那个 bug 把版本降到 1.26.x**：实测降级会改变
+# PyMuPDF 自己的 block 切分，79期有 3 句退回词中断行、句中换行指标 5237→5239，
+# 踩坏 _paragraphs.py 那套照 1.28 切分标定的段落合并。
 pymupdf
 python-docx
 paddleocr

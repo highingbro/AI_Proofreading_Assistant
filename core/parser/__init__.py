@@ -99,7 +99,9 @@ def _parse_pdf(path: Path, force_layout: str, spread_order: str, ocr: str) -> Pa
             if not use_ocr:
                 # ---- A类通道：原生文字层，直接按坐标提取文本块 ----
                 logical_page_no += 1
-                raw_blocks, width = _extract_native_page_raw(page)
+                # allow_ocr 只影响"被编造的字形要不要渲染送OCR读回真身"（见
+                # _glyph_repair.py）：ocr='off' 的语义是这次调用不许碰OCR，字形还原也算在内。
+                raw_blocks, width = _extract_native_page_raw(page, allow_ocr=(ocr != "off"))
                 # 先放一个占位dict进最终结果列表里占好位置（保证页面顺序），
                 # mode/blocks 留空，等所有原生页收集完、统一做完页眉页脚剔除后再回填
                 placeholder: dict = {"source": "native", "page_no": logical_page_no, "mode": None, "blocks": None}

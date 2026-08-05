@@ -32,6 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import config  # noqa: E402
 from core.parser import parse_document  # noqa: E402
 from core.parser._types import NoTextLayerError  # noqa: E402
 
@@ -42,6 +43,20 @@ _STOP_CHARS = "。！？；…：.!?;:）)》」』】〕》\"'”’"
 
 # `《` 后紧跟空白 → 开括号被排到了它后面那个字符的前面；`1 《 .` → 序号点被吞进括号里。
 _BRACKET_MISORDER_RES = (re.compile(r"《\s"), re.compile(r"\d\s*《\s*\."))
+
+
+def _glyph_metrics(blocks) -> tuple[int, int]:
+    """字形读不出的字符数，以及因此被排除送审的正文字数。
+
+    本脚本一律用 `ocr='off'` 调 `parse_document`，所以量到的是**最坏路径**：字形还原全部
+    不生效、检出的伪造字符统统落成记号。这个上界正是我们要盯的——它说明"万一还原完全
+    失效，盲区有多大"。真实路径（还原开着）的残留由 `tools/glyph_repair_report.py` 量。
+    """
+    from core.chunker.fill_units import _drop_unreadable_clauses
+
+    marks = sum(b.text.count(config.NATIVE_UNREADABLE_GLYPH_MARK) for b in blocks)
+    dropped = sum(len(b.text) - len(_drop_unreadable_clauses(b.text)) for b in blocks)
+    return marks, dropped
 
 
 def _metrics(blocks) -> tuple[int, int, int]:
@@ -76,23 +91,25 @@ def main() -> None:
     if args.needle:
         paths = [p for p in paths if args.needle in p.name]
 
-    totals = [0, 0, 0]
-    print("%-42s %8s %8s %8s %7s" % ("文档", "句中换行", "位置断行", "括号错位", "块数"))
+    totals = [0, 0, 0, 0, 0]
+    print("%-42s %8s %8s %8s %8s %8s %7s"
+          % ("文档", "句中换行", "位置断行", "括号错位", "读不出字", "弃审字数", "块数"))
     for path in paths:
         try:
             doc = parse_document(path, ocr="off")
         except NoTextLayerError as exc:
             print("%-42s  跳过（%s）" % (path.name[:42], type(exc).__name__))
             continue
-        m = _metrics(doc.blocks)
+        m = _metrics(doc.blocks) + _glyph_metrics(doc.blocks)
         totals = [t + v for t, v in zip(totals, m)]
-        print("%-42s %8d %8d %8d %7d" % (path.name[:42], m[0], m[1], m[2], len(doc.blocks)))
+        print("%-42s %8d %8d %8d %8d %8d %7d"
+              % (path.name[:42], m[0], m[1], m[2], m[3], m[4], len(doc.blocks)))
         if dump_dir:
             # 位置串也要 repr：它本身可能含换行（正是本脚本要量的噪声之一），
             # 直接写进去会把一条记录劈成两行，diff 的行号全错位。
             lines = [f"{b.source_location!r}\t{b.text!r}" for b in doc.blocks]
             (dump_dir / (path.stem + ".txt")).write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print("%-42s %8d %8d %8d" % ("合计", *totals))
+    print("%-42s %8d %8d %8d %8d %8d" % ("合计", *totals))
 
 
 if __name__ == "__main__":

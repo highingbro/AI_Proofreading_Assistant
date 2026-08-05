@@ -1,7 +1,7 @@
-"""阶段3验收测试：长文档分块模块。
+"""长文档分块模块（core/chunker/）。
 
-用合成 ParsedDocument（精确控制block大小/类型，便于断言边界规则）
-加真实样本冒烟测试（复用阶段2已验收的 sample_double_column.pdf）。
+用合成 ParsedDocument（精确控制 block 大小/类型，便于断言边界规则），外加一条读真实
+样本的全链路冒烟（`samples/` 不进版本库，缺文件时跳过，形态要求见 README）。
 """
 
 import sys
@@ -16,6 +16,14 @@ from core.chunker import chunk_document, chunk_for_block, locate_block
 from core.parser import ParsedBlock, ParsedDocument, parse_document
 
 SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
+
+
+def _sample(name: str) -> Path:
+    """样例文档路径；文件不在就跳过该用例（`samples/` 不进版本库，理由见 README）。"""
+    path = SAMPLES_DIR / name
+    if not path.exists():
+        pytest.skip(f"缺少样例文档 samples/{name}（不进版本库，见 README）")
+    return path
 
 
 def _make_text(seed: int, length: int) -> str:
@@ -227,7 +235,7 @@ def test_locate_block_and_chunk_for_block(overlap_scenario):
 # ---------------------------------------------------------------------------
 
 def test_real_sample_smoke():
-    parsed = parse_document(SAMPLES_DIR / "sample_double_column.pdf")
+    parsed = parse_document(_sample("sample_double_column.pdf"))
     chunked = chunk_document(parsed)
 
     assert len(chunked.chunks) >= 1
@@ -237,3 +245,60 @@ def test_real_sample_smoke():
     non_table_indices = [b.block_index for b in parsed.blocks if b.block_type != "table"]
     assert sorted(covered) == sorted(non_table_indices)
     assert len(covered) == len(set(covered))  # 真实样本没有超长block，不会触发切分例外
+
+
+# ---------------------------------------------------------------------------
+# 字形读不出的位置：只排除**那一句**，同块其余句子照常送审
+# （记号由 core/parser/_glyph_repair.py 落下，含义见 config.NATIVE_UNREADABLE_GLYPH_MARK）
+# ---------------------------------------------------------------------------
+
+MARK = config.NATIVE_UNREADABLE_GLYPH_MARK
+
+
+def test_unreadable_clause_excluded_but_siblings_kept():
+    """★ 关键防线：只丢含记号的那一句，同一个block里其余句子必须照常送审。
+
+    防的是"退化成整块丢弃"——实测最坏情况按块丢会赔上 20.3% 的正文，还会让某个
+    241 字长段因为一个字读不出而整段不校对。
+    """
+    text = f"第一句完全正常。第二句有个{MARK}读不出的字。第三句也完全正常。"
+    blocks = [ParsedBlock(page=1, block_index=0, text=text, block_type="paragraph", source_location="第1页")]
+    chunked = chunk_document(_synthetic_doc(blocks))
+
+    body = "".join(c.text for c in chunked.chunks)
+    assert MARK not in body                    # 记号不会漏进送审文本
+    assert "第二句" not in body                 # 含记号的那一句被整句排除
+    assert "第一句完全正常。" in body           # 同块其余句子照进
+    assert "第三句也完全正常。" in body
+
+
+def test_unreadable_clause_splits_on_newline_and_semicolon():
+    """切分点比超长block切分用的 _SENTENCE_END 更细（多收分号/换行等），
+    目的就是尽量缩小被排除的范围。"""
+    text = f"条目甲正常；条目乙有{MARK}问题；条目丙正常"
+    blocks = [ParsedBlock(page=1, block_index=0, text=text, block_type="paragraph", source_location="第1页")]
+    chunked = chunk_document(_synthetic_doc(blocks))
+
+    body = "".join(c.text for c in chunked.chunks)
+    assert "条目甲正常；" in body and "条目丙正常" in body
+    assert "条目乙" not in body
+
+
+def test_unreadable_block_without_sentence_end_is_dropped_whole():
+    """块内找不到任何切分点时整块丢弃（标题、条目那类，本来就短）。"""
+    blocks = [
+        ParsedBlock(page=1, block_index=0, text=f"标题里有{MARK}字", block_type="heading", source_location="第1页"),
+        ParsedBlock(page=1, block_index=1, text="正文照常。", block_type="paragraph", source_location="第1页"),
+    ]
+    chunked = chunk_document(_synthetic_doc(blocks))
+
+    assert {bi for c in chunked.chunks for bi in c.block_indices} == {1}
+
+
+def test_text_without_mark_is_untouched():
+    """没有记号的文本一个字都不能动。★ 防"顺手按句重组了正常文本"。"""
+    text = "第一句正常。第二句正常；第三句正常"
+    blocks = [ParsedBlock(page=1, block_index=0, text=text, block_type="paragraph", source_location="第1页")]
+    chunked = chunk_document(_synthetic_doc(blocks))
+
+    assert text in "".join(c.text for c in chunked.chunks)

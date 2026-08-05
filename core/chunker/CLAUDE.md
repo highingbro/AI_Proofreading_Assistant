@@ -19,3 +19,26 @@
 这是有意识的取舍（宁可漏判不复杂化）：如果文档里真的存在需要校对的表格化正文，会被这条规则连带跳过——目前没有可靠信号能区分"表格化正文"和"截图/示意图"（LayoutDetection只给"table"一个标签，不含语义），留给以后真遇到这种文档再解决。
 
 测试见 `tests/test_chunker.py`"block_type=="table"的区域整体不进入任何chunk"一节两条用例（`test_table_blocks_excluded_from_chunking`/`test_document_with_only_table_blocks_produces_no_chunks`），以及真实样本冒烟测试 `test_real_sample_smoke` 里"覆盖到的block集合应等于非table的block集合"这条断言。
+
+## 字形读不出的位置：只排除**那一句**，不是整块
+
+`ParsedBlock.text` 里出现 `config.NATIVE_UNREADABLE_GLYPH_MARK` 表示"此处原文有一个字，但它的
+字形无法从文件里读出"——成因与还原尝试见 [core/parser/CLAUDE.md](../parser/CLAUDE.md)"字体把
+字形映射成'另一个毫不相干的汉字'"一节。这些位置**没法校对**：字形读不出来，就无从判断作者有
+没有写错。送进 LLM 只会得到两类假问题——把记号本身报成错别字，或者对着缺字的句子猜一条"漏字"。
+
+`fill_units.py::_drop_unreadable_clauses` 因此在 `_build_fill_units` 里把含记号的那一句整句
+排除；块内找不到任何切分点时（标题、条目那类，本来就短）整块跳过。与 table 规则一样，只影响
+送审文本，`ParsedBlock` 本身不动。
+
+**按句而不是按块，是有实测依据的取舍**：最坏情况（字形还原全不生效）按句丢 14.9% 的正文、
+按块要丢 20.3%；更要紧的是按块会让"某个 241 字长段里只有一个字读不出"赔上整段。真实路径下
+（还原开着）残留很小——实测 98 处伪造字符还原后只剩 7 处，最终排除 35/10193 字（0.34%）。
+
+**切分点用 `_CLAUSE_END` 而不是超长block切分那个 `_SENTENCE_END`**：前者多收分号/省略号/换行，
+目的是尽量缩小被排除的范围（切得越细丢得越少）；后者要的是语义完整的段。两者目标不同，
+不共用一个正则。
+
+测试见 `tests/test_chunker.py`"字形读不出的位置"一节四条用例，都做过反向验证。其中
+`test_unreadable_clause_excluded_but_siblings_kept` 是★防线——防止实现退化成整块丢弃；
+`test_text_without_mark_is_untouched` 防的是"顺手把正常文本也按句重组了"。

@@ -1,13 +1,13 @@
-"""阶段2验收测试：文档解析模块。
+"""文档解析模块（core/parser/）。
 
-以两组“内容相同”的对照样本交叉验证为核心：
-  - sample.pdf（A类）vs sample.docx（C类）
-  - sample_single_column.pdf vs sample_double_column.pdf（B类，检验双栏阅读顺序还原）★核心
+绝大多数用例用构造的 PyMuPDF/python-docx 桩数据精确断言文本装配逻辑，不碰外部文件。
+少数几条端到端用例要读 `samples/` 下的真实文档（四份的形态要求见 README），缺文件时由
+`_sample()` 跳过——那个目录不进版本库。
 """
 
-import difflib
 import sys
 import time
+import types
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -16,37 +16,39 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import config
 from core.parser import NoTextLayerError, UnsupportedFormatError, parse_document
 
 SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
 
 
-def _normalize(text: str) -> str:
-    return "".join(text.split())
-
-
-def _full_text(doc) -> str:
-    return _normalize("".join(b.text for b in doc.blocks))
+def _sample(name: str) -> Path:
+    """样例文档路径；文件不在就跳过该用例，不让它 error 成"代码坏了"的样子。
+    """
+    path = SAMPLES_DIR / name
+    if not path.exists():
+        pytest.skip(f"缺少样例文档 samples/{name}（不进版本库，见 README）")
+    return path
 
 
 @pytest.fixture(scope="module")
 def native_pdf_doc():
-    return parse_document(SAMPLES_DIR / "sample.pdf")
+    return parse_document(_sample("sample.pdf"))
 
 
 @pytest.fixture(scope="module")
 def docx_doc():
-    return parse_document(SAMPLES_DIR / "sample.docx")
+    return parse_document(_sample("sample.docx"))
 
 
 @pytest.fixture(scope="module")
 def single_column_doc():
-    return parse_document(SAMPLES_DIR / "sample_single_column.pdf")
+    return parse_document(_sample("sample_single_column.pdf"))
 
 
 @pytest.fixture(scope="module")
 def double_column_doc():
-    return parse_document(SAMPLES_DIR / "sample_double_column.pdf")
+    return parse_document(_sample("sample_double_column.pdf"))
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +79,19 @@ def _char_line(chars, size=8.5):
     }
 
 
-class _FakeNativePage:
+class _FakeNativePageBase:
+    """A类页面桩的公共父类：补上 `get_texttrace()`。
+
+    `_extract_native_page_raw` 会调它来找"字体把字形映射成了另一个汉字"的位置（见
+    core/parser/_glyph_repair.py）。这些桩测的都是文本装配逻辑、不涉及坏字形，返回空列表
+    即可——真实 `fitz.Page` 一定有这个方法，桩不补就会 AttributeError。
+    """
+
+    def get_texttrace(self):
+        return []
+
+
+class _FakeNativePage(_FakeNativePageBase):
     """伪造一个具备 get_text("rawdict") 接口的对象，隔离测试 _extract_native_page_raw
     的拼接逻辑，不依赖真实PDF文件里恰好存在多行block。两行的bbox在y轴上完全不重叠
     （100~115 vs 118~133），代表纵向上真正独立的两行，不应被判定为同一视觉行。"""
@@ -110,7 +124,7 @@ def test_native_pdf_multiline_block_join_uses_newline():
     assert raw_blocks[0]["text"] == "第一行文字：\n第二行文字。"
 
 
-class _FakeNativePageSameRowMisplit:
+class _FakeNativePageSameRowMisplit(_FakeNativePageBase):
     """补丁回归测试用：伪造PyMuPDF把同一视觉行误拆成两个line对象的场景——项目符号
     （符号字体，窄bbox）跟正文之间隔了一段水平间隙，但y轴范围几乎完全重叠（真实文档
     踩过的坑：Wingdings项目符号+正文被拆成两个line，中间插入换行符后LLM误判成
@@ -143,7 +157,7 @@ def test_native_pdf_same_row_misplit_lines_join_with_space():
     assert raw_blocks[0]["text"] == " 系统管理员享有学生的功能"
 
 
-class _FakeNativePageBarelyOverlapping:
+class _FakeNativePageBarelyOverlapping(_FakeNativePageBase):
     """补丁回归测试用：两行y轴只有轻微擦边重叠（占较小行自身高度的比例远低于阈值），
     应仍判定为纵向上真正不同的两行，用换行符拼接，不能被误判成同一视觉行。"""
 
@@ -506,7 +520,7 @@ def test_normalize_cjk_variants_ordinary_text_untouched():
     assert normalize_cjk_variants(text) == text
 
 
-class _FakeNativePageCjkVariant:
+class _FakeNativePageCjkVariant(_FakeNativePageBase):
     """真实场景复现：破损字体把"工业互联网"里的"工"和"网"映射到康熙部首码位，
     验证 _extract_native_page_raw 在拼出block文本后确实做了归一化，不只是
     normalize_cjk_variants 函数本身正确。"""
@@ -574,7 +588,7 @@ def test_strip_unmapped_glyph_chars_ordinary_text_untouched():
     assert _strip_unmapped_glyph_chars(text) == text
 
 
-class _FakeNativePageUnmappedGlyphs:
+class _FakeNativePageUnmappedGlyphs(_FakeNativePageBase):
     """真实场景复现：一整行只有装饰图标（`\\x01`），以及正文行里夹着图标占位码位。
     坐标让两行在y轴上完全不重叠，代表纵向真正独立的两行。"""
 
@@ -613,7 +627,7 @@ def test_native_pdf_extract_strips_unmapped_glyphs_and_drops_icon_only_line():
 # 的假错误全出自这里。
 # ---------------------------------------------------------------------------
 
-class _FakeNativePageOpenBracketMisorder:
+class _FakeNativePageOpenBracketMisorder(_FakeNativePageBase):
     """PyMuPDF 把 `1.《数据…》` 拆成 `1《` / `. 数据…》` 两个 line：`《` 字框 61.10 起、
     墨迹却约从 64.8 才开始，`.`(62.44–64.80) 整个落在它的空白左半里，`《` 与 `.` 之间
     那个 64.80–69.43 的空格是排版填充（字框几乎完全被 `《` 盖住）。"""
@@ -679,7 +693,7 @@ def test_filler_space_covered_by_neighbour_dropped_but_word_space_kept():
     assert _chars_text(drop_filler_spaces(real)) == "A B"
 
 
-class _FakeNativePageStackedLines:
+class _FakeNativePageStackedLines(_FakeNativePageBase):
     """★ 防过度合并：79期第19页股票表格里 `*ST` 与 `⼯智` 被拆成两个 line，但两者 x 范围
     几乎完全重合（叠印在同一位置，重叠 13.7pt ≈ 两个字宽）。逐字符排会排成 `⼯*S智T`，
     按视觉顺序前后调也没有可靠依据（只差 0.79pt），应保持 PyMuPDF 原序用空格拼。"""
@@ -710,7 +724,7 @@ def test_native_pdf_stacked_lines_not_merged_char_by_char():
     assert raw_blocks[0]["text"] == "*ST 工智"  # 康熙部首码位已由 _cjk_variants 归一化
 
 
-class _FakeNativePageReversedRowOrder:
+class _FakeNativePageReversedRowOrder(_FakeNativePageBase):
     """真实场景复现：PyMuPDF 给的行序与视觉顺序相反——`合肥`(x393) 排在
     `9月17-18日`(x332) 前面。两段横向完全不重叠，按视觉顺序调过来用空格拼。"""
 
@@ -740,7 +754,7 @@ def test_native_pdf_same_row_lines_reordered_by_x():
     assert raw_blocks[0]["text"] == "9月17-18日 合肥"
 
 
-class _FakeNativePageAdjacentHeadings:
+class _FakeNativePageAdjacentHeadings(_FakeNativePageBase):
     """★ 防"只要挨着就按字符拼"：真实文档里 `课程介绍`(574.7–603.6) 与
     `讲师介绍`(603.4–624.3) 是并排的两个表头，字框有 0.2pt 擦边重叠但并没有交错，
     按字符拼会把中间那个必要的分隔空格吃掉，变成 `课程介绍讲师介绍`。"""
@@ -830,7 +844,7 @@ def test_tracking_space_skipped_when_too_few_gap_samples():
     assert _chars_text(_drop_tracking_spaces(span["chars"])) == "A B"
 
 
-class _FakeNativePageTrackingSpaces:
+class _FakeNativePageTrackingSpaces(_FakeNativePageBase):
     """真实场景复现（预览版第9页 `注重APS应用落地`，字号8.5）：`A`=[133.95,139.11]、
     空格=[139.11,140.39] 宽仅 1.28pt、`P`=[140.39,145.76]、`S`=[146.95,152.03]——
     `P` 与 `S` 之间同样有 1.19pt 间隙却没有空格字符，同一行同一种间距编码得不一致。"""
@@ -864,7 +878,7 @@ def test_native_pdf_extract_drops_tracking_spaces():
     assert raw_blocks[0]["text"] == "聚焦实施注重APS应用落地"
 
 
-class _FakeNativePageSpreadMisjoin:
+class _FakeNativePageSpreadMisjoin(_FakeNativePageBase):
     """补丁回归测试用：跨页对开版面（一个物理页印着左右两个页码）里，左页和右页同一
     水平线上两块**毫不相干**的文字，y轴100%重叠但横向相距半个页面，被PyMuPDF聚成了
     同一个block。坐标取自真实文档（活动手册第30/29页对开：右页最右的"联系方式"信息框
@@ -940,7 +954,7 @@ def test_columns_four_column_symmetric():
 
 
 def test_columns_spanning_header_does_not_break_gap():
-    """通栏刊头横跨整幅，仍应检出四栏（旧算法的原始误判之一，此前没有回归用例）。"""
+    """通栏刊头横跨整幅，仍应检出四栏。"""
     from core.parser._columns import _detect_column_boundaries
 
     blocks = _symmetric_four_column_blocks()
@@ -952,9 +966,9 @@ def test_columns_spanning_header_does_not_break_gap():
 def test_columns_spread_merged_block_does_not_break_detection():
     """跨页对开版面里 PyMuPDF 把左右两页同一水平线的文字聚成的"误聚块"不得搅乱分栏。
 
-    真实文档里这个块宽 777pt（页宽 1009）、**中心点落进左半区**，旧算法据此把左半区
-    内容范围从 [44,466] 撑成整页宽 [44,953]，中部搜索带随之落到主分栏线附近而不是
-    栏1|栏2 的真实间隙，四栏被判成两栏。新算法每层都用"剔通栏块之后"剩余块的范围，
+    真实文档里这个块宽 777pt（页宽 1009）、**中心点落进左半区**：拿半区全部块算内容
+    范围的话，会从 [44,466] 被撑成整页宽 [44,953]，搜索带随之落到主分栏线附近而不是
+    栏1|栏2 的真实间隙，四栏被判成两栏。防线是每层都用"剔通栏块之后"剩余块的范围，
     这个块在任何一层都够宽、必被剔除。
     """
     from core.parser._columns import _detect_column_boundaries
@@ -985,7 +999,7 @@ def test_columns_overflow_lines_do_not_close_gap():
 def test_columns_asymmetric_four_column():
     """末栏只有4行短文本（联系方式框那类）时仍应检出四栏。
 
-    ★ 旧算法因"分栏线两侧字符数要平衡"必然失败，core/parser/CLAUDE.md 点名为残留未处理。
+    ★ 任何"分栏线两侧字符数要平衡"的判据在这里必然失败，所以定栏数一个字符都不许看。
     """
     from core.parser._columns import _detect_column_boundaries
 
@@ -1297,11 +1311,9 @@ def test_source_location_single_column_reports_page_only():
 
 
 # ---------------------------------------------------------------------------
-# 补丁回归测试：table类区域不再尝试结构识别重建，按坐标拉平的文本原样保留
-# （曾用 TableRecognitionPipelineV2 重建行列结构，真实验证命中率接近零：
-# 真实文档诊断发现table类区域绝大多数是说明性UI截图/菜单结构图，不是待校对
-# 正文，且贡献了大量假错误，core/chunker.py 已改为整体跳过这类block不送审，
-# 结构重建本身不再有必要，见 core/parser/CLAUDE.md）
+# 防线：table类区域不做结构识别重建，按坐标拉平的文本原样保留
+# （这类区域绝大多数是说明性UI截图/菜单结构图、不是待校对正文，core/chunker/ 整体
+# 跳过它们不送审；TableRecognitionPipelineV2 这条路已否决，见 core/parser/CLAUDE.md）
 # ---------------------------------------------------------------------------
 
 class _FakeLayoutPipelineTable:
@@ -1337,8 +1349,9 @@ def test_table_region_keeps_flat_joined_text(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 补丁回归测试：OCR文字识别模型换档（降低低画质截图的字符误识别率）
-# _get_ocr_pipeline 应把 config.PADDLEOCR_DET_MODEL/REC_MODEL 透传给 PaddleOCR
+# OCR识别模型换档机制：_get_ocr_pipeline 把 config.PADDLEOCR_DET_MODEL/REC_MODEL
+# 透传给 PaddleOCR。两个常量默认为 None（换更大档没有准确率收益，A/B 数据见
+# core/parser/CLAUDE.md），机制留着供将来重新评估，这几条钉的就是透传本身
 # ---------------------------------------------------------------------------
 
 class _FakePaddleOCR:
@@ -1526,7 +1539,7 @@ def test_ocr_double_column(double_column_doc):
 
 def test_ocr_off_raises_for_scanned_pdf():
     with pytest.raises(NoTextLayerError):
-        parse_document(SAMPLES_DIR / "sample_single_column.pdf", ocr="off")
+        parse_document(_sample("sample_single_column.pdf"), ocr="off")
 
 
 def test_unsupported_format(tmp_path):
@@ -1537,12 +1550,12 @@ def test_unsupported_format(tmp_path):
 
 
 def test_native_pdf_parses_faster_than_ocr(tmp_path):
-    # OCR 推理耗时很高（CPU 环境下当前禁用了 MKL-DNN，见 core/parser.py 说明），
+    # OCR 推理耗时很高（CPU 环境下当前禁用了 MKL-DNN，见 core/parser/ocr_pdf.py 说明），
     # 只截取B类样本第1页做对比，避免重复解析整份8页文档拖慢测试。
     import fitz
 
     one_page_path = tmp_path / "one_page.pdf"
-    src = fitz.open(SAMPLES_DIR / "sample_single_column.pdf")
+    src = fitz.open(_sample("sample_single_column.pdf"))
     single_page_doc = fitz.open()
     single_page_doc.insert_pdf(src, from_page=0, to_page=0)
     single_page_doc.save(one_page_path)
@@ -1550,43 +1563,131 @@ def test_native_pdf_parses_faster_than_ocr(tmp_path):
     src.close()
 
     t0 = time.perf_counter()
-    parse_document(SAMPLES_DIR / "sample.pdf")
+    parse_document(_sample("sample.pdf"))
     native_elapsed = time.perf_counter() - t0
 
     t0 = time.perf_counter()
     parse_document(one_page_path)
     ocr_elapsed = time.perf_counter() - t0
 
-    print(f"\nnative(4页)={native_elapsed:.3f}s  ocr(1页)={ocr_elapsed:.3f}s")
+    print(f"\nnative={native_elapsed:.3f}s  ocr(1页)={ocr_elapsed:.3f}s")
     assert native_elapsed < ocr_elapsed
 
 
 # ---------------------------------------------------------------------------
-# 交叉验证一：A类 vs C类（内容相同）
+# 字体把字形映射成"另一个毫不相干的汉字"时的检测与还原（core/parser/_glyph_repair.py）
+# 真实文档诊断：`2026e-works媒体服务简介` 的 ToUnicode 表把 `每`映成`嫥`、`能`映成`腉`、
+# `数字化`映成`侧㶵⻉`，人眼看PDF完全正常、只有提取文字时才错，LLM据此报出的"错别字"
+# 原文根本不存在（记录79 的15条确定性错误里约10条如此）
 # ---------------------------------------------------------------------------
 
-def test_cross_validate_native_pdf_vs_docx(native_pdf_doc, docx_doc):
-    a = _full_text(native_pdf_doc)
-    b = _full_text(docx_doc)
-    ratio = difflib.SequenceMatcher(None, a, b).ratio()
-    print(f"\n[交叉验证一] A类(sample.pdf) vs C类(sample.docx) 相似度: {ratio:.4f}")
-    assert ratio >= 0.95, f"相似度仅 {ratio:.4f}，低于95%阈值"
+def _ch(c: str, x: float, y: float) -> dict:
+    """构造一个 rawdict 风格的字符字典（只带本模块用得到的字段）。"""
+    return {"c": c, "origin": (x, y), "bbox": (x, y - 10.0, x + 10.0, y)}
 
 
-# ---------------------------------------------------------------------------
-# 交叉验证二（★核心）：双栏OCR vs 单栏OCR（内容相同）
-# ---------------------------------------------------------------------------
+def test_glyph_repair_align_only_accepts_one_to_one():
+    """对齐只认 1:1 的对应——伪造位置在文字层是一个字符，OCR那边也该是一个字符。
+    长度不等说明这一段根本没对齐上，宁可判读不出。
+    ★ 这条是防"顺手把不等长的 replace 段也映射过去"。"""
+    from core.parser._glyph_repair import align_ocr_to_text
 
-def test_cross_validate_single_vs_double_column(single_column_doc, double_column_doc):
-    a = _full_text(single_column_doc)
-    b = _full_text(double_column_doc)
-    ratio = difflib.SequenceMatcher(None, a, b).ratio()
-    print(f"\n[交叉验证二★] 单栏OCR vs 双栏OCR 相似度: {ratio:.4f}")
-    if ratio < 0.88:
-        matcher = difflib.SequenceMatcher(None, a, b)
-        diffs = [
-            f"single[{i1}:{i2}]={a[i1:i2]!r} vs double[{j1}:{j2}]={b[j1:j2]!r}"
-            for tag, i1, i2, j1, j2 in matcher.get_opcodes()
-            if tag != "equal"
-        ][:10]
-        pytest.fail(f"相似度仅 {ratio:.4f}，低于88%阈值。差异样例：\n" + "\n".join(diffs))
+    # 等长 replace：第2个字符对上
+    assert align_ocr_to_text("智腉制造", "智能制造")[1] == "能"
+    # 不等长 replace（OCR多认出一个字）：该段一个都不映射
+    mapping = align_ocr_to_text("智腉造", "智能制造")
+    assert 1 not in mapping
+
+
+def test_glyph_repair_gate_rejects_line_ocr_disagrees_elsewhere():
+    """闸门：该行非伪造位置上 OCR 与文字层对不上得多，就说明这行 OCR 本身读得不准，
+    伪造位取它不可信，整行判读不出。★ 这条是防"闸门被简化掉"。"""
+    from core.parser._glyph_repair import repair_line_chars
+
+    chars = [_ch(c, 10.0 + 12 * i, 50.0) for i, c in enumerate("智腉制造厂商")]
+    bad = {1}
+    # OCR 把其余5个字里的4个都读错了 -> 一致率 0.2，低于阈值 0.8
+    assert repair_line_chars(chars, bad, "×能××××") == {}
+    # 同一行，OCR 其余位置全对 -> 采纳
+    assert repair_line_chars(chars, bad, "智能制造厂商") == {1: "能"}
+
+
+def test_glyph_repair_ignores_control_and_private_use_chars():
+    """C0 占位码位与私有使用区字符不算"被编造出来的字"：前者由 _strip_unmapped_glyph_chars
+    整个删掉（是装饰图标），后者是承载列表项语义的项目符号。★ 防"顺手把它们也换成记号"。"""
+    from core.parser._glyph_repair import _is_out_of_scope
+
+    assert _is_out_of_scope("\x01") and _is_out_of_scope("\uf0d8")
+    assert not _is_out_of_scope("侧") and not _is_out_of_scope("A")
+
+
+def test_glyph_repair_comparable_text_skips_dropped_chars_but_keeps_indices():
+    """算一致率前要按生产口径剔掉占位码位、并做康熙部首归一化，否则 `⼚`/`⼾` 会被算成
+    "OCR与文字层不一致"、把一致率压低到闸门之下；同时下标必须映射回原字符列表。
+    ★ 这条钉的是"剔除后下标错位"这个最容易写错的地方。"""
+    from core.parser._glyph_repair import repair_line_chars
+
+    # 文字层：`⼚`是康熙部首(U+2F1A)、`\x01`是装饰图标；伪造位在下标4的`㉀`
+    chars = [_ch(c, 10.0 + 12 * i, 50.0) for i, c in enumerate("知名\x01MES⼚㉀引荐")]
+    bad = {i for i, c in enumerate(chars) if c["c"] == "㉀"}
+    assert repair_line_chars(chars, bad, "知名MES厂商引荐") == {bad.pop(): "商"}
+
+
+def test_glyph_repair_no_ocr_text_reads_as_unreadable():
+    """OCR 没返回任何文本（识别失败/整行空白）时不猜，判读不出。"""
+    from core.parser._glyph_repair import repair_line_chars
+
+    chars = [_ch(c, 10.0 + 12 * i, 50.0) for i, c in enumerate("智腉制造")]
+    assert repair_line_chars(chars, {1}, "") == {}
+
+
+def test_native_pdf_marks_unrepairable_fabricated_chars(monkeypatch):
+    """还原不了的伪造字符落成 config.NATIVE_UNREADABLE_GLYPH_MARK，交给 core/chunker/
+    整句排除；**不是直接删字符**——`智能制造`删两个字变`智制`会造出原文没有的词。"""
+    from core.parser import native_pdf
+
+    chars = [_ch(c, 10.0 + 12 * i, 50.0) for i, c in enumerate("智腉制造")]
+    span_chars = [chars]
+    fabricated = {(chars[1]["origin"][0], chars[1]["origin"][1])}
+    # allow_ocr=False：ocr='off' 的语义是这次调用不许碰OCR，字形还原也算在内
+    native_pdf._repair_fabricated_chars(None, span_chars, fabricated, None, False)
+    assert "".join(c["c"] for c in chars) == "智" + config.NATIVE_UNREADABLE_GLYPH_MARK + "制造"
+
+
+def test_native_pdf_repairs_fabricated_chars_from_ocr(monkeypatch):
+    """能读回真身就地改掉，不留记号。"""
+    from core.parser import native_pdf
+
+    chars = [_ch(c, 10.0 + 12 * i, 50.0) for i, c in enumerate("智腉制造")]
+    span_chars = [chars]
+    fabricated = {(chars[1]["origin"][0], chars[1]["origin"][1])}
+    monkeypatch.setattr(native_pdf, "ocr_line_text", lambda *a, **k: "智能制造")
+    native_pdf._repair_fabricated_chars(None, span_chars, fabricated, object(), True)
+    assert "".join(c["c"] for c in chars) == "智能制造"
+
+
+def test_glyph_repair_missing_ocr_dependency_degrades_instead_of_raising(monkeypatch):
+    """★ 防线：取OCR管线失败（没装 paddlepaddle、权重拉不下来、显存不足）必须降级成
+    "这一行读不出来"，不能把整篇解析打掉——一份普通的有文字层PDF不该因为缺OCR依赖就解析
+    不了，何况本模块有完好的降级路径（落记号→整句不送审）。"""
+    from core.parser import _glyph_repair, ocr_pdf
+
+    def _boom():
+        raise ImportError("No module named 'paddle'")
+
+    monkeypatch.setattr(ocr_pdf, "_get_ocr_pipeline", _boom)
+    page_image = types.SimpleNamespace(width=1000, height=1000, crop=lambda box: None)
+    assert _glyph_repair.ocr_line_text(page_image, (10.0, 40.0, 60.0, 50.0), 400) == ""
+
+
+def test_native_pdf_fabricated_index_spans_whole_line_not_per_span(monkeypatch):
+    """伪造位置的下标要按**整行**算：同一个词的相邻两字可能分属不同 span，
+    按 span 各算各的会让比较用文本残缺、对不上。★ 防"按span分别处理"。"""
+    from core.parser import native_pdf
+
+    left = [_ch(c, 10.0 + 12 * i, 50.0) for i, c in enumerate("智腉")]
+    right = [_ch(c, 34.0 + 12 * i, 50.0) for i, c in enumerate("制造")]
+    fabricated = {(left[1]["origin"][0], left[1]["origin"][1])}
+    monkeypatch.setattr(native_pdf, "ocr_line_text", lambda *a, **k: "智能制造")
+    native_pdf._repair_fabricated_chars(None, [left, right], fabricated, object(), True)
+    assert "".join(c["c"] for c in left + right) == "智能制造"

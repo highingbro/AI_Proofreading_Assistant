@@ -12,4 +12,3 @@ data/app.log
 .env
 data/uploads/*
 data/exports/*
-samples/*

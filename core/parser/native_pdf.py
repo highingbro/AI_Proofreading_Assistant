@@ -1,4 +1,4 @@
-"""A类：有文字层 PDF 解析（从 core/parser.py 拆分而来，逻辑未改动）。
+"""A类：有文字层 PDF 解析。
 
 用 PyMuPDF 按坐标提取文本块，手写页眉页脚剔除 + 分栏检测 + 阅读顺序还原。
 """
@@ -14,6 +14,12 @@ import config
 from core.parser._cjk_variants import normalize_cjk_variants
 from core.parser._columns import _detect_column_boundaries
 from core.parser._common import _source_location
+from core.parser._glyph_repair import (
+    _is_out_of_scope,
+    fabricated_char_origins,
+    ocr_line_text,
+    repair_line_chars,
+)
 from core.parser._glyphs import (
     _chars_text,
     _drop_tracking_spaces,
@@ -97,11 +103,50 @@ def _is_unmapped_glyph_char(ch: str) -> bool:
     return ord(ch) < 0x20 or ord(ch) == 0x7F
 
 
-def _extract_native_page_raw(page: "fitz.Page") -> tuple[list[dict], float]:
+def _repair_fabricated_chars(page, span_chars, fabricated, page_image, allow_ocr):
+    """把这一行里被编造出来的字换成读回的真身，读不出来的换成记号（就地改 `c` 字段）。
+
+    返回（可能刚渲染出来的）整页图，供同一页后续的行复用——一页往往有好几行要认，
+    每行各渲染一次会把同一页反复光栅化。
+
+    传入的是按 span 分组的字符列表，但伪造位置的下标要按**整行**算：同一个词的相邻两字
+    可能分属不同 span，按 span 各算各的会让 OCR 拿到残缺的比较文本。
+    """
+    flat = [ch for chars in span_chars for ch in chars]
+    bad_idx = {
+        i for i, ch in enumerate(flat)
+        if (round(ch["origin"][0], 2), round(ch["origin"][1], 2)) in fabricated
+        and not _is_out_of_scope(ch["c"])   # C0占位码位与PUA项目符号另有处置，不算"被编造的字"
+    }
+    if not bad_idx:
+        return page_image
+
+    repaired: dict[int, str] = {}
+    if allow_ocr:
+        if page_image is None:
+            from core.parser.ocr_pdf import _render_page_image
+
+            page_image = _render_page_image(page, config.NATIVE_GLYPH_REPAIR_DPI)
+        bbox = (
+            min(ch["bbox"][0] for ch in flat), min(ch["bbox"][1] for ch in flat),
+            max(ch["bbox"][2] for ch in flat), max(ch["bbox"][3] for ch in flat),
+        )
+        ocr_text = ocr_line_text(page_image, bbox, config.NATIVE_GLYPH_REPAIR_DPI)
+        repaired = repair_line_chars(flat, bad_idx, ocr_text)
+
+    for i in bad_idx:
+        flat[i]["c"] = repaired.get(i, config.NATIVE_UNREADABLE_GLYPH_MARK)
+    return page_image
+
+
+def _extract_native_page_raw(page: "fitz.Page", allow_ocr: bool = True) -> tuple[list[dict], float]:
     """从有文字层的PDF页面里，按PyMuPDF给出的坐标提取所有文本块的原始信息。
 
     这里只是"提取"，不做分栏、不做阅读顺序还原、不剔除页眉页脚——
     那些都是后续步骤（_strip_headers_footers / _finalize_native_page）的事。
+
+    `allow_ocr=False`（调用方传了 `ocr='off'`）时不渲染、不识别，被编造的字符一律落成
+    "读不出来"的记号——`ocr='off'` 的语义就是"这次调用不许碰OCR"，字形还原也算在内。
     """
     # 用 rawdict 而不是 dict：两者的 blocks→lines→spans 结构和字段完全一致（真实文档
     # 逐字段比对过，无差异），只是每个 span 多一个 `chars` 列表给出**单个字符**的 bbox。
@@ -109,6 +154,10 @@ def _extract_native_page_raw(page: "fitz.Page") -> tuple[list[dict], float]:
     # span 级坐标看不出这件事（见 core/parser/_glyphs.py）。
     data = page.get_text("rawdict")
     width, height = data["width"], data["height"]
+    # 整页取一次：哪些位置的字形其实没有可靠Unicode、rawdict 却给出了一个看着正常的字。
+    # 这是页级信息（要拿 texttrace 与 rawdict 按坐标对照），不能放进下面的逐行循环重复取。
+    fabricated = fabricated_char_origins(page) if config.NATIVE_GLYPH_REPAIR else set()
+    page_image = None  # 真有伪造字符要还原时才渲染，且整页只渲染一次（见 _repair_fabricated_chars）
     out: list[dict] = []
     for b in data["blocks"]:
         if b.get("type") != 0:
@@ -128,6 +177,11 @@ def _extract_native_page_raw(page: "fitz.Page") -> tuple[list[dict], float]:
             # _glyphs.py::restore_unmapped_glyph_spaces），剩下的才是真装饰图标、照删。
             # 顺序不能倒：删完就看不出它两侧是不是拉丁字母了。
             span_chars = [list(s["chars"]) for s in line["spans"]]
+            # 被编造出来的字：能读回真身就地改掉，读不出来的落成记号交给 core/chunker/
+            # 整句排除送审。放在这里（拼接与各种空格判定之前），让后面每一步看到的都是最终
+            # 字符——还原出的是汉字、记号也不是拉丁字母或空格，都不影响下面两步的判定。
+            if fabricated:
+                page_image = _repair_fabricated_chars(page, span_chars, fabricated, page_image, allow_ocr)
             restore_unmapped_glyph_spaces(span_chars)
             chars = []
             for sc in span_chars:
