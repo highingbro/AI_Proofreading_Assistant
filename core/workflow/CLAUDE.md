@@ -27,4 +27,4 @@
 
 批注（比如"已核实，确实需要修改"这类编辑判断依据）在采纳、拒绝、待处理任何状态下都可能想写，不该绑定在"拒绝"这一个动作上——`status.py::set_issue_note(issue_id, note, db_path=None)` 与 `set_issue_status` 各自只管自己那一列，互不影响。对应 `issues` 表列名是 `note`（`db/database.py::init_db()` 里的 `_migrate_reject_reason_to_note()` 负责把历史库的旧列名 `reject_reason` 原地迁移过来，幂等，重复调用不会报错）。
 
-回归测试：`tests/test_project_skeleton.py::test_init_db_migrates_legacy_reject_reason_column_to_note`（构造带旧列名的库验证迁移+幂等）；`tests/test_app_standard_flow.py::test_set_issue_note_independent_of_status`（拒绝后写批注不影响status，status变化不清空批注）、`test_app_note_input_saves_independent_of_status`（AppTest驱动真实的 `on_change` 回调路径）。`app.py` 里对应的UI改动（批注输入框位置/独立于拒绝按钮）见 `app.py` 模块docstring。
+回归测试：`tests/test_project_skeleton.py::test_init_db_migrates_legacy_reject_reason_column_to_note`（构造带旧列名的库验证迁移+幂等）；`tests/test_app_standard_flow.py::test_set_issue_note_independent_of_status`（拒绝后写批注不影响status，status变化不清空批注）、`test_app_note_input_saves_independent_of_status`（AppTest驱动真实的 `on_change` 回调路径）。对应的UI（批注输入框位置/独立于拒绝按钮）在 `ui/cards.py`，见 `ui/CLAUDE.md`。

@@ -1,4 +1,4 @@
-"""C类：Word 文档解析（从 core/parser.py 拆分而来，逻辑未改动）。"""
+"""C类：Word 文档解析。"""
 
 from __future__ import annotations
 

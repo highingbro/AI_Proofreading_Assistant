@@ -59,14 +59,12 @@ streamlit run app.py
 
 ## 数据存放位置
 
-数据全部在本地，不上传任何服务器（除了送给 LLM 校对的正文片段）。
 
 - `data/app.db`：所有任务、校对记录、问题明细、反馈学习数据
 - `data/uploads/`：上传文件的临时落盘目录，仅供解析读取用，会自动清理旧文件
 - `data/exports/`：导出的 Excel 文件
 - `data/app.log`：运行日志
 
-以上都在 `.gitignore` 里，不会被提交。
 
 ## 运行测试
 
@@ -76,5 +74,20 @@ pytest tests/test_classifier.py  # 跑指定模块的测试
 pytest -m integration            # 手动跑耗真实API额度的集成冒烟测试
 ```
 
+### 测试样例文档
 
-`test_parser.py`/`test_chunker.py` 里依赖这些样例的用例在 clone 后会失败，其余测试不受影响。
+绝大多数用例用构造数据，不碰外部文件；7 条端到端用例要读 `samples/` 下的文档。
+**四份内容可以毫不相干**，只要各自的形态对得上：
+
+| 文件名 | 要求 |
+|---|---|
+| `sample.pdf` | 任意**有文字层**的**单栏** PDF（Word/WPS 导出即可，不是扫描件） |
+| `sample.docx` | 任意 Word 文档，正文非空 |
+| `sample_single_column.pdf` | **无文字层的扫描件**（纯图片，如纸质件扫描/拍照转 PDF）、**单栏**、≥1 页 |
+| `sample_double_column.pdf` | **无文字层的扫描件**、**双栏**、≥1 页，且单个版面区域文字量不超过 4500 字 |
+
+判定标准就是解析器自己的判定：一页可提取字符数低于 `config.TEXT_LAYER_MIN_CHARS`(20)
+的走 B 类 OCR。跑那几条 B 类用例要真实 OCR 推理，纯 CPU 下较慢（8 页样本约 1 分钟）。
+
+`samples/` 不进版本库（放的是真实文档）。缺文件时相关用例自动跳过，`pytest` 末尾会显示
+skipped 数，其余测试不受影响。

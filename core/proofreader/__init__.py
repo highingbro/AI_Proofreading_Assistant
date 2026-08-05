@@ -1,6 +1,6 @@
 """校对提示词组装与单块/全文档校对。
 
-把 core/chunker.py 产出的 Chunk 送入 LLM 校对，解析/校验/容错 LLM 的 JSON
+把 core/chunker/ 产出的 Chunk 送入 LLM 校对，解析/校验/容错 LLM 的 JSON
 输出，并把每条问题回填定位到原始 block_index/page_location。本模块只输出
 LLM自报的结构化判断（category/confidence 未经强制归层校验），core/classifier/
 负责按规则做归层强制校验。

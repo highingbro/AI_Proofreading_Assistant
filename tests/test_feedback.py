@@ -160,7 +160,7 @@ def test_record_rejection_from_live_flow_issue_with_reason(db_path):
 
 
 def test_record_rejection_from_history_page_issue_without_reason(db_path):
-    """历史记录页复用的issue对象（_row_to_issue_view包装）没有reason属性，
+    """历史记录页复用的issue对象（cards.row_to_issue_view 包装）没有reason属性，
     应退化为空字符串，不报错，suggestion/original_text/issue_type仍完整记录。"""
     issue = types.SimpleNamespace(
         issue_type="错别字与拼写",

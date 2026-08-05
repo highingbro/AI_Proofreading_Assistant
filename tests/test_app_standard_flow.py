@@ -1,6 +1,6 @@
 """阶段6验收测试：Streamlit 对话界面（标准校对流）。
 
-core/workflow.py 的编排/落库逻辑用 mock + 临时数据库精确断言，全部不联网不耗
+core/workflow/ 的编排/落库逻辑用 mock + 临时数据库精确断言，全部不联网不耗
 API额度。app.py 的 UI 交互用 streamlit.testing.v1.AppTest 做冒烟，同样打桩掉
 core.workflow 里耗额度的入口，不触发真实LLM调用。
 """
@@ -98,7 +98,7 @@ def _classified_result_all_layers() -> ClassifiedResult:
 
 
 # ---------------------------------------------------------------------------
-# core/workflow.py 单元测试
+# core/workflow/ 单元测试
 # ---------------------------------------------------------------------------
 
 def test_run_standard_proofread_calls_pipeline_in_order():

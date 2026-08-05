@@ -1,7 +1,7 @@
 """阶段7验收测试：对话式追问处理（core/followup.py）。
 
 core/followup.py 用 mock 掉 chat_completion 做精确断言，全部不联网不耗API额度。
-core/workflow.py 新增的 context_snippet 计算用真实构造的小型 ParsedDocument 验证。
+core/workflow/ 新增的 context_snippet 计算用真实构造的小型 ParsedDocument 验证。
 app.py 的追问UI用 streamlit.testing.v1.AppTest 做冒烟，同样打桩掉耗额度的入口。
 """
 
@@ -157,7 +157,7 @@ def test_get_followup_history_nonexistent_issue_raises(db_path):
 
 
 # ---------------------------------------------------------------------------
-# core/workflow.py：context_snippet 计算
+# core/workflow/：context_snippet 计算
 # ---------------------------------------------------------------------------
 
 def _classified_issue(**overrides) -> ClassifiedIssue:

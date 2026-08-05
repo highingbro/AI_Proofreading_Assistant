@@ -209,10 +209,11 @@ def _render_issue_card(issue, issue_id, record_id):
 
 
 def render_issue_cards(items, record_id, n_cols: int = 2) -> None:
-    """两条一行的网格布局渲染问题卡列表，压缩列表纵向长度（原先一条卡打满整行，问题
-    一多列表就很长）。items 是 (issue, issue_id) 二元组列表；和任务选择页任务卡的两列
-    网格是同一个模式（见 ui/CLAUDE.md）。试过三列，但单卡变窄后原文/建议更容易换行，
-    同一行内卡片高度参差不齐反而更明显，改回两列。
+    """两条一行的网格布局渲染问题卡列表：一条卡打满整行的话，问题一多列表纵向就很长。
+
+    items 是 (issue, issue_id) 二元组列表；和任务选择页任务卡的两列网格是同一个模式
+    （见 ui/CLAUDE.md）。**列数不要加到三**：单卡变窄后原文/建议更容易换行，同一行内
+    卡片高度参差不齐反而更明显。
     """
     for i in range(0, len(items), n_cols):
         cols = st.columns(n_cols)

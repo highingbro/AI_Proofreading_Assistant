@@ -1,4 +1,4 @@
-"""阶段5调试辅助脚本：预览 core/classifier.py 的归层结果。
+"""调试辅助脚本：预览 core/classifier/ 的归层结果。
 
 两种用法：
     python tools/preview_classify.py <file_path> [--max-chunks N]

@@ -1,11 +1,10 @@
-"""B类：无文字层扫描 PDF 解析（从 core/parser.py 拆分而来，逻辑未改动）。
+"""B类：无文字层扫描 PDF 解析。
 
 PaddleOCR 文本检测识别 + 独立版面检测 + XY-Cut阅读顺序还原，含跨页拼接检测。
 
-说明：最初方案是直接调用 PPStructureV3 一体化管线，但在纯 CPU 环境
-（paddlepaddle 3.3.1 CPU 版）下该管线的并行调度会段错误崩溃（exit code 139）。
-逐一排查确认：独立的 LayoutDetection（版面检测）与 PaddleOCR（文本检测+识别）
-两个模型单独调用都完全正常。因此改为自行组合这两个模型：
+**不用 PPStructureV3 一体化管线**：纯 CPU 环境（paddlepaddle 3.3.1 CPU 版）下它的
+并行调度会段错误崩溃（exit code 139），而独立的 LayoutDetection（版面检测）与
+PaddleOCR（文本检测+识别）单独调用都正常，所以自行组合这两个模型：
   1. LayoutDetection 得到区域框+标签（沿用与 PPStructureV3 相同的版面模型/标签体系）
   2. PaddleOCR 得到文字行框+文本+置信度
   3. 把文字行按中心点归属到对应版面区域，拼成整块文本、平均置信度
@@ -84,11 +83,10 @@ def _get_layout_pipeline():
 def _get_ocr_pipeline():
     """惰性加载文本检测+识别模型。
 
-    可选支持 config.PADDLEOCR_DET_MODEL/PADDLEOCR_REC_MODEL 覆盖默认识别模型
-    （曾尝试用上一代最大档 PP-OCRv5_server 替换库默认的 PP-OCRv6_medium，
-    动机是缓解低画质截图的字符误识别，见 core/parser/CLAUDE.md）。
-    **真实A/B测试结论：两常量目前都保持 None（沿用库默认），因为 v5_server
-    在真实文档同页对比中没有更准，个别字段反而更差，没有证据支持切换。**
+    可选支持 config.PADDLEOCR_DET_MODEL/PADDLEOCR_REC_MODEL 覆盖默认识别模型。
+    **两个常量都保持 None（沿用库默认）**：换上一代最大档 PP-OCRv5_server 在真实
+    文档同页 A/B 里没有更准、个别字段反而更差，没有证据支持切换，见
+    core/parser/CLAUDE.md。机制留着供将来用更大样本重新评估。
     """
     global _OCR_PIPELINE
     if _OCR_PIPELINE is None:
@@ -236,11 +234,9 @@ def _run_structure(img: Image.Image) -> tuple[list[dict], float | None, str | No
             doc_page = text
         if block_type is None or not text:
             continue  # block_type为None表示这个标签本该丢弃（如图片区）；或者区域内没识别出任何文字，也丢弃
-        # table类区域不做结构识别重建（曾用TableRecognitionPipelineV2重建行列结构，
-        # 真实验证命中率接近零，见core/parser/CLAUDE.md）——这类区域绝大多数是说明性
-        # UI截图/菜单结构图，不是待校对正文，core/chunker.py 会在分块阶段整体跳过
-        # block_type=="table" 的block，不送去LLM校对，此处保留按坐标拉平的文本即可
-        # （仅供未来展示/导出等场景使用，不再需要为校对准确性投入结构重建）。
+        # table类区域不做结构识别重建（理由见 core/parser/CLAUDE.md）——这类区域绝大多数
+        # 是说明性UI截图/菜单结构图，不是待校对正文，core/chunker/ 会在分块阶段整体跳过
+        # block_type=="table" 的block，此处保留按坐标拉平的文本供展示/导出使用即可。
         conf = sum(l["score"] for l in lines) / len(lines) if lines else None  # 该区域内所有行置信度的平均值
         if conf is not None:
             scores.append(conf)

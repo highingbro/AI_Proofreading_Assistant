@@ -1,6 +1,6 @@
-"""阶段10验收测试：历史记录页（app.py，复用 core/workflow.py 既有渲染逻辑）。
+"""历史记录页（`ui/page_history.py`）。
 
-历史记录页不打桩数据库读写（`_render_history_detail`/`_row_to_issue_view` 本身就是
+历史记录页不打桩数据库读写（`_render_history_detail`/`cards.row_to_issue_view` 本身就是
 直接读库的薄封装，没有独立业务逻辑可脱离Streamlit单测），用 monkeypatch
 config.DB_PATH 指向临时库隔离测试，通过 streamlit.testing.v1.AppTest 驱动真实页面。
 """
@@ -184,6 +184,6 @@ def test_history_page_export_button_calls_exporter(db_path, monkeypatch, tmp_pat
         assert not at.exception
         mock_export.assert_called_once_with(record_id)
         assert len(at.success) >= 1
-        # 历史记录页的导出不触发规则重算（那不是刚审完一批新反馈的场景，见 app.py
-        # _regenerate_rules_after_export 只挂在标准校对/原稿比对页的导出后）
+        # 历史记录页的导出不触发规则重算（那不是刚审完一批新反馈的场景，
+        # actions.regenerate_rules_after_export 只挂在标准校对/原稿比对页的导出后）
         mock_regenerate.assert_not_called()

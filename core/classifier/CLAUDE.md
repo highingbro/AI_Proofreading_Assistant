@@ -33,9 +33,9 @@
 
 **②按"码位区间"判定，不维护"变体字→汉字"映射表**。Unicode的"Kangxi Radicals"区块（`U+2F00~2FDF`）大多有NFKC兼容分解，但"CJK Radicals Supplement"区块（`U+2E80~2EF3`）**整块都没有**，`unicodedata.normalize("NFKC", "⻔")` 原样返回"⻔"，NFKC对它完全无效。
 
-早期做法是为后者维护一张人工核实过的映射表（13个字符）。**这条路被真实数据证伪：表永远追不上下一份文档**——同一份刊物换一次校对，LLM报到了表外的`⻣`(骨)、`⻰`(龙)，一次放出38条假错别字，一轮71条问题里50条源于此，且这类字符散布在整句里、LLM会引用整段来报，原文长度和噪声量成倍上升。
+**人工核实过的映射表这条路被真实数据证伪：表永远追不上下一份文档**——一张13个字符的表，同一份刊物换一次校对，LLM就报到了表外的`⻣`(骨)、`⻰`(龙)，一次放出38条假错别字，一轮71条问题里50条源于此，且这类字符散布在整句里、LLM会引用整段来报，原文长度和噪声量成倍上升。
 
-现在改为 `_diff_is_only_cjk_variants`：用 `difflib` 对齐"旧→新"，**只要求差异位置上旧侧字符的码位落在 `_CJK_VARIANT_RANGES` 内**，不关心它具体对应哪个汉字。不依赖表，所以任意新文档、任意没见过的变体字符都拦得住。三个配套约束缺一不可：
+判据因此是 `_diff_is_only_cjk_variants`：用 `difflib` 对齐"旧→新"，**只要求差异位置上旧侧字符的码位落在 `_CJK_VARIANT_RANGES` 内**，不关心它具体对应哪个汉字。不依赖表，所以任意新文档、任意没见过的变体字符都拦得住。三个配套约束缺一不可：
 
 - **必须校验"变体字符的规范形式确实等于建议里的字"**（`_variant_char_matches`），不能只看它落在变体区就放行。真实反例：`数⼦化`→`数字化` 里 `⼦`(康熙部首"子")被误用成了`字`，这是**真错别字**，不校验就会被当字形变体丢掉。
 - **CJK部首补充区无从校验，按"该区字符本就是某汉字的部首形式"放行**——这是不维护映射表付出的代价。
@@ -45,7 +45,7 @@
 
 **suggestion的措辞方式还会影响能不能抽出"新旧文本对"来比较**：常见的是"应改为『整段新文本』"（`_REPLACEMENT_SUGGESTION_RE`，和 `original_text` 整体比较），但真实数据里还出现了"『旧片段』应改为『新片段』"这种只描述 `original_text` 里某一个字/词该换的措辞（如 `original_text="归⺟扣⾮净利润"`，`suggestion='"⺟"应改为"母"。'`）——如果只有整段比较逻辑，会因为『⺟』（1字）和 `original_text`（7字）长度不一致误判成"不是零改动"而漏判。`postprocess.py::_extract_replacement_pair` 因此优先尝试 `_FRAGMENT_REPLACEMENT_RE`（片段式，抽出的『旧』还要求确实在 `original_text` 里出现过，避免措辞不规范时抽到不相关文本），抽不到才退回整段式，两种都抽不到才判定"这条issue无法判定新旧对比，不参与零改动判定"。`_is_visually_no_op_suggestion` 与 `_is_layout_or_space_artifact`（见下方"版式错乱措辞 / 建议与原文只差空格"一节）共用这同一个抽取函数。
 
-**三种措辞模式都抽不到时，最后兜底把 `suggestion` 整体当候选新文本，不再返回None**：真实案例——`suggestion` 有时不套"应改为『X』"这层话术，字段内容就是修正后的文本本身（`original_text="AI 助力PMC实战进阶"`、`suggestion="AI助力PMC实战进阶"`，没有任何引号/动词包裹）。这种"裸"措辞是LLM输出格式的又一种变体，每冒出一种新变体就要为它专门加一条正则去识别，是在追着LLM的措辞打地鼠——`_extract_replacement_pair` 因此改为"三种已知模式都抽不到就直接拿 `suggestion.strip()` 本身当候选"，把"这算不算零改动/纯空格差异"完全交给后续判据（NFKC归一化相同、CJK变体diff、去空格比较）决定，不再额外识别"这段文本是不是裸替换文本"。这个兜底之所以安全，是因为真正的描述性建议（如"建议删除多余的'的'字"）内容和 `original_text` 本来就相差悬殊，天然通不过这几条判据，不会被误判成零改动或纯空格差异。
+**三种措辞模式都抽不到时，兜底把 `suggestion.strip()` 整体当候选新文本，不返回None**：真实案例——`suggestion` 有时不套"应改为『X』"这层话术，字段内容就是修正后的文本本身（`original_text="AI 助力PMC实战进阶"`、`suggestion="AI助力PMC实战进阶"`，没有任何引号/动词包裹）。这种"裸"措辞是LLM输出格式的又一种变体，每冒出一种新变体就为它加一条正则是在追着LLM的措辞打地鼠，所以"这算不算零改动/纯空格差异"完全交给后续判据（NFKC归一化相同、CJK变体diff、去空格比较）决定，`_extract_replacement_pair` 不去识别"这段文本是不是裸替换文本"。兜底之所以安全，是因为真正的描述性建议（如"建议删除多余的'的'字"）内容和 `original_text` 本来就相差悬殊，天然通不过这几条判据。
 
 判定（`postprocess.py::_is_visually_no_op_suggestion`，在 `classify_issues` 里于 `classify_issue` **之前**对 `RawIssue` 列表整体过滤，不是叠加在某条已归层结果上的修饰规则）：`_extract_replacement_pair` 抽出"旧→新"文本对后，三条判据取或——① 都过 `_normalize_lookalike`（纯NFKC）后相同；② `_diff_is_only_cjk_variants` 判定差异全在字形变体上；③ `_fragment_is_only_cjk_variants` 在原文里找到与建议等长、只差字形变体的窗口。`_has_stray_control_chars` 独立检查 `original_text` 是否含 `\t\n\r` 之外的Unicode `Cc`类控制字符，命中即无条件丢弃（不依赖suggestion内容——控制字符本身就证明这段"原文"是解析垃圾）。
 
@@ -53,11 +53,11 @@
 
 **`_REPLACEMENT_TO_END_RE` 为什么要贪婪匹配到建议末尾**：LLM转述整段原文时会把原文自带的引号一起带上（`应改为"走进…深入"全员自主改善"的现场…"`），非贪婪规则在第一个内嵌引号处就截断，抽出残缺的新文本，长度对不上原文，零改动判定随即失效。贪婪版要求引号收在建议末尾（允许尾随句号），避免在"改为『X』，因为『Y』"这类后面还有引用的措辞里抽过头。**"应为"这个措辞只加进片段式正则、不加进整段式**：真实数据里"应为"后面常跟引号外的补充说明（`应为'进行智能制造整体规划以及推进落地'，'何'字多余`——真正的意图是删"何"字），整段式套用会把删字建议误判成零改动丢掉。
 
-**处理方式是直接丢弃，不是降级**：与规则C/D"降级为存疑待核实、保留可审计性"的一般惯例不同，这是用户明确要求的特例——这类issue已经确认是零改动的假问题/解析垃圾，不存在"人工核实"的价值。`classify_issues` 返回的 `warnings` 里会分别记"丢弃N条视觉无实质改动的建议"/"丢弃N条解析产生乱码字符的问题"，与"跨块去重丢弃N条重复问题"是同一模式，供 `_render_stats` 的"提示信息"面板展示，不是悄无声息地消失。
+**处理方式是直接丢弃，不是降级**：与规则C/D"降级为存疑待核实、保留可审计性"的一般惯例不同，这是用户明确要求的特例——这类issue已经确认是零改动的假问题/解析垃圾，不存在"人工核实"的价值。`classify_issues` 返回的 `warnings` 里会分别记"丢弃N条视觉无实质改动的建议"/"丢弃N条解析产生乱码字符的问题"，与"跨块去重丢弃N条重复问题"是同一模式，供 `ui/cards.py::render_stats` 的"提示信息"面板展示，不是悄无声息地消失。
 
 测试见 `tests/test_classifier.py` "视觉无实质改动的建议过滤" 一节：字面完全相同丢弃、Kangxi Radicals区块Unicode兼容变体（真实用 `unicodedata.normalize` 验证过康熙部首"⽉"确实归一化等于"月"）丢弃、CJK Radicals Supplement区块无NFKC分解的部首替代字（"⻔"→"门"）丢弃、片段式措辞在更长original_text里的零改动丢弃、控制字符乱码丢弃、真实改写不误伤、"存疑"类引用原文不误伤、裸措辞（无"应改为"包裹）零改动丢弃、裸措辞不误伤描述性建议九条用例。
 
-**改动验证方式（真实数据回放）**：把 `data/app.db` 里同一份刊物三次校对记录（record 45/46/47）的全部 issue 重新过一遍过滤器——record 47（改动前漏出的那次）71条丢21条，而**record 45/46 丢弃数为0**，证明新判据只拦到了原先漏网的字形变体假错误，没有误伤历史上已经正常保留的结果。调规则时建议照此回放，比只看单元测试更能暴露误伤。
+**改规则时用真实数据回放验证，比只看单元测试更能暴露误伤**：把 `data/app.db` 里同一份刊物三次校对记录（record 45/46/47）的全部 issue 重新过一遍过滤器。当前判据下 record 47（字形变体假错误集中的那次）71条丢21条，record 45/46 丢弃数为0——后者是误伤的标尺，它一旦不为0就说明判据放宽过头了。
 
 **这套过滤只检查 `raw.suggestion`，覆盖不到规则A(`_rule_quotation`)展示给用户的 `raw.reason`**——真实案例：命中引文保护、"原文照录不建议改动"，但LLM把两个疑点写进同一句reason里，"编号与标题之间的标点格式不统一，应为'4.'"是真疑点，"'⼊表'应为'入表'"纯粹是部首编码伪影（⼊是"入"的康熙部首变体），`_filter_visually_no_op` 只看 `raw.suggestion` 整条是否零改动，从未检查过 `raw.reason`，这类噪声就原样展示成"疑点供参考"，误导核实方向。`_rule_quotation` 因此单独调用 `_strip_visually_no_op_fragments`（`postprocess.py`）对 `raw.reason` 做片段级剔除，不是整条丢弃——两个疑点混在同一句话里，整条丢会连真疑点一起丢，只能挑出零改动的那一段删掉（连同前面的"，且"/"、且"连接词一起删，避免留下悬空残句）；reason整句都是零改动时会退化成空字符串，此时 fallback 成不带冒号的"原文照录，不建议改动。"，不留"疑点供参考："空尾巴。判据复用 `_normalize_lookalike`/`_diff_is_only_cjk_variants`，与上面的整条丢弃逻辑标准一致。测试见 `tests/test_classifier.py::test_rule_a_strips_cjk_variant_fragment_from_reason_but_keeps_real_doubt`/`test_rule_a_reason_entirely_cjk_variant_falls_back_to_bare_suggestion`。
 
@@ -184,7 +184,7 @@
 
 判定条件（`base_rules.py::_rule_simplified_grammar_as_style`，插在基础规则 A/B 之后、E 之前）：`mode == config.PROOFREAD_MODE_SIMPLIFIED` **且** `raw.issue_type == "语法结构问题"`，命中即直接归为"风格可选"+最低优先级，不再看 `confidence`。放在 A/B 之后是为了保证**引文保护、事实置信度降级这两条设计铁律不因精简模式被弱化**——即使在精简模式下，同一条issue如果先命中了quotation/factual的文本特征，仍会被规则A/B拦下，不会流到这条规则。深度模式（`mode` 不传或为 `PROOFREAD_MODE_DEEP`）完全不受影响，规则2依旧走原有的confidence判定路径。
 
-`mode` 参数是这条规则新增才从 `classify_issues()`/`classify_issue()` 打通到 `_BASE_RULES` 里的（其余四条基础规则原先只依赖 `raw` 一个参数，签名统一加宽为 `(raw, mode)` 后三条不使用该参数，纯粹是为了让 `_BASE_RULES` 元组里所有规则保持统一签名，方便 for 循环调用，和 `modifier_rules.py` 的既有约定一致）。测试见 `tests/test_classifier.py` "精简模式语法结构降级" 一节（深度模式不受影响的回归用例、精简模式下不分confidence都归风格可选、精简模式下quotation/factual仍优先于此规则生效）。
+`_BASE_RULES` 里所有规则统一签名 `(raw, mode)`，其中三条并不使用 `mode`——统一签名纯粹是为了 for 循环能一视同仁地调用，和 `modifier_rules.py` 的约定一致。测试见 `tests/test_classifier.py` "精简模式语法结构降级" 一节（深度模式不受影响的回归用例、精简模式下不分confidence都归风格可选、精简模式下quotation/factual仍优先于此规则生效）。
 
 ## 精简模式下规则1里"汉字冒充标点符号"这类零歧义问题按风格可选处理
 

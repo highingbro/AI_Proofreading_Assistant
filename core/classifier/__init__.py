@@ -95,9 +95,8 @@ def classify_issues(
 
     紧接着 is_artifact_misjudgment 再丢一轮"我们自己造成的误判"——PDF换行符被转写成
     空格、LLM知识时效性、分块边界截断。这一轮要用 block/tail_blocks 判定，所以单独
-    走一遍而不是并进上面那个过滤器。这几类原先都是降级为存疑待核实并在建议前贴一句
-    "疑似……建议核实后再处理"，用户明确要求改成整条丢弃：问题不在文档里，在我们这条
-    流水线上，留着那句话本身就是噪声。
+    走一遍而不是并进上面那个过滤器。这几类是整条丢弃而不是降级（用户明确要求）：问题
+    不在文档里，在我们这条流水线上，贴一句"疑似……建议核实后再处理"留着本身就是噪声。
     """
     block_by_index = {b.block_index: b for b in parsed.blocks}
     tail_blocks = _compute_chunk_tail_blocks(chunked)

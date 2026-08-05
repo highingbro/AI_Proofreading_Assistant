@@ -17,7 +17,7 @@ __all__ = ["record_rejection", "forget_feedback"]
 def record_rejection(issue, issue_id: int, record_id: int, db_path=None) -> None:
     """issue被人工拒绝时调用，记录一条反馈快照。
 
-    suggestion 在实时校对流程（ClassifiedIssue）和历史记录页（_row_to_issue_view 包装的
+    suggestion 在实时校对流程（ClassifiedIssue）和历史记录页（cards.row_to_issue_view 包装的
     SimpleNamespace）两种 issue 对象上都存在，不需要兜底；reason 只在实时流程的
     ClassifiedIssue 上存在，用 getattr 兜底成空字符串——这里只影响管理页的展示信息。
     """

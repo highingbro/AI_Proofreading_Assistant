@@ -683,9 +683,8 @@ def test_no_op_filter_drops_radical_lookalike_without_nfkc_decomposition():
 
 
 def test_no_op_filter_drops_variant_char_outside_any_lookup_table():
-    """曾经靠人工映射表识别这类字符，表只有13个字，换一份文档就被表外的"⻣"(骨)、
-    "⻰"(龙)破防、一次放出38条假错别字。现在按码位区间判定，不依赖表——这两个字
-    当年都不在表里，必须同样被丢弃，否则等于退回老方案。"""
+    """★ 防线：判定必须按码位区间、不依赖任何人工映射表。"⻣"(骨)、"⻰"(龙) 是当初
+    13字映射表外、一次放出38条假错别字的那两个字，它们必须同样被丢弃。"""
     parsed = _parsed([_block(block_index=0)])
     for original, suggestion in (("⻣干", '应改为"骨干"'), ("江苏⻰城", '应改为"江苏龙城"')):
         raw = _raw_issue(block_index=0, original_text=original, suggestion=suggestion)
@@ -760,8 +759,8 @@ def test_no_op_filter_does_not_drop_deletion_suggestion_worded_as_ying_wei():
 
 def test_no_op_filter_drops_fragment_style_suggestion_within_longer_original_text():
     """真实案例："「⺟」应改为「母」"这种只描述original_text里一个字该换的措辞，
-    original_text本身是"归⺟扣⾮净利润"整个词组——整段比较（旧逻辑）会因为长度不
-    一致判定"不是零改动"而漏判，必须单独识别"旧片段→新片段"这一对再比较。"""
+    original_text本身是"归⺟扣⾮净利润"整个词组——只做整段比较会因为长度不一致
+    判定"不是零改动"而漏判，必须单独识别"旧片段→新片段"这一对再比较。"""
     parsed = _parsed([_block(block_index=0)])
     raw = _raw_issue(block_index=0, original_text="归⺟扣⾮净利润", suggestion='"⺟"应改为"母"。')
     result = classify_issues(ProofreadResult(issues=[raw], chunk_warnings=[]), parsed)

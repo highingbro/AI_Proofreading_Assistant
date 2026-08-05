@@ -1,4 +1,4 @@
-"""解析模块的公共数据结构与异常（从 core/parser.py 拆分而来，逻辑未改动）。
+"""解析模块的公共数据结构与异常。
 
 独立成文件是为了让 native_pdf.py/ocr_pdf.py/docx_parser.py 都能导入
 ParsedBlock/ParsedDocument 而不必反向依赖 __init__.py，避免循环导入。
