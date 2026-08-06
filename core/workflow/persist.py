@@ -30,7 +30,7 @@ def persist_result(
     task_id: int,
     doc_name: str,
     doc_version: str = "",
-    task_type: str = "标准校对",
+    task_type: str = config.RECORD_TYPE_STANDARD,
     parsed: ParsedDocument | None = None,
     mode: str = config.PROOFREAD_MODE_DEEP,
     author: str | None = None,
@@ -78,7 +78,6 @@ def persist_result(
             layer=issue.layer,
             suggestion=issue.suggestion,
             context_snippet=context_snippet,
-            doc_page=issue.doc_page,
             db_path=db_path,
         )
         issue_ids.append(issue_id)
@@ -97,11 +96,11 @@ def persist_comparison_result(
 ) -> tuple[int, list[int]]:
     """把原稿比对（core.comparer.compare_documents）产出的差异条目落库。
 
-    复用 records/issues 两张通用表，不新建表结构——task_type 固定为"原稿比对"，
-    issue_type/layer 填差异特有的值（"新增内容"/"删除内容"/"文字替换"，层级恒为
-    config.DIFF_LAYER_SUBSTANTIVE，因为 compare_documents 已经把归一化后相同的纯
-    排版差异过滤掉了）。priority 固定为 config.PRIORITY_MEDIUM，比对场景不像标准
-    校对那样需要区分优先级。
+    复用 records/issues 两张通用表，不新建表结构——task_type 固定为 RECORD_TYPE_COMPARE，
+    issue_type 填差异特有的值（"新增内容"/"删除内容"/"文字替换"），layer 沿用
+    compare_documents 给的 config.LAYER_CONFIRMED（理由见该函数docstring），
+    records.count_confirmed 跟着一起填，否则历史记录列表和指标区那几个分层数字全是0。
+    priority 固定为 config.PRIORITY_MEDIUM，比对场景不像标准校对那样需要区分优先级。
 
     formatted 非空时用 build_context_snippet 计算每条已定位差异（diff['block_index']
     非None）的上下文——与 persist_result 是同一份逻辑，diff['block_index'] 取自差异
@@ -115,8 +114,9 @@ def persist_comparison_result(
         author=author,
         doc_name=doc_name,
         doc_version=doc_version,
-        task_type="原稿比对",
+        task_type=config.RECORD_TYPE_COMPARE,
         total_issues=len(diffs),
+        count_confirmed=len(diffs),
         db_path=db_path,
     )
 
@@ -134,7 +134,6 @@ def persist_comparison_result(
             layer=diff["layer"],
             suggestion=diff["suggestion"],
             context_snippet=context_snippet,
-            doc_page=diff.get("doc_page"),
             db_path=db_path,
         )
         issue_ids.append(issue_id)

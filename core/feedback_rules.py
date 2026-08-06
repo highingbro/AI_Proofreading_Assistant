@@ -17,9 +17,16 @@ _is_self_declared_non_issue` 在归层前把这类自陈条目整条丢弃，详
 
 `regenerate_rejection_rules()`——重新生成规则表，在 `app.py` 每次记录一条拒绝之后调用
 （也可在管理页手动触发）：
-1. 读取全部历史反馈，**过滤掉 `config.FEEDBACK_EXEMPT_ISSUE_TYPES`（事实类）**——这是
-   项目设计铁律"涉及人名/职务/历史事实的修改建议禁止确定性结论，必须保留人工复核机会"
-   的延伸，在喂给LLM之前就从源头排除，不依赖总结LLM自己判断"这条该不该排除"。
+1. 读取全部历史反馈，在喂给LLM之前先从源头排除两类（都不依赖总结LLM自己判断
+   "这条该不该排除"）：
+   - **`config.FEEDBACK_EXEMPT_ISSUE_TYPES`（事实类）**——项目设计铁律"涉及人名/职务/
+     历史事实的修改建议禁止确定性结论，必须保留人工复核机会"的延伸。
+   - **来自原稿比对记录的拒绝**（`source_task_type == config.RECORD_TYPE_COMPARE`）——
+     规则是注入校对提示词、让LLM少报某类问题用的，只有LLM自己报出来的东西被拒绝才
+     构成"这类判断不对"的信号。比对结果是逐字diff出来的客观差异，跟LLM怎么判断无关，
+     拒绝一条只说明这处改动可以接受，总结不出任何该让LLM规避的东西。按来源记录的
+     task_type 排除、而不是按 issue_type 认"新增内容/删除内容/文字替换"那几个名字：
+     前者是这条反馈从哪来的事实，后者只是恰好长那样的字符串。
 2. 剩余行数不足 `config.FEEDBACK_REJECTION_THRESHOLD` 直接返回，不发起LLM调用。
 3. 调用LLM做语义总结（`prompt/feedback_rules_system.md`），要求只归并**语义上真正同类**
    （不是句式相似）且达到阈值次数的模式，输出规则文本+佐证的 `feedback_id` 列表。
@@ -64,6 +71,7 @@ def regenerate_rejection_rules(db_path=None) -> None:
     """重新生成 feedback_rules 表，详见模块docstring"regenerate_rejection_rules"一节。"""
     rows = get_feedback(db_path=db_path)
     rows = [r for r in rows if r["issue_type"] not in config.FEEDBACK_EXEMPT_ISSUE_TYPES]
+    rows = [r for r in rows if r["source_task_type"] != config.RECORD_TYPE_COMPARE]
     if len(rows) < config.FEEDBACK_REJECTION_THRESHOLD:
         return  # 不可能凑够一条规则，不发起LLM调用
 

@@ -185,5 +185,5 @@ def test_history_page_export_button_calls_exporter(db_path, monkeypatch, tmp_pat
         mock_export.assert_called_once_with(record_id)
         assert len(at.success) >= 1
         # 历史记录页的导出不触发规则重算（那不是刚审完一批新反馈的场景，
-        # actions.regenerate_rules_after_export 只挂在标准校对/原稿比对页的导出后）
+        # actions.regenerate_rules_after_export 只挂在标准校对页的导出后）
         mock_regenerate.assert_not_called()

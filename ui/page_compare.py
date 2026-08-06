@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 def _reset_compare_session_state():
     st.session_state["compare_record_id"] = None
+    st.session_state["compare_file_id"] = None
 
 
 def render_document_comparison():
@@ -30,7 +31,6 @@ def render_document_comparison():
 
     if "compare_record_id" not in st.session_state:
         _reset_compare_session_state()
-        st.session_state["compare_file_id"] = None
 
     col_orig, col_fmt = st.columns(2)
     original_file = col_orig.file_uploader("上传原稿（Word）", type=["docx"], key="compare_original_uploader")
@@ -97,6 +97,15 @@ def render_document_comparison():
 
     st.caption(f"共发现 {len(rows)} 处实质性内容改动（排版调整不计入，已自动过滤）。")
 
+    # 结果还在时上面那个"开始比对"不再渲染，这里必须给一条退回上传状态的路——切走页面
+    # 再回来两个 uploader 因浏览器安全限制变回 None（见上方说明），换文件的哈希判定不
+    # 触发，不给这个按钮就停在"结果还在、却没有任何办法发起下一次"的死角里。
+    # 不做标准校对页那种"重跑同一份"的按钮：比对是纯本地确定性计算，同一对文件再跑
+    # 必然得到同样的结果，比对完这一对就是换下一对。
+    if st.button("开始比对", key="new_comparison"):
+        _reset_compare_session_state()
+        st.rerun()
+
     # 复用历史记录页同一套"issue_status刷新+批注预填"逻辑：issue_status是全局共享的
     # session_state字典，渲染前必须用DB当前值刷新，否则会显示成陈旧/错误的状态。
     st.session_state.setdefault("issue_status", {})
@@ -126,4 +135,3 @@ def render_document_comparison():
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key=f"compare_download_{record_id}",
             )
-            actions.regenerate_rules_after_export()

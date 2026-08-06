@@ -20,6 +20,9 @@ for _dir in (DATA_DIR, UPLOADS_DIR, EXPORTS_DIR):
 # 上传文件落盘只是为了给 parse_document 一个路径读，用完即弃、不进 records 表，
 # 不删会无限堆积。每次写入后只保留最近这么多个文件（按修改时间），多余的直接删除。
 UPLOADS_RETENTION_COUNT = 10
+# 导出的Excel同理：生成后立刻通过下载按钮交给用户，服务端这份只是中转，没有任何代码
+# 会再读回来（records.result_path 只写不读）。每次导出后同样只保留最近这么多个。
+EXPORTS_RETENTION_COUNT = 10
 
 # ---------- 任务常量 ----------
 # 任务是校对记录的顶层容器（一个任务=一件持续的校对工作，如"期刊A"，下面挂多轮
@@ -30,6 +33,11 @@ TASK_STATUS_RESOLVED = "解决"
 TASK_STATUS_CLOSED = "关闭"
 
 TASK_STATUSES = (TASK_STATUS_ACTIVE, TASK_STATUS_RESOLVED, TASK_STATUS_CLOSED)
+
+# records.task_type：这条记录是哪条流程产出的。取成常量而不是两处各写一个字面量，
+# 是因为 core/feedback_rules.py 要靠它精确排除原稿比对的记录，写错一个字就静默失效。
+RECORD_TYPE_STANDARD = "标准校对"
+RECORD_TYPE_COMPARE = "原稿比对"
 
 # 引入任务概念之前就已存在的历史记录，迁移时统一归入这个名字的任务（见
 # db/database.py::_migrate_backfill_legacy_task）。不按文档名自动聚类——"79期"和
@@ -349,15 +357,16 @@ NON_ISSUE_SELF_DECLARATION_KEYWORDS = (
 )
 
 # ---------- 原稿比对配置（core/comparer.py使用）----------
-# 句子级diff的切分标点：按这几个句末标点把段落切成句子列表再逐句比较，标点保留在
-# 前一句末尾（core/comparer.py::_split_sentences 用零宽断言切分，不消耗字符）。
+# 句子级diff的切分标点：按这几个句末标点把全文档文本流切成句子列表再逐句比较，标点
+# 保留在前一句末尾（core/comparer.py::split_sentences 用零宽断言切分，不消耗字符）。
 COMPARE_SENTENCE_SPLIT_PUNCTUATION = "。！？；"
-# replace区间内两段相似度（difflib.SequenceMatcher.ratio()）低于此值，判定不是同一段
-# 的改写，分别标记为删除+插入，不再往下做句子级diff。
-COMPARE_PARAGRAPH_MATCH_MIN_RATIO = 0.5
-
-DIFF_LAYER_SUBSTANTIVE = "实质性改动"
-DIFF_LAYER_FORMATTING = "排版调整"  # 当前实现不主动产出（归一化后完全相同的差异直接跳过），保留用于表结构完整性
+# 收窄"文字替换"展示范围时的分句标点：比句末标点细一级（含逗号顿号冒号），用于把
+# 一个很长的比对单元里真正变了的那一句摘出来（core/comparer.py::_narrow_replace_span）。
+COMPARE_CLAUSE_BOUNDARY_PUNCTUATION = "。！？；，、：\n"
+# 不参与比对的块类型：PDF侧表格是按坐标拉平的文本，而 docx_parser.py 只读
+# document.paragraphs、根本不读 Word 表格，两边天然对不上，比也只会比出假差异。
+# 标题/图注不在此列，理由见 core/comparer.py 模块docstring。
+COMPARE_SKIP_BLOCK_TYPES = frozenset({"table"})
 
 # ---------- 追问上下文配置（core/followup.py使用）----------
 # 追问时携带的原文上下文窗口：取issue所在block前后各N个block拼接，控制token成本（T5）。

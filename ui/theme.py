@@ -25,9 +25,8 @@ LAYER_COLOR = {
 }
 # 采纳=绿、拒绝=红，只用在卡片左侧色条与状态标签上（不给整卡上底色）。
 STATUS_COLOR = {"已采纳": "#2E8B57", "已拒绝": "#D64570"}
-# 原稿比对产出的issue的 layer 字段取值是 config.DIFF_LAYER_SUBSTANTIVE/
-# DIFF_LAYER_FORMATTING（独立于四层分类的另一个轴），不在 LAYER_SLUG/LAYER_COLOR
-# 里——用这个中性灰兜底，避免 KeyError。
+# 库里可能存着四层之外的 layer 取值（早期原稿比对记录用的是"实质性改动"这套独立取值），
+# 不在 LAYER_SLUG/LAYER_COLOR 里——用这个中性灰兜底，避免翻旧记录时 KeyError。
 OTHER_LAYER_SLUG = "other"
 OTHER_LAYER_COLOR = "#8a8f98"
 # 存疑类/引文类的判断依赖置信度/引用识别，需要人工复核依据；错误类/风格类判断相对

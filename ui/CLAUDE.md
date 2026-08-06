@@ -34,8 +34,9 @@ key=...)`（Streamlit 1.32+起容器带 `st-key-<key>` 稳定class）按属性�
 `cards._render_issue_card` 的 `card_key` 待处理态用层级slug、已采纳/已拒绝态用固定前缀
 （`accepted`/`rejected`），因此"层级色条"和"终态色条（绿/红）"只需要7条CSS规则；
 `card_key` 随 `status_info["status"]` 变化，rerun 后色条随之切换，不需要额外状态管理。
-原稿比对产出的issue的 `layer` 是另一套取值（`DIFF_LAYER_*`），用 `theme.OTHER_LAYER_SLUG`
-中性灰兜底避免 KeyError。
+原稿比对产出的issue 也归在四层里（恒为 `LAYER_CONFIRMED`，理由见
+`core/comparer.py::compare_documents` docstring）；`theme.OTHER_LAYER_SLUG` 中性灰只用来
+兜底库里早期比对记录遗留的四层之外的取值，避免翻旧记录时 KeyError。
 
 原文/建议**分两块干净展示，不做字符级diff**：`suggestion` 是自由文本说明（"应改为…"/
 "存疑，建议人工核实…"/"原文照录…"），不是和 `original_text` 平行的"改后文本"，硬做
@@ -156,6 +157,10 @@ session_state，和导出模块"数据一律从库读"是同一个原则。
 用 st.error 兜住；成功后 st.success 提示路径 + st.download_button 提供下载
 （mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"）。
 
+导出目录的清理跟上传目录同一套策略（只留最近 `config.EXPORTS_RETENTION_COUNT` 个），
+但**挂在 `core/exporter.py` 里而不是这一层**：三个页面的导出都汇到那一个函数，挂在那里
+才不会漏掉某个入口。
+
 ## 批注输入框（批注与状态解耦）要点
 
 紧贴采纳/拒绝按钮的"批注（可选，采纳/拒绝/待处理都可以写）"，
@@ -228,10 +233,12 @@ issue_id, record_id)` 把这条issue存进 `feedback` 表——
 **规则重算（`regenerate_rejection_rules`，一次真实LLM调用）的触发时机不放在
 "拒绝"里**：点一次"拒绝"就同步重算的话，连续拒绝会次次触发几秒级LLM调用，既卡
 （"拒绝"要等好几秒才响应）又费额度。所以"拒绝"只快速写库、秒响应；重算挂在
-两个低频的收尾/主动时机：① 标准校对页、原稿比对页"导出Excel"成功后
+两个低频的收尾/主动时机：① **标准校对页**"导出Excel"成功后
 （`actions.regenerate_rules_after_export`，"这一轮审校完成"的自然收尾，用 st.spinner
-给出等待提示）——历史记录页的导出**不**触发，那不是刚审完一批新反馈的场景；
-② 反馈页"重新生成规则"按钮手动触发。重算失败只记 `logger`，不影响导出/拒绝
+给出等待提示）；② 反馈页"重新生成规则"按钮手动触发。**原稿比对页和历史记录页的导出
+都不触发**——比对结果是逐字diff出来的客观差异，拒绝一条只说明这处改动可以接受，跟
+"LLM某类判断不对"无关，总结不出任何该注入校对提示词的规则；历史记录页则不是刚审完
+一批新反馈的场景。重算失败只记 `logger`，不影响导出/拒绝
 这些主操作（反馈已落库，只是规则集合没刷新）。
 
 事实性错误类问题不参与规则总结——`core/feedback_rules.py::regenerate_rejection_rules`
@@ -265,6 +272,13 @@ Excel 全部原样可用。
 
 原稿限定只收 Word（type=["docx"]），排版稿收 PDF/Word（type=["pdf","docx"]），
 对应框架文档"输入：原稿Word + 排版稿PDF/Word"这条。
+
+**结果区那个"开始比对"按钮（key=`new_comparison`）不能省**：上传区那个只在
+`compare_record_id is None` 时渲染，而切走页面再回来两个 uploader 会变回 None（浏览器
+安全限制），换文件的哈希判定不触发，页面就停在"上一次结果还在、却没有任何办法发起
+下一次"的死角里。它只是清 `compare_record_id`/`compare_file_id` 退回上传状态。
+**没有做标准校对页那种"重跑同一份"的按钮**：比对是纯本地确定性计算，同一对文件再跑
+必然是同样的结果，重跑没有意义，比对完这一对就是换下一对。
 
 ## 日志落地与落库失败兜底
 

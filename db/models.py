@@ -236,7 +236,6 @@ def add_issue(
     note: str | None = None,
     context_snippet: str | None = None,
     followup_history: str | None = None,
-    doc_page: str | None = None,
     db_path=None,
 ) -> int:
     """插入一条问题，返回 issue_id。"""
@@ -245,15 +244,14 @@ def add_issue(
         cursor = conn.execute(
             """
             INSERT INTO issues (
-                record_id, page_location, doc_page, original_text, issue_type, priority,
+                record_id, page_location, original_text, issue_type, priority,
                 layer, suggestion, status, note, context_snippet,
                 followup_history
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record_id,
                 page_location,
-                doc_page,
                 original_text,
                 issue_type,
                 priority,
@@ -399,16 +397,24 @@ def add_feedback(
 
 
 def get_feedback(issue_type: str | None = None, db_path=None) -> list[dict]:
-    """按时间倒序列出人工反馈记录，可选按 issue_type 过滤。"""
+    """按时间倒序列出人工反馈记录，可选按 issue_type 过滤。
+
+    多带一个 source_task_type 字段（这条反馈来自哪条流程的记录，LEFT JOIN records
+    取的），供 core/feedback_rules.py 排除原稿比对的拒绝。用 LEFT JOIN 而不是 JOIN：
+    source_record_id 为空、或那条 record 已经不在了的历史反馈仍要列出来，该字段取
+    None，按"来源不明"处理、不排除。
+    """
     conn = get_connection(db_path)
+    select = (
+        "SELECT f.*, r.task_type AS source_task_type FROM feedback f"
+        " LEFT JOIN records r ON r.record_id = f.source_record_id"
+    )
     try:
         if issue_type is None:
-            rows = conn.execute(
-                "SELECT * FROM feedback ORDER BY created_at DESC"
-            ).fetchall()
+            rows = conn.execute(f"{select} ORDER BY f.created_at DESC").fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM feedback WHERE issue_type = ? ORDER BY created_at DESC",
+                f"{select} WHERE f.issue_type = ? ORDER BY f.created_at DESC",
                 (issue_type,),
             ).fetchall()
         return [dict(row) for row in rows]

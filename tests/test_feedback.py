@@ -31,7 +31,10 @@ from core.parser import ParsedDocument
 from core.proofreader import ProofreadResult
 from core.workflow.run import run_standard_proofread
 from db import database
-from db.models import add_feedback, create_task, delete_feedback, get_feedback, get_feedback_rules, get_tasks, replace_feedback_rules
+from db.models import (
+    add_feedback, create_record, create_task, delete_feedback, get_feedback,
+    get_feedback_rules, get_tasks, replace_feedback_rules,
+)
 
 
 @pytest.fixture
@@ -222,6 +225,46 @@ def test_regenerate_rejection_rules_filters_out_factual_issue_type(db_path):
         feedback_rules.regenerate_rejection_rules(db_path=db_path)
 
     mock_chat.assert_not_called()
+
+
+def _seed_record(db_path, task_type) -> int:
+    task_id = create_task("测试任务", db_path=db_path)
+    return create_record(
+        task_id=task_id, doc_name="doc", doc_version="", task_type=task_type, db_path=db_path
+    )
+
+
+def test_regenerate_rejection_rules_excludes_feedback_from_comparison_records(db_path):
+    """★ 防线：原稿比对记录里的拒绝不参与规则总结。
+
+    规则是注入校对提示词、让LLM少报某类问题用的，只有LLM报出来的东西被拒绝才构成
+    "这类判断不对"的信号。比对结果是逐字diff出来的客观差异，拒绝一条只说明这处改动
+    可以接受，总结不出任何该让LLM规避的东西。
+    """
+    compare_record = _seed_record(db_path, config.RECORD_TYPE_COMPARE)
+    for i in range(config.FEEDBACK_REJECTION_THRESHOLD):
+        add_feedback(
+            issue_type="文字替换", original_text=f"比对差异{i}", suggestion=f"原稿为：X{i}",
+            source_record_id=compare_record, db_path=db_path,
+        )
+    mock_chat = MagicMock()
+
+    with patch("core.feedback_rules.chat_completion", mock_chat):
+        feedback_rules.regenerate_rejection_rules(db_path=db_path)
+
+    mock_chat.assert_not_called()  # 全被排除，凑不够阈值，根本不该发起LLM调用
+
+
+def test_regenerate_rejection_rules_keeps_feedback_without_source_record(db_path):
+    """来源记录已不在（或压根没记来源）的历史反馈按"来源不明"处理，照常参与总结——
+    LEFT JOIN 取不到 task_type 时不能顺手当成比对记录排掉。"""
+    _seed_feedback_rows(db_path, config.FEEDBACK_REJECTION_THRESHOLD)  # 不带 source_record_id
+    mock_chat = MagicMock(return_value="[]")
+
+    with patch("core.feedback_rules.chat_completion", mock_chat):
+        feedback_rules.regenerate_rejection_rules(db_path=db_path)
+
+    mock_chat.assert_called_once()
 
 
 def test_regenerate_rejection_rules_stores_valid_llm_output(db_path):

@@ -22,7 +22,7 @@ core/
   followup.py       对话追问——设计决策见文件顶部 docstring
   feedback.py       人工反馈原始记录——记录/撤销issue被拒绝的反馈，薄封装，设计决策见文件顶部 docstring
   feedback_rules.py 反馈语义总结——把历史拒绝记录交给LLM总结成规则注入校对提示词，设计决策见文件顶部 docstring
-  comparer.py       原稿比对——归一化+段落对齐+句子级diff，设计决策见文件顶部 docstring
+  comparer.py       原稿比对——归一化+全文档文本流+句子级diff，设计决策见文件顶部 docstring
 
 db/
   database.py       SQLite连接与建表（tasks、records、issues、feedback、feedback_rules 五张表）+ 旧库列迁移

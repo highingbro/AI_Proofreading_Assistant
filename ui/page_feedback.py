@@ -1,6 +1,6 @@
 """反馈学习页：查看/重算当前生效的反馈规则，以及浏览、撤销原始拒绝记录。
 
-规则平时由"导出Excel成功后"自动重算（`ui/actions.py::regenerate_rules_after_export`），
+规则平时由标准校对页"导出Excel成功后"自动重算（`ui/actions.py::regenerate_rules_after_export`），
 这里的"重新生成规则"是手动补一次的入口。
 """
 
