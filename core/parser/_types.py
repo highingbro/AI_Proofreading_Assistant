@@ -30,7 +30,6 @@ class ParsedBlock:
     block_type: str  # 'paragraph'/'heading'/'footnote'/'table'/'figure_caption'/'other'
     source_location: str   # 人类可读的位置描述，如"第3页左栏"/"第5段"，方便追问/导出时定位
     ocr_confidence: float | None = None  # OCR识别置信度(0~1)；非OCR来源（原生PDF/Word）恒为None
-    doc_page: str | None = None  # 双栏页从页眉/页脚提取到的期刊自身页码（如"12"），未提取到为None
 
 
 @dataclass

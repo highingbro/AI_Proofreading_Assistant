@@ -345,3 +345,47 @@ def test_task_status_update_and_record_scoping(db_path):
     active = models.get_tasks(status=config.TASK_STATUS_ACTIVE, db_path=db_path)
     assert [t["task_id"] for t in active] == [task_b]
     assert models.get_task(9999, db_path=db_path) is None
+
+
+def test_init_db_drops_legacy_doc_page_column(tmp_path):
+    """回归测试：旧库的 issues 表带 doc_page 列（刊物自印页码），该功能整条删除后
+    init_db() 要把这一列去掉，其余数据原样保留，重复调用不报错（幂等）。"""
+    legacy_path = tmp_path / "legacy_doc_page.db"
+    conn = sqlite3.connect(str(legacy_path))
+    conn.execute(
+        """
+        CREATE TABLE issues (
+            issue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id INTEGER NOT NULL,
+            page_location TEXT,
+            doc_page TEXT,
+            original_text TEXT,
+            issue_type TEXT,
+            priority TEXT,
+            layer TEXT,
+            suggestion TEXT,
+            status TEXT NOT NULL DEFAULT '待处理',
+            note TEXT,
+            context_snippet TEXT,
+            followup_history TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO issues (record_id, page_location, doc_page, original_text)"
+        " VALUES (1, '第1页', '12', '历史正文')"
+    )
+    conn.commit()
+    conn.close()
+
+    database.init_db(legacy_path)
+    database.init_db(legacy_path)  # 幂等：列已经没了，第二次不该报错
+
+    conn = sqlite3.connect(str(legacy_path))
+    conn.row_factory = sqlite3.Row
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(issues)")}
+    rows = conn.execute("SELECT page_location, original_text FROM issues").fetchall()
+    conn.close()
+
+    assert "doc_page" not in cols
+    assert [tuple(r) for r in rows] == [("第1页", "历史正文")]

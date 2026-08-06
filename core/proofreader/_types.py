@@ -25,7 +25,6 @@ class RawIssue:
     page_location: str | None  # locate_block() 的结果
     chunk_index: int
     located: bool              # 是否成功定位
-    doc_page: str | None = None  # locate_doc_page() 的结果，未提取到期刊页码时为None
 
 
 @dataclass

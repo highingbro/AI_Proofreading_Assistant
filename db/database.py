@@ -55,7 +55,6 @@ CREATE TABLE IF NOT EXISTS issues (
     issue_id INTEGER PRIMARY KEY AUTOINCREMENT,
     record_id INTEGER NOT NULL,
     page_location TEXT,
-    doc_page TEXT,
     original_text TEXT,
     issue_type TEXT,
     priority TEXT,
@@ -159,16 +158,16 @@ def _migrate_rename_layer_labels(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _migrate_add_doc_page_column(conn: sqlite3.Connection) -> None:
-    """给旧库的 issues 表补上 doc_page 列（双栏页提取到的期刊自身页码）。
+def _migrate_drop_doc_page_column(conn: sqlite3.Connection) -> None:
+    """删掉旧库 issues 表里的 doc_page 列（刊物自己印的页码）。
 
-    旧记录该列取值为 NULL——迁移前的行本来就没有做过这项提取，NULL 如实表达
-    "该功能上线前的数据"，导出时按现有"未提取到就留空"的规则展示，不拿PDF页码
-    顶替。
+    这一列曾经只服务于 Excel 的"文档页码"列，那一列去掉之后它就没有任何消费者了；
+    位置信息由 page_location（PDF物理页码）单独回答。不留着空跑的列，免得以后有人
+    照着它接新代码。已存在的取值随列一起丢弃——它回答的问题 page_location 已经答了。
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(issues)")}
-    if "doc_page" not in cols:
-        conn.execute("ALTER TABLE issues ADD COLUMN doc_page TEXT")
+    if "doc_page" in cols:
+        conn.execute("ALTER TABLE issues DROP COLUMN doc_page")
         conn.commit()
 
 
@@ -236,7 +235,7 @@ def init_db(db_path=None) -> None:
         _migrate_reject_reason_to_note(conn)
         _migrate_add_mode_column(conn)
         _migrate_rename_layer_labels(conn)
-        _migrate_add_doc_page_column(conn)
+        _migrate_drop_doc_page_column(conn)
         _migrate_add_task_and_author_columns(conn)
         _migrate_backfill_legacy_task(conn)
     finally:

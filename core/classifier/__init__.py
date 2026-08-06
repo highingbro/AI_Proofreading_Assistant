@@ -66,7 +66,6 @@ def classify_issue(
         llm_category=raw.category,
         llm_confidence=raw.confidence,
         original_suggestion=raw.suggestion,
-        doc_page=raw.doc_page,
     )
 
 

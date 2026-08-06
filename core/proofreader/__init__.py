@@ -16,7 +16,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import config
-from core.chunker import Chunk, ChunkedDocument, locate_block, locate_doc_page
+from core.chunker import Chunk, ChunkedDocument, locate_block
 from core.llm_client import LLMCallError, chat_completion
 from core.parser import ParsedDocument
 from core.proofreader._types import LLMResponseError, ProofreadResult, RawIssue
@@ -85,7 +85,6 @@ def proofread_chunk(
             block_index = _locate_block_for_snippet(original_text, chunk, parsed)
             located = block_index is not None
             page_location = locate_block(parsed, block_index) if located else None
-            doc_page = locate_doc_page(parsed, block_index) if located else None
             if not located:
                 logger.warning("第%d块条目命中正文但未能归属到具体block: %s", chunk.chunk_index, original_text)
         elif overlap_text and _contains(overlap_text, original_text):
@@ -95,7 +94,6 @@ def proofread_chunk(
             block_index = None
             located = False
             page_location = None
-            doc_page = None
             logger.warning("第%d块条目未能定位: %s", chunk.chunk_index, original_text)
 
         issues.append(
@@ -110,7 +108,6 @@ def proofread_chunk(
                 page_location=page_location,
                 chunk_index=chunk.chunk_index,
                 located=located,
-                doc_page=doc_page,
             )
         )
 

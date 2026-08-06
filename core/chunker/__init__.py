@@ -13,10 +13,10 @@ import config
 from core.chunker._types import Chunk, ChunkedDocument
 from core.chunker.fill_units import _build_fill_units
 from core.chunker.greedy_fill import _fill_body
-from core.chunker.locate import chunk_for_block, locate_block, locate_doc_page
+from core.chunker.locate import chunk_for_block, locate_block
 from core.parser import ParsedDocument
 
-__all__ = ["Chunk", "ChunkedDocument", "chunk_document", "locate_block", "locate_doc_page", "chunk_for_block"]
+__all__ = ["Chunk", "ChunkedDocument", "chunk_document", "locate_block", "chunk_for_block"]
 
 
 def chunk_document(
